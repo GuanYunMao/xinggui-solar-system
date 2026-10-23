@@ -1,6 +1,7 @@
-import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
-import { useEffect } from "react";
+import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag, Trophy } from "lucide-react";
+import { useEffect, useState } from "react";
 import { BODY_BY_ID, CHIP_BODIES, childrenOf } from "./data";
+import { Quiz } from "./Quiz";
 import { bindSettingsPersistence, loadSettings, useSim } from "./store";
 
 function formatSpeed(speed: number) {
@@ -16,6 +17,7 @@ function formatEpoch(days: number) {
 }
 
 export function Hud() {
+  const [quizOpen, setQuizOpen] = useState(false);
   const paused = useSim((state) => state.paused);
   const speed = useSim((state) => state.speed);
   const showLabels = useSim((state) => state.showLabels);
@@ -213,7 +215,7 @@ export function Hud() {
           />
           <span className="w-12 text-right text-sm tabular-nums text-fg">{formatSpeed(speed)}</span>
         </label>
-        <div className="mt-1 grid grid-cols-5 gap-1.5">
+        <div className="mt-1 grid grid-cols-6 gap-1.5">
           <button
             type="button"
             className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md bg-accent text-sm text-accent-fg"
@@ -262,6 +264,15 @@ export function Hud() {
           </button>
           <button
             type="button"
+            className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border border-accent/60 text-sm text-accent"
+            aria-label="星问挑战"
+            onClick={() => setQuizOpen(true)}
+          >
+            <Trophy className="size-4" />
+            <span className="hidden sm:inline">星问</span>
+          </button>
+          <button
+            type="button"
             className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border border-line text-sm text-fg"
             aria-label="返回总览"
             onClick={requestReset}
@@ -274,6 +285,7 @@ export function Hud() {
           空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
         </p>
       </footer>
+      <Quiz open={quizOpen} onClose={() => setQuizOpen(false)} />
     </div>
   );
 }

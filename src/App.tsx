@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Hud } from "./solar/Hud";
 import { SolarCanvas } from "./solar/SolarCanvas";
 import { BODY_BY_ID } from "./solar/data";
+import { markVisited } from "./solar/progress";
 import { useSim } from "./solar/store";
 
 /**
@@ -22,6 +23,7 @@ export function App() {
 
     return useSim.subscribe((state, prev) => {
       if (state.selectedId === prev.selectedId) return;
+      if (state.selectedId) markVisited(state.selectedId);
       try {
         const url = new URL(window.location.href);
         if (state.selectedId) url.searchParams.set("body", state.selectedId);

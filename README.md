@@ -40,6 +40,9 @@ solar/data.ts          天体数据、文案、事实卡片
 solar/textures.ts      贴图：地球/月球读真实影像，其余运行时逐像素生成
 solar/SolarCanvas.tsx  3D 场景、着色器、镜头、尾迹
 solar/Hud.tsx          界面、速度条、芯片、卫星行、键位
+solar/Quiz.tsx         星问挑战（答题小游戏）
+solar/questions.ts     题库 + 随机抽题
+solar/progress.ts      已探索天体的本地记录
 solar/store.ts         状态 + localStorage 存档
 solar/clock.ts         共享时钟
 ```
@@ -160,6 +163,7 @@ release 名字都从它取。每次改动都写进 [CHANGELOG.md](CHANGELOG.md)�
 | `solar/textures.ts` | 重写：噪声格点周期修正、陨石坑、气态行星条带、冰壳裂缝；地球与月球改用真实影像 |
 | `solar/SolarCanvas.tsx` | 首次摆位与聚焦动画挪进帧循环；竖屏镜头抬升；云层独立着色器；拖动误触防护；行星尾迹；卫星透明命中球 |
 | `solar/Hud.tsx` | 手机端详情卡改底部抽屉；卫星芯片行；1–9 键选行星；显示版本号 |
+| `solar/Quiz.tsx` / `questions.ts` / `progress.ts` | 新增：星问挑战与探索进度 |
 | `solar/store.ts` | 新增尾迹开关（含存档） |
 | `solar/data.ts` / `clock.ts` | **未改动** |
 
