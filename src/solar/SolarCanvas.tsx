@@ -6,6 +6,7 @@ import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { simClock } from "./clock";
 import { BODY_BY_ID, BODIES, childrenOf, EARTH_PERIOD, isMoon, type Body } from "./data";
 import { useSim } from "./store";
+import { tightenClipPlanes } from "./systems";
 import { cloudTexture, glowTexture, textureFor } from "./textures";
 
 declare global {
@@ -911,6 +912,12 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   useFrame((_, raw) => {
     const controls = controlsRef.current;
     if (!controls) return;
+
+    // 每帧按焦点距离收窄 near/far：固定值在 1:1 下不可能覆盖 4.87e9 的跨度
+    tightenClipPlanes(
+      camera as THREE.PerspectiveCamera,
+      camera.position.distanceTo(controls.target),
+    );
 
     // 首次摆位：等控件和尺寸都就绪，在这里做才不会错过头
     if (!posed && sizeRef.current.width >= 2 && camera instanceof THREE.PerspectiveCamera) {
