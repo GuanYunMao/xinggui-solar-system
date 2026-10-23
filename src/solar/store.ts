@@ -235,7 +235,11 @@ export const useSim = create<SimStore>((set, get) => {
     if (!s.switching) return;
     clearSwitchTimeout();
     const queued = s.queuedSelectId;
-    set({ switching: null, queuedSelectId: null, ...(queued ? { selectedId: queued } : {}) });
+    // 先把锁放掉，再走 select()：被拦下的那次选择必须和用户真点一下走同一条路，
+    // 否则它不记 hops（`target` 门少一次）、不走切换守卫、也不触发 URL 订阅里的 markVisited。
+    // 原来直接 set({selectedId}) 的写法会让「切换期间的那一次点击」凭空消失。
+    set({ switching: null, queuedSelectId: null });
+    if (queued) get().select(queued);
   },
 
   hydrate: (settings) =>

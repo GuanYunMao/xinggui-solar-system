@@ -10,8 +10,13 @@ import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SITE = path.join(root, "release", "site");
-const SINGLE = path.join(root, "release", "巡星.html");
+// 产物的根目录。默认 release/。想验一份**冻结快照**时用 XG_RELEASE 指过去
+// （另一个 agent 正在 `npm run build` 时，release/ 会被 rm+重建，页面会抓到半成品：
+//   表现为 __solarReady 未置位 + 资源 404 或莫名的 ReferenceError）。
+// 目录结构要和 release/ 一致：`site/` + `巡星.html`。
+const RELEASE = process.env.XG_RELEASE ? path.resolve(process.env.XG_RELEASE) : path.join(root, "release");
+const SITE = path.join(RELEASE, "site");
+const SINGLE = path.join(RELEASE, "巡星.html");
 const SHOTS = path.join(root, "screenshots");
 // 浏览器可执行文件。默认用系统 Edge（不下载 Chromium）；CI 或别的机器上用
 // XG_EDGE 指过去，比如 XG_EDGE=/usr/bin/chromium。
@@ -579,7 +584,7 @@ try {
         p90: +at(0.9).toFixed(2),
         x0: +out[0].toFixed(2),
       };
-    });
+    }, JITTER_FRAMES);
   };
   try {
     const modern = await sampleJitter("?proto=1&dist=1.2e7");
@@ -591,11 +596,13 @@ try {
     if (!modern.samples || !legacy.samples) {
       failures.push(`proto-jitter: 像素回读没采到样本（modern ${modern.samples} / legacy ${legacy.samples}）`);
     } else {
-      // 阈值仍是契约值（0.35 / 3× / 0.4），换的只是估计量：p10–p90 比 max−min 抗离群。
-      if (modern.pp >= 0.35) failures.push(`proto-jitter: 现代路径 p10–p90 ${modern.pp}px 未低于 0.35px`);
-      if (legacy.pp <= modern.pp * 3 || legacy.pp <= 0.4) {
+      // 阈值见上方注释：0.35 / 3× / 0.2。换的只是估计量：p10–p90 比 max−min 抗离群。
+      if (modern.pp >= MODERN_PP_MAX) {
+        failures.push(`proto-jitter: 现代路径 p10–p90 ${modern.pp}px 未低于 ${MODERN_PP_MAX}px`);
+      }
+      if (legacy.pp <= modern.pp * LEGACY_RATIO_MIN || legacy.pp <= LEGACY_PP_MIN) {
         failures.push(
-          `proto-jitter: legacy p10–p90 ${legacy.pp}px 未显著高于现代 ${modern.pp}px（需 >3× 且 >0.4px）—— 对照失效，断言就没意义`,
+          `proto-jitter: legacy p10–p90 ${legacy.pp}px 未显著高于现代 ${modern.pp}px（需 >${LEGACY_RATIO_MIN}× 且 >${LEGACY_PP_MIN}px）—— 对照失效，断言就没意义`,
         );
       }
     }

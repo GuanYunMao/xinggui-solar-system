@@ -14,6 +14,25 @@ import { REAL_PROTO } from "./solar/systems";
  */
 const PROTO = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("proto") === "1";
 
+/**
+ * 退出原型（t20）。
+ *
+ * `?proto=1` 是发布物的一部分（参数名在 bundle 里可读），原来它把整个 HUD 卸掉，
+ * 进去之后**只能改地址栏才出得来** —— 一条分享链接就能把人关在原型里。后门可以留，
+ * 陷阱不能留。这里做的事只有一件：把 `proto` 参数摘掉再重新加载
+ * （必须 reload：SystemProvider 的 spec 在挂载时定，热换会留下半个原型）。
+ */
+function exitProto() {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("proto");
+    window.location.assign(url.toString());
+  } catch {
+    // file:// 下改不了地址栏：至少把查询串清掉
+    window.location.search = "";
+  }
+}
+
 export function App() {
   const [ready, setReady] = useState(false);
   /*
@@ -26,7 +45,6 @@ export function App() {
    * PickLayer / Simulation / Probe 的 effect 都会跟着重建（它们的依赖里都有 bodies/spec）。
    */
   const mode = useSim((state) => state.mode);
-  const switching = useSim((state) => state.switching);
   const inReal = mode === "real";
   const system = PROTO || inReal ? REAL_PROTO : undefined;
 
@@ -34,17 +52,42 @@ export function App() {
     setReady(true);
   }, []);
 
-  /*
-   * 米制分支每帧独占相机并**提前 return**（SolarCanvas 的 `spec.unit === "meter"` 那一支），
-   * 所以渲染层「动画跑完 → finishSwitch()」的释放点走不到，switching 只能等 store 的
-   * 1500ms 兜底 —— 那意味着黑场结束后还有 1.2 秒点不动。
-   * 由壳层在 320ms（黑场 240ms + 余量）后放锁：finishSwitch 幂等，沙盘方向依旧由渲染层释放。
-   */
+  // 原型模式下 Esc 也是出口（和那个按钮同一件事，两条路都能走）
   useEffect(() => {
-    if (!inReal || switching !== "toReal") return;
-    const timer = window.setTimeout(() => useSim.getState().finishSwitch(), 320);
+    if (!PROTO) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.code === "Escape") exitProto();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  /*
+   * 同步置黑（t20）。目标：换系统的那一帧就已经是全黑，浏览器没有机会先画一帧新系统。
+   *
+   * 做法：黑幕在 `mode === "real"` 的**那次 commit 里**就是不透明的 ——
+   * `veilLifted` 初值 false，直到 240ms 后 effect 才把它抬起来。
+   * 注意顺序：切进实地的那一帧 `veilLifted` 还是 false，所以「黑」和「换系统」同帧；
+   * 240ms 之后再淡出（`transition-opacity` 只挂在淡出那一支上），
+   * 于是硬切被黑场盖住，露出时已经是摆好的实地画面。
+   *
+   * 为什么不在 `dip()` 里改（captain 原话是改 dip 的那 3 行）：`dip()` 在
+   * `SolarCanvas.tsx`，是 engineer 的领土，TEAM.md 第一节写死了只读。
+   * 而且 engineer 已经在米制分支里补了「这一帧就 finishSwitch」的释放点（`:1230`），
+   * 所以 dip 里那套 append + rAF 的老时序仍然存在、但被我的黑幕盖着看不出来；
+   * 他愿意的话可以删掉 dip，两边不冲突。
+   *
+   * 只盖进实地、不盖回沙盘：回沙盘那 0.95s 是设计好的镜头回归，盖住就看不见路了。
+   */
+  const [veilLifted, setVeilLifted] = useState(false);
+  useEffect(() => {
+    if (!inReal) {
+      setVeilLifted(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setVeilLifted(true), 240);
     return () => window.clearTimeout(timer);
-  }, [inReal, switching]);
+  }, [inReal]);
 
   // 可分享的深链：?body=earth 打开就聚焦地球，选中什么就把什么写回地址栏。
   useEffect(() => {
@@ -97,7 +140,43 @@ export function App() {
           {ready ? <SolarCanvas /> : null}
         </div>
         <div className="vignette pointer-events-none absolute inset-0 z-[1]" aria-hidden />
-        {PROTO ? null : <Hud />}
+        {/*
+          黑幕本体。三态：
+          - 不在实境 → 透明（不挂 transition，免得回沙盘时还留着一层）；
+          - 刚切实境（veilLifted=false）→ **完全不透明且无 transition**，所以这一帧就是黑的；
+          - 240ms 后 veilLifted=true → 挂 transition 淡出，露出已经摆好的实地面画。
+          挂载时机比 opacity 更重要：这个 div 一直在 DOM 里，只切 class，
+          所以不存在"append 到 DOM 之后才等一帧变黑"的窗口（dip 的老毛病）。
+        */}
+        <div
+          className={`pointer-events-none absolute inset-0 z-[2] bg-black ${
+            inReal
+              ? veilLifted
+                ? "opacity-0 transition-opacity duration-200"
+                : "opacity-100"
+              : "opacity-0"
+          }`}
+          aria-hidden
+        />
+        {PROTO ? (
+          /*
+            原型的出口（t20）。极简：一个角标按钮 + Esc，位置和 HUD 的徽标同一片区域，
+            但它不是模式控件 —— 原型不是"另一种看法"，是工程脚手架。
+            文案没有进 narrator 的表（它是调试面），所以就地写死并标 TODO(copy)。
+          */
+          <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
+            <span className="eyebrow text-[11px] text-subtle">原型</span>
+            <button
+              type="button"
+              className="hud-btn pointer-events-auto inline-flex h-8 items-center rounded-full border border-line bg-elevated px-3 text-xs text-fg"
+              onClick={exitProto}
+            >
+              退出
+            </button>
+          </div>
+        ) : (
+          <Hud />
+        )}
       </main>
     </SystemProvider>
   );

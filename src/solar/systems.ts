@@ -99,10 +99,23 @@ export const REAL_PROTO: SystemSpec = {
 export function tightenClipPlanes(
   camera: { near: number; far: number; updateProjectionMatrix: () => void },
   distance: number,
+  farFloor = 0,
 ) {
   const d = Math.max(distance, 1e-6);
   const near = Math.min(Math.max(d / 4096, 0.05), d / 1.25);
-  const far = Math.max(1.25 * d, 16384 * near);
+  /*
+   * farFloor：系统里最远那颗天体到相机的距离（含体型余量）。
+   *
+   * 没有它就会出现「实境里只画得出一颗地球」：d=2.5e7 时 near=6104，
+   * 视距上界 16384·near = 1.0e8，而月球在 3.6e8、太阳在 1.5e11 —— 两颗都在
+   * 远平面之外，被视锥剔除，从来没渲染过。探针只算屏幕投影、不看 near/far，
+   * 所以「返回 3 个天体」证明不了它们画出来了。
+   *
+   * 代价：跨度超出 2^24 的深度预算后，远处天体之间的**深度排序**不可靠。
+   * 实境里天体彼此不重叠，这个代价可以接受；将来若要渲染互相遮挡的远景，
+   * 再上对数深度（那需要给 5 个手写着色器补 logdepthbuf chunk）。
+   */
+  const far = Math.max(1.25 * d, 16384 * near, farFloor);
   // 只在变化超过 5% 时更新，避免每帧重算投影矩阵
   if (Math.abs(camera.near - near) > near * 0.05 || Math.abs(camera.far - far) > far * 0.05) {
     camera.near = near;
@@ -112,47 +125,41 @@ export function tightenClipPlanes(
 }
 
 /**
- * 实地落点机位。**与时间无关**——只用「太阳→地球方向」和「系统外缘」两个量。
+ * 实地取景：把地球和月球同时框进画面。
  *
- * 这条注释是给后人踩刹车用的：t9 的黑屏就是拿 `performance.now()*0.0003` 转方位角
- * 造成的。地球公转角速度是 2π/18 = 0.349 rad/s，而 0.0003 rad/ms = 0.300 rad/s，
- * 两者几乎同速 → 方位差被锁死在 0 → 相机永远停在地球背光侧，画面全黑。
- * 所以落点机位一律用「相对某个真实几何量 + 固定夹角」构造，绝不出现时钟。
+ * 为什么不是"系统全景"：实境要的是「航行仪表」—— 你得看得见脚下那颗球，
+ * 也得看得见同框的邻居。系统全景（2.4× 外缘 = 7.2e11 m）里地球是亚像素，
+ * 那等于没有实境。
  *
- * 单位无关：外缘取各行星轨道半径的最大值，米制系统里它自然是 4.5e12 m，
- * 沙盘里是 63 世界单位，两者都能得到一个合理的全景机位。
+ * 几何约束摆在这儿：地月间距 3.844e8 m 是地球半径的 60 倍，任何一帧同时装下
+ * 两颗球，地球最多只有整幅宽度的 1/120。所以取景距离按地月间距反推，
+ * 而不是按地球大小：d = sep / tan(fov*0.4) ≈ 1.75·sep 时，两球夹角约 32°，
+ * 塞进 42° 垂直视场还有余量；此时地球约 18 px、月球约 5 px，都认得出来。
+ *
+ * **与时间无关**：只用「地月连线」和「日向」两个几何量，绝不出现时钟 ——
+ * t9 的黑屏就是拿 performance.now() 转方位角、与地球公转同速造成的。
  */
-export function realPose(
-  bodies: readonly Body[],
-  earthWorld: { x: number; y: number; z: number } | null,
-): { dir: { x: number; y: number; z: number }; dist: number } {
-  let outer = 0;
-  for (const b of bodies) {
-    if (b.parent && b.parent !== "sun") continue;
-    outer = Math.max(outer, b.orbitRadius);
-  }
-  if (!(outer > 0)) outer = 1;
+export function frameEarthMoon(
+  earth: { x: number; y: number; z: number },
+  moon: { x: number; y: number; z: number } | null,
+  earthRadius: number,
+): { target: [number, number, number]; dir: [number, number, number]; dist: number } {
+  const target: [number, number, number] = moon
+    ? [(earth.x + moon.x) / 2, (earth.y + moon.y) / 2, (earth.z + moon.z) / 2]
+    : [earth.x, earth.y, earth.z];
 
-  // 默认方向：从黄道面上方看进来，与时间无关
-  let dx = 0;
-  let dy = 0.5;
-  let dz = 1;
-  if (earthWorld) {
-    // 站在「地球→太阳」方向再偏 30°：受光一侧，且这个夹角是常数，不随公转漂
-    const len = Math.hypot(earthWorld.x, earthWorld.y, earthWorld.z) || 1;
-    const sx = -earthWorld.x / len;
-    const sz = -earthWorld.z / len;
-    const c = Math.cos(Math.PI / 6);
-    const s = Math.sin(Math.PI / 6);
-    dx = sx * c;
-    dz = sz * c;
-    // 绕世界 Y 轴转 30°（等价于把 (sx,0,sz) 转一个固定角）
-    const nx = dx * Math.cos(Math.PI / 6) - dz * Math.sin(Math.PI / 6);
-    const nz = dx * Math.sin(Math.PI / 6) + dz * Math.cos(Math.PI / 6);
-    dx = nx;
-    dz = nz;
-    dy = s + 0.25;
-  }
+  // 站在日向一侧：太阳在相机背后，地球和月球都正面受光。
+  // 地球在原点附近公转，所以「地心→太阳」就是 −earth 方向。
+  const len = Math.hypot(earth.x, earth.y, earth.z) || 1;
+  let dx = -earth.x / len;
+  let dy = -earth.y / len;
+  let dz = -earth.z / len;
+
+  const sep = moon ? Math.hypot(moon.x - earth.x, moon.y - earth.y, moon.z - earth.z) : 0;
+  const dist = sep > 0 ? Math.max(sep * 1.75, earthRadius * 8) : earthRadius * 8;
+
+  // 抬 12° 俯视，避免完全正对显得扁
+  dy += 0.2126;
   const n = Math.hypot(dx, dy, dz) || 1;
-  return { dir: { x: dx / n, y: dy / n, z: dz / n }, dist: outer * 2.4 };
+  return { target, dir: [dx / n, dy / n, dz / n], dist };
 }

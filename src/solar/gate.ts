@@ -107,12 +107,20 @@ export function normalizeGate(raw: string): string {
     .replace(/U/g, "V");
 }
 
-export function encodeGate(lit: readonly string[], unlocked: boolean, version = GATE_VERSION): string {
+/**
+ * 编码。
+ *
+ * **bit 12 不再写**（t20）：它是「已解锁」的冗余位，而冗余位能造出自我矛盾的态 ——
+ * `XG1-00C00-S7` = 0 个槽位 + 已解锁，导入后界面同时说「0/3」和「校准已完成」，
+ * 点复制又把这个矛盾导出一遍（自传播）。
+ * 解锁与否现在只由**槽位数**决定（`slots.length >= GATE_REQUIRED`），一个事实一个来源。
+ * `unlocked` 参数保留是为了不改调用方签名，但它已经不影响输出。
+ */
+export function encodeGate(lit: readonly string[], _unlocked: boolean, version = GATE_VERSION): string {
   let payload = 0;
   GATE_SLOTS.forEach((slot, index) => {
     if (lit.includes(slot)) payload |= 1 << index;
   });
-  if (unlocked) payload |= 1 << 12;
   payload |= (version & 0xf) << 13;
 
   const bytes = [payload & 0xff, (payload >>> 8) & 0xff, (payload >>> 16) & 0xff];
@@ -153,7 +161,13 @@ export function decodeGate(raw: string): DecodeGateResult {
   if (low + (high << 5) !== expected) return { ok: false, reason: "checksum" };
 
   const slots = GATE_SLOTS.filter((_, index) => (payload & (1 << index)) !== 0);
-  return { ok: true, slots: [...slots], unlocked: (payload & (1 << 12)) !== 0 };
+  /*
+   * bit 12 一概不读（t20）。老版本发出的码里可能带着它，这里**忽略**而不是报错：
+   * 解码的结论必须和 UI 的判定同源 —— 都是「亮了几格 >= GATE_REQUIRED」。
+   * 于是 `XG1-00C00-S7` 这种「0 槽位 + 已解锁」的旧码，进来就是 0/3，
+   * 不会再让面板一边说 0/3、一边说「校准已完成」。
+   */
+  return { ok: true, slots: [...slots], unlocked: slots.length >= GATE_REQUIRED };
 }
 
 export type GateRecord = {

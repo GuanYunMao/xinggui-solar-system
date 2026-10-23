@@ -1,5 +1,5 @@
 import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
-import { Html, OrbitControls } from "@react-three/drei";
+import { OrbitControls } from "@react-three/drei";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -8,7 +8,7 @@ import { EARTH_PERIOD, isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
-import { realPose, tightenClipPlanes } from "./systems";
+import { frameEarthMoon, tightenClipPlanes } from "./systems";
 import { cloudTexture, glowTexture, textureFor } from "./textures";
 
 declare global {
@@ -55,6 +55,14 @@ const DIAG =
 const READBACK =
   typeof window !== "undefined" &&
   ["proto", "legacy", "diag"].some((k) => new URLSearchParams(window.location.search).has(k));
+
+/**
+ * `?proto=1` 是**抖动测量的专用机位**（正面受光 + 慢摆），不是产品取景。
+ * 实地模式（store.mode === "real"，不带这个参数）用 frameEarthMoon 的地月取景。
+ * 两者共用米制分支，但机位语义不同，必须分开。
+ */
+const PROTO_HARNESS =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("proto") === "1";
 
 /** ?legacy=1：把行星顶点着色器切回"世界坐标过 float32 再减相机"的旧写法，作为抖动对照。 */
 const LEGACY_SHADER =
@@ -704,8 +712,6 @@ function BodyNode({
   const selected = selectedId === body.id;
   // 卫星标签只在被选中时出现：全显示的话木星四颗卫星的名字会叠成一团。
   // 卫星靠 HUD 里的卫星芯片行来选择/辨认。
-  const labelOn = selected || (showLabels && !isMoon(body));
-  const labelY = body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
   return (
     <group
       ref={(node) => {
@@ -714,9 +720,6 @@ function BodyNode({
       }}
     >
       {selected && <SelectionRing radius={body.radius} />}
-      {labelOn && (
-        <HtmlLabel y={labelY} name={body.name} selected={selected} />
-      )}
       <group rotation={[0, 0, body.obliquity]}>
         <group
           ref={(node) => {
@@ -796,6 +799,18 @@ function Labels() {
     // 沙盘里卫星不给标签（会叠成一团）；实境里只给选中的那个
     const baseOn = showLabels && spec.unit !== "meter";
 
+    /*
+     * 先回收这一帧不在系统里的旧节点。
+     * 切系统时 bodies 从 15 个变成 3 个，循环只遍历新 bodies，旧标签节点
+     * 就永远留在容器里 —— 实境画面上会飘着"木星/海王星/土星"这些沙盘的名字。
+     */
+    const alive = new Set(bodies.map((b) => b.id));
+    for (const [key, node] of nodes) {
+      if (alive.has(key)) continue;
+      node.el.remove();
+      nodes.delete(key);
+    }
+
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
       const on = Boolean(group) && (selectedId === body.id || (baseOn && !isMoon(body)));
@@ -808,6 +823,9 @@ function Labels() {
       if (!node) {
         const span = document.createElement("span");
         span.className = "star-label";
+        // .star-label 本身没有定位：以前是 drei 的 Html 外层容器负责绝对定位，
+        // 现在直接给元素定位，transform 才是它的位移而不是偏移。
+        span.style.cssText = "position:absolute;left:0;top:0;will-change:transform";
         el.appendChild(span);
         node = { el: span, text: "", selected: false };
         nodes.set(key, node);
@@ -1013,26 +1031,15 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   const switching = useSim((state) => state.switching);
   const mode = useSim((state) => state.mode);
 
-  /**
-   * 240ms 黑场。跨模式同时换掉映射、时间倍率、near/far 和 HUD 语义，
-   * 连续形变只会让人分不清在看什么，所以切一刀比补间诚实。
-   * 用命令式 DOM 覆盖层：这是纯过渡视觉，不该进 HUD 的布局账本。
+  /*
+   * 这里原本有一个 `dip()`：命令式 append 一层黑 div，再等一个 rAF 才把 opacity 设成 1。
+   * 已删除，两个理由都不是"没用了"：
+   *  1. 它是假黑场 —— append 后要等下一帧才全黑，所以换系统那次 commit 根本没被盖住，
+   *     critic 判的就是这一条。
+   *  2. 壳层现在有真正的常驻黑幕（App.tsx 侧，黑的那一支不挂 transition，
+   *     实测 opacity=1 覆盖 52→310ms）。两套并存，后人会以为 dip 还在起作用。
+   * 跨模式切换的视觉现在完全由壳层负责；渲染层只负责把相机摆到位、按时放锁。
    */
-  const dip = () => {
-    const host = gl.domElement?.parentElement;
-    if (!host) return;
-    const el = document.createElement("div");
-    el.style.cssText =
-      "position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;transition:opacity 110ms linear;z-index:2";
-    host.appendChild(el);
-    requestAnimationFrame(() => {
-      el.style.opacity = "1";
-    });
-    window.setTimeout(() => {
-      el.style.opacity = "0";
-    }, 120);
-    window.setTimeout(() => el.remove(), 260);
-  };
   const sizeRef = useRef(size);
   sizeRef.current = size;
   // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
@@ -1096,6 +1103,8 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   wantReset.current = resetToken;
   const appliedKey = useRef<string | null>(null);
   const appliedMode = useRef<string>("sandbox");
+  /** 米制分支的放锁只做一次，避免每帧调 finishSwitch */
+  const switchReleased = useRef(false);
 
   const startFocus = (controls: OrbitControlsImpl, id: string | null) => {
     const reduced =
@@ -1120,34 +1129,23 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     followId.current = null;
     controls.enableRotate = false;
     controls.enableZoom = false;
+    /*
+     * 动画期间必须连 `enabled` 一起关。
+     * OrbitControls 有 `minDistance=1.15 / maxDistance=280` 的距离夹取：相机一旦被
+     * 动画带到 1e11 量级（实地机位），它的 update() 每帧都会把相机拽回 280 单位，
+     * 和动画互相拉扯，最后停在半路。关掉 enabled 等于整套控件静音，
+     * 这正是米制分支的做法；代价是切回来之后必须记得还原，否则视角永久拖不动。
+     */
+    controls.enabled = false;
   };
 
   /*
-   * 实地落点：切进实地时把相机摆到「系统外缘 2.4 倍」的全景位，方向由
-   * realPose 从太阳→地球方向推出（与时间无关，不是拿时钟转角度）。
-   * 目标点固定为原点（太阳），因为实地的观测中心是整系而不是某颗行星。
+   * 这里原本有一个 `startSwitchPose`（0.9s 飞向"系统外缘 2.4 倍"的切换动画）。
+   * 已删除：米制分支每帧独占相机并提前 return，这个函数永远走不到 —— 它和
+   * systems.ts 里配套的 realPose() 都是死代码。进实地是瞬切，而且壳层有黑幕
+   * 盖着那一下，动画本来也看不见。实地的取景现在由 frameEarthMoon 在米制分支里
+   * 每帧直接算（地月同框），不再需要一条独立的切换轨迹。
    */
-  const startSwitchPose = (controls: OrbitControlsImpl) => {
-    const earth = reg.groups.get("earth");
-    const earthWorld = earth ? earth.getWorldPosition(new THREE.Vector3()) : null;
-    const pose = realPose(spec.bodies, earthWorld);
-    const fromPos = camera.position.clone();
-    const fromTarget = controls.target.clone();
-    anim.current = {
-      t: 0,
-      dur: 0.9,
-      fromPos,
-      fromTarget,
-      dir: new THREE.Vector3(pose.dir.x, pose.dir.y, pose.dir.z),
-      fromDist: Math.max(fromPos.distanceTo(fromTarget), 0.001),
-      toDist: pose.dist,
-      toId: null,
-      home: false,
-    };
-    followId.current = null;
-    controls.enableRotate = false;
-    controls.enableZoom = false;
-  };
 
   /*
    * 切换结束（switching → null）时把控制权还回去。
@@ -1163,6 +1161,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     } else if (!anim.current) {
       c.enableRotate = true;
       c.enableZoom = true;
+      c.enabled = true;
     }
   }, [switching, controlsRef]);
 
@@ -1181,7 +1180,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
         // 球坐标状态，必须关掉，否则手动摆放的机位会被覆盖。
         controls.enabled = false;
         earth.getWorldPosition(scratch.dest);
-        const dist = PROTO_DIST;
+        let dist = PROTO_DIST;
 
         /*
          * 机位必须落在「地球→太阳」这个方向上，不能挂在世界固定角上。
@@ -1203,18 +1202,82 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
          * 组只差 0.05 px），必须有横向的三维位移才能把 float32 量化扫出来。
          */
         scratch.sunDir.copy(scratch.dest).negate().normalize();
-        scratch.camDir.copy(scratch.sunDir);
-        scratch.camDir.applyAxisAngle(perpAxis(scratch.sunDir), 0.2126); // 抬 12° 俯视
-        // 绕「日向轴」滚转 ±10°：与太阳的夹角恒定，受光区域完全不变，
-        // 但相机在三维里扫一个锥面，float32 的量化误差才会在屏幕横向扫出来。
-        // 只做径向呼吸的话，误差几乎全落在视线方向上，投影上根本看不见。
-        scratch.camDir.applyAxisAngle(scratch.sunDir, 0.17 * Math.sin(performance.now() * 0.0016));
-        const breath = 1 + 0.01 * Math.sin(performance.now() * 0.00314);
-        camera.position.copy(scratch.dest).addScaledVector(scratch.camDir, STILL ? dist : dist * breath);
+        if (PROTO_HARNESS) {
+          scratch.camDir.copy(scratch.sunDir);
+          scratch.camDir.applyAxisAngle(perpAxis(scratch.sunDir), 0.2126); // 抬 12° 俯视
+          // 绕「日向轴」滚转 ±10°：与太阳的夹角恒定，受光区域完全不变，
+          // 但相机在三维里扫一个锥面，float32 的量化误差才会在屏幕横向扫出来。
+          // 只做径向呼吸的话，误差几乎全落在视线方向上，投影上根本看不见。
+          scratch.camDir.applyAxisAngle(scratch.sunDir, 0.17 * Math.sin(performance.now() * 0.0016));
+          const breath = 1 + 0.01 * Math.sin(performance.now() * 0.00314);
+          camera.position.copy(scratch.dest).addScaledVector(scratch.camDir, STILL ? dist : dist * breath);
+          controls.target.copy(scratch.dest);
+          camera.lookAt(scratch.dest);
+        } else {
+          /*
+           * 实地取景：地月同框，站在日向一侧（太阳在相机背后，两颗都正面受光）。
+           * 之前这里用的是「系统外缘 2.4 倍」的全景位，地球在 7.2e11 m 外只是亚像素 ——
+           * 那不是实境，是一张星图。取景距离的推导见 systems.frameEarthMoon。
+           */
+          const moon = reg.groups.get("moon");
+          const earthR = byId.earth?.radius ?? 6.371e6;
+          if (moon) moon.getWorldPosition(scratch.pos);
+          const pose = frameEarthMoon(
+            { x: scratch.dest.x, y: scratch.dest.y, z: scratch.dest.z },
+            moon ? { x: scratch.pos.x, y: scratch.pos.y, z: scratch.pos.z } : null,
+            earthR,
+          );
+          dist = pose.dist;
+          scratch.target.set(pose.target[0], pose.target[1], pose.target[2]);
+          scratch.camDir.set(pose.dir[0], pose.dir[1], pose.dir[2]);
+          camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
+          controls.target.copy(scratch.target);
+          camera.lookAt(scratch.target);
+        }
 
-        controls.target.copy(scratch.dest);
-        camera.lookAt(scratch.dest);
-        tightenClipPlanes(camera as THREE.PerspectiveCamera, dist);
+        /*
+         * far 必须覆盖整个系统，不能只按"到焦点"算。
+         * 之前 far = max(1.25·d, 16384·near)：d=2.5e7 时上界只有 1.0e8，
+         * 而月球在 3.6e8、太阳在 1.5e11 —— 两颗都在远平面之外，被视锥剔除，
+         * 从来没有渲染过。探针只算屏幕投影不看裁剪面，所以"返回 3 个天体"
+         * 一直是对的，而画面里只有一颗地球。
+         */
+        let farFloor = 0;
+        for (const b of spec.bodies) {
+          const g = reg.groups.get(b.id);
+          if (!g) continue;
+          g.getWorldPosition(scratch.pos);
+          farFloor = Math.max(farFloor, camera.position.distanceTo(scratch.pos) + b.radius * 4);
+        }
+        tightenClipPlanes(camera as THREE.PerspectiveCamera, dist, farFloor * 1.2);
+
+        /*
+         * 米制分支的放锁点。
+         *
+         * 这一支每帧独占相机并提前 return，所以下面「动画跑完 → finishSwitch()」
+         * 那个释放点永远走不到。t16 曾在 App.tsx 里借了一个 320ms 超时来补，
+         * 那是壳层给渲染层擦屁股，现已由 designer 删除 —— 释放点只留这一个。
+         * 正确的点在渲染层：这支的相机没有过渡动画，位置在这一帧就已经摆好，
+         * "动画结束"就等于"这一帧"。
+         *
+         * 在这里放锁是安全的：这支每帧都重写 camera.position，OrbitControls
+         * 就算被放开也挪不动相机，不存在"黑幕里被拖歪"的窗口。
+         * 黑场由壳层负责（渲染层的 dip 已删），这里只管相机和锁。
+         */
+        if (switching === "toReal" && !switchReleased.current) {
+          switchReleased.current = true;
+          useSim.getState().finishSwitch();
+        } else if (switching === null) {
+          switchReleased.current = false;
+        }
+
+        /*
+         * 这一支不看 appliedKey，但必须把 appliedKey/appliedMode 保持成"真话"：
+         * 否则从实地切回沙盘时，appliedMode 还停在 "sandbox"，比对下来会认为
+         * "没换过模式"，重取景不触发，相机就停在上一次的位置。
+         */
+        appliedKey.current = `${wantId.current ?? ""}|${wantReset.current}|${mode}`;
+        appliedMode.current = mode;
 
         if (DIAG && diagTick.current++ % 20 === 0) {
           const persp = camera as THREE.PerspectiveCamera;
@@ -1253,6 +1316,19 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       camera.position.distanceTo(controls.target),
     );
 
+    if (DIAG && diagTick.current++ % 30 === 0) {
+      console.log(
+        "[sandbox]",
+        JSON.stringify({
+          cam: camera.position.toArray().map((n) => +n.toFixed(1)),
+          target: controls.target.toArray().map((n) => +n.toFixed(1)),
+          anim: anim.current ? +anim.current.t.toFixed(2) : null,
+          enabled: controls.enabled,
+          key: appliedKey.current,
+        }),
+      );
+    }
+
     /*
      * 模式切换期间禁用拖拽/缩放。放在每帧最前面强制写一次，是因为 drei 的
      * <OrbitControls> 会在自身重渲染时按 props 把开关刷回默认值，只在 useEffect
@@ -1277,14 +1353,12 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     const key = `${wantId.current ?? ""}|${wantReset.current}|${mode}`;
     if (posed && appliedKey.current !== key) {
       const initial = appliedKey.current === null;
-      const modeChanged = appliedKey.current !== null && !key.endsWith(`|${appliedMode.current}`);
       appliedKey.current = key;
       appliedMode.current = mode;
-      if (!initial) {
-        if (modeChanged) dip();
-        if (mode === "real") startSwitchPose(controls);
-        else startFocus(controls, wantId.current);
-      }
+      // 黑场已挪到壳层（渲染层的 dip 已删）：这里只负责相机。
+      // 切进实地不在这里起动画 —— 米制分支每帧直接摆位（见 frameEarthMoon），
+      // 从实地切回沙盘仍然走 startFocus，回到「带着目标的沙盘聚焦位」。
+      if (!initial && mode !== "real") startFocus(controls, wantId.current);
     }
 
     const delta = Math.min(raw, 0.1);
@@ -1323,6 +1397,10 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
         const stillSwitching = useSim.getState().switching !== null;
         controls.enableRotate = !stillSwitching;
         controls.enableZoom = !stillSwitching;
+        // enabled 与动画同生命周期：动画期间静音（否则 maxDistance=280 的距离夹取
+        // 会把相机从 1e11 拽回 280，和动画互相拉扯），跑完这里必须还回来，
+        // 不然切一次实境回来视角就永久拖不动。
+        controls.enabled = !stillSwitching;
         if (stillSwitching) useSim.getState().finishSwitch();
         if (!current.home && current.toId) {
           followId.current = current.toId;
@@ -1344,7 +1422,36 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     camera.position.add(scratch.delta);
     controls.target.add(scratch.delta);
     prevPlanet.current.copy(scratch.dest);
+
+    /*
+     * 跟随卫星时要躲开母天体。
+     * 月球的 focus 是 1.7，而地球半径 0.76、地月距离 1.95 —— 相机贴在月球
+     * 「朝地球那一侧」时离地心只有 1.95−1.7 = 0.25，直接钻进地球内部；
+     * 球面背面被剔除，画面上整颗地球消失，最多 2.5 秒必现。
+     * 跟随逻辑只做平移，不避让，所以这里补一次最小距离钳制。
+     */
+    clampOutsideParent(id);
   }, -2);
+
+  /**
+   * 把相机从母天体的球体里推出来。只推相机不动 target：
+   * OrbitControls 每帧会把朝向重新对准 target，推出去的视角变化是平滑的。
+   */
+  function clampOutsideParent(id: string) {
+    const parentId = byId[id]?.parent;
+    if (!parentId) return;
+    const pg = reg.groups.get(parentId);
+    const pb = byId[parentId];
+    if (!pg || !pb) return;
+    pg.getWorldPosition(scratch.pos);
+    const minDist = pb.radius * 1.35;
+    scratch.delta.copy(camera.position).sub(scratch.pos);
+    const len = scratch.delta.length();
+    if (len >= minDist) return;
+    if (len < 1e-6) scratch.delta.set(0, 1, 0);
+    else scratch.delta.multiplyScalar(1 / len);
+    camera.position.copy(scratch.pos).addScaledVector(scratch.delta, minDist);
+  }
 
   return null;
 }
@@ -1384,6 +1491,16 @@ function Probe() {
       return projected;
     };
     (window as unknown as { __solarProbe?: typeof probe }).__solarProbe = probe;
+    /*
+     * 裁剪面探针。`__solarProbe` 只算屏幕投影、不看 near/far，所以它能
+     * 「返回 3 个天体」而画面上只有一颗地球 —— 那正是 t17 抓到的阻断项。
+     * 这个钩子让验收能直接读 far，证明太阳/月球没有落在远平面之外。
+     */
+    const clip = () => {
+      const p = camera as THREE.PerspectiveCamera;
+      return { near: p.near, far: p.far };
+    };
+    (window as unknown as { __solarClip?: typeof clip }).__solarClip = clip;
 
     /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
@@ -1563,6 +1680,7 @@ function Probe() {
     return () => {
       delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
       delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
+      delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
     };
   }, [reg, camera, gl, bodies, size.height, size.width]);
 
@@ -1594,7 +1712,20 @@ function PickLayer() {
         const g = reg.groups.get(b.id);
         if (!g) continue;
         g.getWorldPosition(tmp);
-        out.push({ id: b.id, world: tmp.clone(), radius: b.radius, rings: b.rings });
+        out.push({
+          id: b.id,
+          world: tmp.clone(),
+          radius: b.radius,
+          rings: b.rings,
+          /*
+           * 环平面的世界法线。环几何在 XY 平面，mesh 再转 [π/2,0,0]，
+           * 外层 group 再绕 Z 转 obliquity —— 合成结果就是下面这行。
+           * 少了它，pick 只能把环当正圆环，斜视时会把整片天空和邻居的热区一起吞掉。
+           */
+          ringNormal: b.rings
+            ? new THREE.Vector3(Math.sin(b.obliquity), -Math.cos(b.obliquity), 0)
+            : undefined,
+        });
       }
       return out;
     };
@@ -1660,6 +1791,7 @@ function Scene() {
       {decor && <Stars />}
       <Probe />
       <PickLayer />
+      <Labels />
       <Simulation />
       <BodyNode
         body={sun}

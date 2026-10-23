@@ -1,4 +1,4 @@
-# 巡星 · 未至之境（独立版）
+# 巡星·未至之境（独立版）
 
 可交互的三维太阳系轨道仪。从 Grok App Builder 工作区里抽出来，**游戏本体一行没改**，只把外壳换成了普通静态网站。
 
@@ -126,6 +126,20 @@ https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xing
 构建设在 `.github/workflows/build.yml`：push 到 `main` → `npm ci` → `npm run build` →
 按 `package.json` 的版本号打 `v<版本>` 的 tag 并发布 `xinggui.html`。不需要本地打包再手动传。
 下载地址写作 `releases/latest/...`，所以**跨版本不变**。
+
+### 命名口径
+
+| 用在哪 | 写法 | 例 |
+| --- | --- | --- |
+| 全名（启动页 / about / `<title>` / 描述 / 品牌物料） | **`巡星·未至之境`，中间不加空格** | `<title>巡星·未至之境</title>` |
+| 短名（HUD 占位、手机桌面标题、本地产物名） | `巡星` | `release/巡星.html` |
+| 发布名（GitHub release 标题） | 名字 + 版本 + ` · ` + 摘要 | `巡星 1.0.11 · 修复实境浮点` |
+| 技术标识（npm 包名 / 仓库名 / release asset） | ASCII，**永不翻译** | `xinggui` / `xinggui-solar-system` / `xinggui.html` |
+
+**` · ` 只出现在发布名里当分隔符**，用来隔开「名字」和「版本/摘要」；名字本身上下文里
+写 `巡星·未至之境`（无空格）。源码里这两处字面量的唯一出处：
+`vite.config.ts` 的 `APP_NAME` / `APP_SHORT_NAME`（经 `__APP_NAME__` / `__APP_SHORT_NAME__` 注入），
+消费方见 `src/solar/brand.ts`。
 
 **本机推送需要走代理**（直连 GitHub 会 TLS 中断）。仓库的 local config 里已经写死了：
 

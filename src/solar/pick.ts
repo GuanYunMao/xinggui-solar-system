@@ -19,8 +19,10 @@ export type PickBody = {
   /** 世界坐标（沙盘是世界单位，实境是米；本模块不关心单位） */
   world: THREE.Vector3;
   radius: number;
-  /** 环带的内外半径，同样是与 radius 同一单位的世界长度 */
+  /** 环带的内外半径，与 radius 同一单位 */
   rings?: { inner: number; outer: number };
+  /** 环平面的世界单位法线。给了它，环带才会按真实的斜视椭圆判定 */
+  ringNormal?: THREE.Vector3;
 };
 
 export type PickCandidate = {
@@ -30,9 +32,13 @@ export type PickCandidate = {
   y: number;
   /** 视觉半径（CSS 像素），画面上能看到多大的圆盘 */
   radiusPx: number;
-  /** 环带投影半径；没有环就是 0 */
-  ringInnerPx: number;
-  ringOuterPx: number;
+  /** 环带：屏幕空间中「世界单位 → 像素」的两根基向量，缺省时全 0 表示没有环 */
+  ringUx: number;
+  ringUy: number;
+  ringVx: number;
+  ringVy: number;
+  ringInner: number;
+  ringOuter: number;
   /** 相机到天体中心的距离 */
   depth: number;
 };
@@ -44,6 +50,10 @@ export function focalPx(height: number, fovDeg: number) {
 
 const _v = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
+const _n = new THREE.Vector3();
+const _u = new THREE.Vector3();
+const _w = new THREE.Vector3();
+const _p = new THREE.Vector3();
 
 /**
  * 把天体投影成屏幕候选。
@@ -67,18 +77,75 @@ export function projectCandidates(
     if (_v.dot(_fwd) <= 0) continue; // 相机背后
 
     _v.copy(body.world).project(camera);
-    const radiusPx = (focal * body.radius) / depth;
+    const ndcX = _v.x;
+    const ndcY = _v.y;
+    /*
+     * 视觉半径用切线，不是小角近似：
+     * 小角近似 focal·R/d 在 R/d 大时严重偏小。100 km 高度那天 R/d = 0.985，
+     * 近似给 0.985·focal，真实是 tan(asin(0.985))·focal = 5.7 倍 ——
+     * 表现就是"只有圆盘内侧 17% 半径的地方点得中"。
+     */
+    const ratio = Math.min(1, body.radius / depth);
+    const radiusPx = focal * Math.tan(Math.asin(ratio));
+
+    let ringUx = 0;
+    let ringUy = 0;
+    let ringVx = 0;
+    let ringVy = 0;
+    if (body.rings && body.ringNormal) {
+      // 环平面内的两根正交单位轴（取哪两根无所谓：带区判定只用到 a²+b²）
+      _n.copy(body.ringNormal).normalize();
+      _u.set(0, 1, 0);
+      if (Math.abs(_n.dot(_u)) > 0.9) _u.set(1, 0, 0);
+      _u.crossVectors(_n, _u).normalize();
+      _w.crossVectors(_n, _u).normalize();
+      /*
+       * 不要用「焦距/深度」的导数当线性化：那等价于假设天体在画面正中心，
+       * 一到边缘（土星在 (751,505)）误差就大到把椭圆方向算歪。
+       * 直接投影环平面两个基向量的**端点**（长度取环外径），
+       * 得到的 2×2 映射在这两点上是精确的，中间是仿射近似 —— 够用且稳。
+       */
+      const eps = body.rings.outer;
+      const toScreen = (vec: THREE.Vector3) => {
+        _p.copy(body.world).addScaledVector(vec, eps).project(camera);
+        return { x: ((_p.x - ndcX) * 0.5 * width) / eps, y: (-(_p.y - ndcY) * 0.5 * height) / eps };
+      };
+      const su = toScreen(_u);
+      const sv = toScreen(_w);
+      ringUx = su.x;
+      ringUy = su.y;
+      ringVx = sv.x;
+      ringVy = sv.y;
+    }
+
     out.push({
       id: body.id,
       x: (_v.x * 0.5 + 0.5) * width,
       y: (-_v.y * 0.5 + 0.5) * height,
       radiusPx,
-      ringInnerPx: body.rings ? (focal * body.rings.inner) / depth : 0,
-      ringOuterPx: body.rings ? (focal * body.rings.outer) / depth : 0,
+      ringUx,
+      ringUy,
+      ringVx,
+      ringVy,
+      ringInner: body.rings?.inner ?? 0,
+      ringOuter: body.rings?.outer ?? 0,
       depth,
     });
   }
   return out;
+}
+
+/** 点是否落在环带的斜视椭圆投影里；退化（几乎侧看）时返回 false。 */
+function inRingEllipse(c: PickCandidate, ox: number, oy: number): boolean {
+  if (!(c.ringOuter > 0)) return false;
+  const det = c.ringUx * c.ringVy - c.ringUy * c.ringVx;
+  // 行列式趋零 = 环平面几乎与视线平行，投影退化成一条线，没有可点面积
+  const scale = Math.hypot(c.ringUx, c.ringUy) * Math.hypot(c.ringVx, c.ringVy);
+  if (!(scale > 0) || Math.abs(det) < scale * 1e-4) return false;
+  const a = (ox * c.ringVy - oy * c.ringVx) / det;
+  const b = (c.ringUx * oy - c.ringUy * ox) / det;
+  const r = Math.hypot(a, b);
+  return r >= c.ringInner && r <= c.ringOuter;
 }
 
 /**
@@ -86,11 +153,17 @@ export function projectCandidates(
  *
  * 「看得见的边界优先于看不见的扩边」——所以视盘 0 赢过热区 1，
  * 而环带 0.5 输给本体、赢过邻近卫星的隐形热区（土星环 vs 土卫六就靠这条）。
+ *
+ * 环带必须按**斜视椭圆**判：环平面倾角 26.7°（土星）或 97.8°（天王星）时，
+ * 正圆判定会把整片天空和邻近卫星的热区一起吞掉 —— 实测"土星中心上方 200px 的
+ * 纯黑天区点下去会选中土星"。
  */
 export function tierOf(c: PickCandidate, px: number, py: number): 0 | 0.5 | 1 | null {
-  const d = Math.hypot(px - c.x, py - c.y);
+  const ox = px - c.x;
+  const oy = py - c.y;
+  const d = Math.hypot(ox, oy);
   if (d <= c.radiusPx) return 0;
-  if (c.ringOuterPx > 0 && d >= c.ringInnerPx && d <= c.ringOuterPx) return 0.5;
+  if (inRingEllipse(c, ox, oy)) return 0.5;
   if (d <= Math.max(HOT_RADIUS_CSS, c.radiusPx)) return 1;
   return null;
 }

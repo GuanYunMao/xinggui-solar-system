@@ -14,6 +14,8 @@ npm run verify         # = node scripts/verify.mjs
 端口默认 4178，被占用会自动往后找（4179、4180…），并打印一行提示。
 浏览器路径默认 `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`，
 换机器用环境变量 `XG_EDGE` 指过去（`XG_EDGE=/usr/bin/chromium node scripts/verify.mjs`）。
+产物目录默认 `release/`，用 `XG_RELEASE` 可以指到一份冻结快照（结构要一致：`site/` + `巡星.html`），
+见下节「别和别人的构建撞车」。
 
 ## 9 个 pass 各验什么
 
@@ -27,7 +29,7 @@ npm run verify         # = node scripts/verify.mjs
 | `hit-matrix` | 探针投影出 15 个天体；重叠对只记录不判 | **数值** | 大于/小于 15 说明数据层漏天体，不是渲染问题 |
 | `follow-jitter` | 选中地球后 90 帧，目标屏幕位置峰峰值 < 0.5px | **数值** | 抖动说明相机跟随里混进了逐帧噪声 |
 | `proto-real` | `?proto=1` 真实单位原型：3 个天体、地球钉在屏幕中心 ≤ 1px | **数值** | 偏移说明相机/投影没对齐 |
-| `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动 | **数值** | 见下节「proto-jitter 的维护契约」 |
+| `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动（p10–p90 / 120 帧） | **数值** | 见下节「proto-jitter 的维护契约」 |
 
 数值断言一共 5 条，但**只有 `frame-time` 会因为「这台机器现在忙」而变红**。
 其余四条量的是几何量（投影坐标、像素偏移），和帧率无关，慢机器上数字一样。
@@ -79,8 +81,13 @@ p95 和 hitch 共用 `2.5 × 分母` 这个常数，和旧判据同源：60Hz �
 这条 pass 有四个**非显然依赖**，动任何一个都会**静默失效**——不报错，只是测不出东西。
 （同样的说明也写在 `verify.mjs` 那段注释里，改代码前两边对一遍。）
 
-1. **断言值绑当前实测**：`modern.pp < 0.35`、`legacy.pp > 3 × modern.pp`、`legacy.pp > 0.4`。
-   当前实测 modern 0.114–0.142 / legacy 0.783–0.866（约 6–6.7×），噪声底 0.08–0.10px。
+1. **断言值绑当前实测，且绑估计量**：`modern.pp < 0.35`、`legacy.pp > 3 × modern.pp`、`legacy.pp > 0.2`。
+   估计量是 **p10–p90 / 120 帧**（2026-10 从 max−min / 60 帧换过来的：max−min 只由两个离群点决定，
+   测的是运气）。换后三次连续实测：modern 0.073–0.079、legacy 0.408–0.474，比值 5.2–6.5×。
+   `max−min` 的口径仍输出在 `ppFull` 里（0.13–0.15 / 0.66–0.87），只留档不判定。
+   ⚠ **legacy 下限从 0.4 挪到 0.2 是跟着估计量换算的，不是放宽**：0.4 是按 max−min 定的，
+   换 p10–p90 后整体数值下移约 40%，0.4 离实测最小值只剩 2%，必然误红；0.2 保留了原来
+   「约 2× 余量」的设计意图，真正负责区分的是 `3×` 那条。**再换估计量时，三个阈值要一起换算。**
 2. **视口必须钉死 1920×1080，且 `dist = 1.2e7`**。这个距离是反解出来的：再近，圆盘左右缘
    出画面就测不到边缘；再远，f/视距 变小、信号被噪声吃掉。
 3. **背景色不能写死** `#07090e`：输出色空间是 sRGB，`setClearColor` 的值会先转线性（实测落在
@@ -107,8 +114,31 @@ p95 和 hitch 共用 `2.5 × 分母` 这个常数，和旧判据同源：60Hz �
   在本地都会失真——这也是 frame-time 不许写死 ms 的直接原因。
 - **CI 更慢但更稳，本地更快但会被别的进程抢**。基线法两边都能吃；反过来，写死绝对阈值
   在两边都会误判（CI 偏红、本地偏绿）。
-- **同机并行会互相污染**：两台 verify 同时跑时，双方的全屏 WebGL 会互抢光栅，
-  `frame-time` 的分母会把对方的开销算成「机器基」。要干净数字就串行跑（端口不会撞，CPU 会）。
+- **同机并行**：并发构建和并发 verify 都会污染结果，见下面「别和别人的构建撞车」。
+
+## 别和别人的构建撞车
+
+`release/` 不是只读的：`npm run build` 会先 `rm -rf release/` 再整份重建，整个过程一两秒。
+如果**别人正好在跑构建**，你的 verify 会抓到半成品，症状很有迷惑性：
+
+- `画布没起来（__solarReady 未置位）` + `控制台 404`
+- 或者干脆来个 `pageerror: XXX is not defined`（页面拿到的是上一版 index.html、加载的是新版 JS）
+- **而且每次红的 pass 不一样**（这次 desktop、下次 mobile-selected）——这是撞车的指纹，
+  不是产品 bug
+
+判断方法：看 `release/site/index.html` 引用的 `assets/*.js` 是不是真的存在，以及
+`release/site` 的时间戳是不是落在你这次运行的时间窗里。确认是撞车就**别改代码**，重跑。
+
+要拿到确定性结果，先冻一份快照再验：
+
+```bash
+cp -r release .tmp-release-snap          # 快照（.gitignore 已忽略 .tmp-*）
+XG_RELEASE=.tmp-release-snap npm run verify
+rm -rf .tmp-release-snap
+```
+
+另外，**两台 verify 同时跑也会互相污染**：双方的全屏 WebGL 互抢光栅，
+`frame-time` 的分母会把对方的开销算成「机器基」。端口不会撞（自动往后找），CPU 会。
 
 ## 截图
 
