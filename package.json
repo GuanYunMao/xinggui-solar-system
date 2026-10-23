@@ -10,7 +10,8 @@
     "icons": "node scripts/make-icons.mjs",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "typecheck": "tsc --noEmit",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "check": "node scripts/check-single-file.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

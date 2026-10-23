@@ -51,12 +51,18 @@ npm install
 npm run dev        # 本机开发预览 http://localhost:5173
 npm run build      # 产出 release/
 npm run typecheck
+npm run verify     # 桌面 + 手机视口 + 单文件，真实浏览器验收
+npm run check -- <某个 html>   # 验证任意一份（比如从 GitHub 下载的）能不能跑
 ```
 
 `npm run build` 会生成两份东西：
 
 - `release/site/` —— 静态站点，丢到任何静态托管就能有网址
 - `release/星轨.html` —— 单个自包含 HTML，双击即玩
+
+`npm run check` 单列出来是有原因的：CI 在 Linux 上构建，产物和本机 Windows 的差几十字节
+（Tailwind 扫描候选类名时平台差异，多一条没人用的规则，不会缺样式）。
+所以「我本地验过了」不等于「你手机上那份能跑」，下载回来那份要单独验。
 
 ---
 
