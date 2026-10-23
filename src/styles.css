@@ -1,0 +1,190 @@
+@import "tailwindcss";
+
+@theme {
+  /* 全系统本地字体栈：不依赖 Google Fonts，离线 / 手机 / 电脑都立刻出字 */
+  --font-display: "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", "SimSun", serif;
+  --font-sans: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Source Han Sans SC", "WenQuanYi Zen Hei", sans-serif;
+  --color-bg: #07090e;
+  --color-elevated: #12161c;
+  --color-fg: #e8edf4;
+  --color-muted: #93a0b2;
+  --color-subtle: #6d7b8d;
+  --color-line: #2c3644;
+  --color-accent: #e7edf5;
+  --color-accent-fg: #14181e;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1.5rem;
+}
+
+:root {
+  --motion-quick: 150ms;
+  --motion-fast: 250ms;
+  --motion-slow: 400ms;
+  --ease-smooth-out: cubic-bezier(0.22, 1, 0.36, 1);
+  color-scheme: dark;
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+    background: var(--color-bg);
+    color: var(--color-fg);
+  }
+
+  body {
+    font-family: var(--font-sans);
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+}
+
+.sky {
+  background-color: var(--color-bg);
+  background-image:
+    radial-gradient(1px 1px at 12% 22%, rgb(232 237 244 / 0.75) 50%, transparent 51%),
+    radial-gradient(1px 1px at 28% 70%, rgb(232 237 244 / 0.5) 50%, transparent 51%),
+    radial-gradient(1.5px 1.5px at 70% 28%, rgb(232 237 244 / 0.8) 50%, transparent 51%),
+    radial-gradient(1px 1px at 86% 76%, rgb(232 237 244 / 0.45) 50%, transparent 51%),
+    radial-gradient(1px 1px at 46% 46%, rgb(232 237 244 / 0.4) 50%, transparent 51%),
+    radial-gradient(1px 1px at 62% 16%, rgb(232 237 244 / 0.55) 50%, transparent 51%);
+}
+
+.vignette {
+  background: radial-gradient(ellipse at center, transparent 48%, rgb(7 9 14 / 0.62) 100%);
+}
+
+.space-canvas {
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  display: block;
+}
+
+.eyebrow {
+  letter-spacing: 0.18em;
+}
+
+.sky-title {
+  text-shadow: 0 1px 2px rgb(7 9 14 / 0.7);
+}
+
+.chip-row {
+  scrollbar-width: none;
+}
+
+.chip-row::-webkit-scrollbar {
+  display: none;
+}
+
+.hud-btn {
+  transition:
+    background-color var(--motion-quick) var(--ease-smooth-out),
+    color var(--motion-quick) var(--ease-smooth-out),
+    transform var(--motion-quick) var(--ease-smooth-out);
+}
+
+.hud-btn:active {
+  transform: scale(0.98);
+}
+
+.hud-dock {
+  padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+}
+
+.panel-in {
+  animation: panel-in var(--motion-slow) var(--ease-smooth-out);
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.star-label {
+  display: block;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.3;
+  letter-spacing: 0.08em;
+  color: var(--color-fg);
+  text-shadow: 0 1px 2px rgb(0 0 0 / 0.85);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.star-label.is-selected {
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+.speed-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 2.75rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.speed-range::-webkit-slider-runnable-track {
+  height: 2px;
+  background: var(--color-line);
+  border-radius: 999px;
+}
+
+.speed-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 1.375rem;
+  height: 1.375rem;
+  margin-top: -0.625rem;
+  border-radius: 999px;
+  background: var(--color-accent);
+  border: 2px solid var(--color-bg);
+  box-shadow: 0 0 0 1px var(--color-line);
+}
+
+.speed-range::-moz-range-track {
+  height: 2px;
+  background: var(--color-line);
+  border-radius: 999px;
+}
+
+.speed-range::-moz-range-thumb {
+  width: 1.375rem;
+  height: 1.375rem;
+  border: 2px solid var(--color-bg);
+  border-radius: 999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 1px var(--color-line);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-in {
+    animation: none;
+  }
+
+  .hud-btn,
+  .hud-btn:active {
+    transition: none;
+    transform: none;
+  }
+}

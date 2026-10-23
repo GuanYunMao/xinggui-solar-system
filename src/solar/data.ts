@@ -1,0 +1,417 @@
+export const EARTH_PERIOD = 18;
+
+export type Rgb = [number, number, number];
+
+export type Body = {
+  id: string;
+  name: string;
+  kind: string;
+  blurb: string;
+  radius: number;
+  orbitRadius: number;
+  period: number;
+  phase: number;
+  inclination: number;
+  obliquity: number;
+  spin: number;
+  locked?: boolean;
+  parent?: string;
+  focus: number;
+  swatch: string;
+  texture:
+    | "sun"
+    | "mercury"
+    | "venus"
+    | "earth"
+    | "mars"
+    | "jupiter"
+    | "saturn"
+    | "uranus"
+    | "neptune"
+    | "moon"
+    | "io"
+    | "europa"
+    | "ganymede"
+    | "callisto"
+    | "titan";
+  atmosphere?: { color: Rgb; opacity: number; scale: number };
+  rings?: { inner: number; outer: number; color: Rgb };
+  facts: { label: string; value: string }[];
+};
+
+const deg = (d: number) => (d * Math.PI) / 180;
+
+export const BODIES: Body[] = [
+  {
+    id: "sun",
+    name: "太阳",
+    kind: "恒星 · G2V",
+    blurb: "太阳系的中心恒星，核心的氢聚变释放光和热，质量约占全系的 99.86%。",
+    radius: 3.8,
+    orbitRadius: 0,
+    period: 1,
+    phase: 0,
+    inclination: 0,
+    obliquity: 0.08,
+    spin: 0.08,
+    focus: 18,
+    swatch: "#f0c27a",
+    texture: "sun",
+    facts: [
+      { label: "直径", value: "139.2 万公里" },
+      { label: "质量占比", value: "99.86%" },
+      { label: "表面温度", value: "约 5,500 °C" },
+      { label: "自转", value: "约 25 地球日" },
+    ],
+  },
+  {
+    id: "mercury",
+    name: "水星",
+    kind: "类地行星",
+    blurb: "最靠近太阳的行星，表面布满撞击坑，几乎没有大气，昼夜温差极大。",
+    radius: 0.38,
+    orbitRadius: 8.6,
+    period: 8.2,
+    phase: 0.4,
+    inclination: deg(7),
+    obliquity: deg(0.03),
+    spin: 0.12,
+    parent: "sun",
+    focus: 2.8,
+    swatch: "#b7b1a6",
+    texture: "mercury",
+    facts: [
+      { label: "距日", value: "0.39 AU" },
+      { label: "公转", value: "88 地球日" },
+      { label: "直径", value: "4,879 公里" },
+      { label: "卫星", value: "0" },
+    ],
+  },
+  {
+    id: "venus",
+    name: "金星",
+    kind: "类地行星",
+    blurb: "浓厚的二氧化碳大气造成失控温室，表面比水星更热，自转方向与多数行星相反。",
+    radius: 0.72,
+    orbitRadius: 11.6,
+    period: 12.6,
+    phase: 1.7,
+    inclination: deg(3.4),
+    obliquity: deg(177),
+    spin: -0.04,
+    parent: "sun",
+    focus: 4.6,
+    swatch: "#e3c98a",
+    texture: "venus",
+    atmosphere: { color: [0.95, 0.82, 0.55], opacity: 0.55, scale: 1.08 },
+    facts: [
+      { label: "距日", value: "0.72 AU" },
+      { label: "公转", value: "225 地球日" },
+      { label: "直径", value: "12,104 公里" },
+      { label: "卫星", value: "0" },
+    ],
+  },
+  {
+    id: "earth",
+    name: "地球",
+    kind: "类地行星",
+    blurb: "目前已知唯一拥有表面液态水与生命的行星，大气以氮和氧为主。",
+    radius: 0.76,
+    orbitRadius: 15.2,
+    period: EARTH_PERIOD,
+    phase: 2.5,
+    inclination: 0,
+    obliquity: deg(23.4),
+    spin: 0.95,
+    parent: "sun",
+    focus: 4.8,
+    swatch: "#6aa2d8",
+    texture: "earth",
+    atmosphere: { color: [0.55, 0.74, 1], opacity: 0.7, scale: 1.12 },
+    facts: [
+      { label: "距日", value: "1.00 AU" },
+      { label: "公转", value: "365.25 日" },
+      { label: "直径", value: "12,742 公里" },
+      { label: "卫星", value: "1" },
+    ],
+  },
+  {
+    id: "moon",
+    name: "月球",
+    kind: "天然卫星",
+    blurb: "地球唯一的天然卫星，潮汐锁定，永远以同一面朝向地球，也是潮汐的主要来源。",
+    radius: 0.2,
+    orbitRadius: 1.95,
+    period: 2.55,
+    phase: 0.6,
+    inclination: deg(5.1),
+    obliquity: deg(6.7),
+    spin: 0,
+    locked: true,
+    parent: "earth",
+    focus: 1.7,
+    swatch: "#c5c1b8",
+    texture: "moon",
+    facts: [
+      { label: "距地", value: "38.4 万公里" },
+      { label: "公转", value: "27.3 日" },
+      { label: "直径", value: "3,474 公里" },
+      { label: "引力", value: "地球的 1/6" },
+    ],
+  },
+  {
+    id: "mars",
+    name: "火星",
+    kind: "类地行星",
+    blurb: "锈红色来自表面的氧化铁，拥有太阳系最高的火山奥林波斯山和巨大的峡谷。",
+    radius: 0.52,
+    orbitRadius: 19.4,
+    period: 26,
+    phase: 0.15,
+    inclination: deg(1.85),
+    obliquity: deg(25.2),
+    spin: 0.9,
+    parent: "sun",
+    focus: 3.6,
+    swatch: "#c4654a",
+    texture: "mars",
+    atmosphere: { color: [0.9, 0.55, 0.4], opacity: 0.35, scale: 1.07 },
+    facts: [
+      { label: "距日", value: "1.52 AU" },
+      { label: "公转", value: "687 地球日" },
+      { label: "直径", value: "6,779 公里" },
+      { label: "卫星", value: "2" },
+    ],
+  },
+  {
+    id: "jupiter",
+    name: "木星",
+    kind: "气态巨行星",
+    blurb: "太阳系最大的行星。大红斑是一场持续数百年的反气旋风暴，比地球还宽。",
+    radius: 2.25,
+    orbitRadius: 32,
+    period: 46,
+    phase: 3.6,
+    inclination: deg(1.3),
+    obliquity: deg(3.1),
+    spin: 1.85,
+    parent: "sun",
+    focus: 12.5,
+    swatch: "#d2b48c",
+    texture: "jupiter",
+    atmosphere: { color: [0.93, 0.82, 0.66], opacity: 0.28, scale: 1.05 },
+    facts: [
+      { label: "距日", value: "5.20 AU" },
+      { label: "公转", value: "11.9 年" },
+      { label: "直径", value: "13.98 万公里" },
+      { label: "卫星", value: "95 颗以上" },
+    ],
+  },
+  {
+    id: "io",
+    name: "木卫一",
+    kind: "天然卫星",
+    blurb: "伊俄，太阳系火山活动最剧烈的天体。轨道共振不断揉搓它的内部。",
+    radius: 0.13,
+    orbitRadius: 3.2,
+    period: 3.3,
+    phase: 0.2,
+    inclination: deg(0.04),
+    obliquity: 0,
+    spin: 0,
+    locked: true,
+    parent: "jupiter",
+    focus: 1.45,
+    swatch: "#e2c15a",
+    texture: "io",
+    facts: [
+      { label: "母行星", value: "木星" },
+      { label: "公转", value: "1.77 日" },
+      { label: "直径", value: "3,643 公里" },
+      { label: "特征", value: "活火山" },
+    ],
+  },
+  {
+    id: "europa",
+    name: "木卫二",
+    kind: "天然卫星",
+    blurb: "欧罗巴，冰壳光滑、裂缝纵横，冰层之下可能存在全球性的咸水海洋。",
+    radius: 0.11,
+    orbitRadius: 3.9,
+    period: 5.1,
+    phase: 1.4,
+    inclination: deg(0.47),
+    obliquity: 0,
+    spin: 0,
+    locked: true,
+    parent: "jupiter",
+    focus: 1.35,
+    swatch: "#d5ddd8",
+    texture: "europa",
+    facts: [
+      { label: "母行星", value: "木星" },
+      { label: "公转", value: "3.55 日" },
+      { label: "直径", value: "3,122 公里" },
+      { label: "特征", value: "冰下海洋" },
+    ],
+  },
+  {
+    id: "ganymede",
+    name: "木卫三",
+    kind: "天然卫星",
+    blurb: "伽倪墨得斯，太阳系最大的卫星，直径甚至超过水星，并拥有自己的磁场。",
+    radius: 0.17,
+    orbitRadius: 4.75,
+    period: 7.8,
+    phase: 2.4,
+    inclination: deg(0.2),
+    obliquity: 0,
+    spin: 0,
+    locked: true,
+    parent: "jupiter",
+    focus: 1.6,
+    swatch: "#9a8b78",
+    texture: "ganymede",
+    facts: [
+      { label: "母行星", value: "木星" },
+      { label: "公转", value: "7.15 日" },
+      { label: "直径", value: "5,268 公里" },
+      { label: "特征", value: "内禀磁场" },
+    ],
+  },
+  {
+    id: "callisto",
+    name: "木卫四",
+    kind: "天然卫星",
+    blurb: "卡利斯托，表面古老、撞击坑密集，是四颗伽利略卫星中最外侧的一颗。",
+    radius: 0.16,
+    orbitRadius: 6.15,
+    period: 12.5,
+    phase: 4.1,
+    inclination: deg(0.2),
+    obliquity: 0,
+    spin: 0,
+    locked: true,
+    parent: "jupiter",
+    focus: 1.55,
+    swatch: "#6e675f",
+    texture: "callisto",
+    facts: [
+      { label: "母行星", value: "木星" },
+      { label: "公转", value: "16.7 日" },
+      { label: "直径", value: "4,821 公里" },
+      { label: "特征", value: "古老坑地" },
+    ],
+  },
+  {
+    id: "saturn",
+    name: "土星",
+    kind: "气态巨行星",
+    blurb: "以冰与岩石碎块组成的环系著称。环很宽，厚度往往只有几十米。",
+    radius: 1.9,
+    orbitRadius: 42.5,
+    period: 64,
+    phase: 1.15,
+    inclination: deg(2.5),
+    obliquity: deg(26.7),
+    spin: 1.65,
+    parent: "sun",
+    focus: 14.5,
+    swatch: "#ead7a8",
+    texture: "saturn",
+    atmosphere: { color: [0.96, 0.9, 0.72], opacity: 0.25, scale: 1.05 },
+    rings: { inner: 2.55, outer: 4.35, color: [0.9, 0.84, 0.7] },
+    facts: [
+      { label: "距日", value: "9.58 AU" },
+      { label: "公转", value: "29.5 年" },
+      { label: "直径", value: "11.65 万公里" },
+      { label: "卫星", value: "140 颗以上" },
+    ],
+  },
+  {
+    id: "titan",
+    name: "土卫六",
+    kind: "天然卫星",
+    blurb: "泰坦，拥有浓厚氮气大气，表面有液态甲烷与乙烷构成的湖泊。",
+    radius: 0.17,
+    orbitRadius: 5.35,
+    period: 9.5,
+    phase: 2.2,
+    inclination: deg(0.3),
+    obliquity: 0,
+    spin: 0,
+    locked: true,
+    parent: "saturn",
+    focus: 1.7,
+    swatch: "#e0b56a",
+    texture: "titan",
+    atmosphere: { color: [0.92, 0.72, 0.38], opacity: 0.55, scale: 1.16 },
+    facts: [
+      { label: "母行星", value: "土星" },
+      { label: "公转", value: "16 日" },
+      { label: "直径", value: "5,150 公里" },
+      { label: "特征", value: "甲烷湖泊" },
+    ],
+  },
+  {
+    id: "uranus",
+    name: "天王星",
+    kind: "冰巨星",
+    blurb: "自转轴几乎倒在公转轨道上，像一颗侧躺滚动的冰巨星，环也因此近乎竖直。",
+    radius: 1.22,
+    orbitRadius: 53,
+    period: 92,
+    phase: 4.3,
+    inclination: deg(0.8),
+    obliquity: deg(97.8),
+    spin: 1.15,
+    parent: "sun",
+    focus: 8.2,
+    swatch: "#9fdcd4",
+    texture: "uranus",
+    atmosphere: { color: [0.7, 0.95, 0.92], opacity: 0.4, scale: 1.08 },
+    rings: { inner: 1.7, outer: 2.15, color: [0.7, 0.82, 0.84] },
+    facts: [
+      { label: "距日", value: "19.2 AU" },
+      { label: "公转", value: "84 年" },
+      { label: "直径", value: "5.07 万公里" },
+      { label: "卫星", value: "28" },
+    ],
+  },
+  {
+    id: "neptune",
+    name: "海王星",
+    kind: "冰巨星",
+    blurb: "最外侧的巨行星，深蓝色来自大气中的甲烷，风速可达每小时两千公里。",
+    radius: 1.18,
+    orbitRadius: 63,
+    period: 118,
+    phase: 2.85,
+    inclination: deg(1.8),
+    obliquity: deg(28.3),
+    spin: 1.25,
+    parent: "sun",
+    focus: 7.8,
+    swatch: "#3d5fbe",
+    texture: "neptune",
+    atmosphere: { color: [0.45, 0.62, 1], opacity: 0.45, scale: 1.08 },
+    facts: [
+      { label: "距日", value: "30.1 AU" },
+      { label: "公转", value: "165 年" },
+      { label: "直径", value: "4.92 万公里" },
+      { label: "卫星", value: "16" },
+    ],
+  },
+];
+
+export const BODY_BY_ID: Record<string, Body> = Object.fromEntries(BODIES.map((body) => [body.id, body]));
+
+export const CHIP_BODIES = BODIES.filter((body) => !body.parent || body.parent === "sun");
+
+export function childrenOf(id: string) {
+  return BODIES.filter((body) => body.parent === id);
+}
+
+export function isMoon(body: Body) {
+  return Boolean(body.parent && body.parent !== "sun");
+}
