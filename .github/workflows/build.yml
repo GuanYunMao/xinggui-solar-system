@@ -46,11 +46,13 @@ jobs:
 
       - name: 确认单文件真的产出了
         run: |
-          test -s "release/星轨.html"
+          test -s "release/巡星.html"
           ls -lh release/
 
       - name: 准备发布用文件名（避开 URL 里的中文）
-        run: cp "release/星轨.html" release/xinggui.html
+        # 本地中间产物叫「巡星.html」，这里 cp 成 xinggui.html 再发。
+        # 手机上的固定下载地址是 releases/latest/download/xinggui.html —— 这个名字不许动。
+        run: cp "release/巡星.html" release/xinggui.html
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4

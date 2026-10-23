@@ -1,4 +1,4 @@
-# 星轨 · 独立版
+# 巡星 · 未至之境（独立版）
 
 可交互的三维太阳系轨道仪。从 Grok App Builder 工作区里抽出来，**游戏本体一行没改**，只把外壳换成了普通静态网站。
 
@@ -62,7 +62,8 @@ npm run shoot      # 逐颗星聚焦截图到 screenshots/body-*.png，肉眼查
 `npm run build` 会生成两份东西：
 
 - `release/site/` —— 静态站点，丢到任何静态托管就能有网址
-- `release/星轨.html` —— 单个自包含 HTML，双击即玩
+- `release/巡星.html` —— 单个自包含 HTML，双击即玩（本地中间产物用中文名；
+  发布出去的 asset 仍叫 `xinggui.html`，见下方「版本库」）
 
 `npm run check` 单列出来是有原因的：CI 在 Linux 上构建，产物和本机 Windows 的差几十字节
 （Tailwind 扫描候选类名时平台差异，多一条没人用的规则，不会缺样式）。
@@ -73,8 +74,8 @@ npm run shoot      # 逐颗星聚焦截图到 screenshots/body-*.png，肉眼查
 ## 手机 + 电脑怎么玩
 
 **方式 A · 单文件（最快，零成本）**
-1. 电脑上双击 `release/星轨.html`，浏览器直接打开
-2. 想上手机：把 `星轨.html` 发到微信「文件传输助手」→ 手机点开 → 选「用浏览器打开」
+1. 电脑上双击 `release/巡星.html`，浏览器直接打开
+2. 想上手机：把 `巡星.html` 发到微信「文件传输助手」→ 手机点开 → 选「用浏览器打开」
 
 **方式 B · 托管（手机体验最好，可安装）**
 1. 打开 [app.netlify.com/drop](https://app.netlify.com/drop)，把 `release/site` 文件夹拖进去
@@ -94,7 +95,7 @@ npm run shoot      # 逐颗星聚焦截图到 screenshots/body-*.png，肉眼查
 # 1. 改 src/solar/ 里的东西
 # 2. 打包
 npm run build
-# 3. 重新上传 release/site（或重新发 release/星轨.html）
+# 3. 重新上传 release/site（或重新发 release/巡星.html）
 ```
 
 之所以不会变成「补丁堆」：游戏代码和外壳是分离的，`src/solar/` 里没有任何一处 import 到外壳或平台。
@@ -116,6 +117,11 @@ npm run build
 ```
 https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xinggui.html
 ```
+
+**两个名字不要混**：本地中间产物叫 `release/巡星.html`（中文名，好看、好发微信）；
+发布出去的 asset 叫 `xinggui.html`（ASCII，避开 URL 里的中文编码）。CI 在最后一刻
+`cp "release/巡星.html" release/xinggui.html` 完成这一步。**asset 名是承诺**——
+上面那条下载地址已经被人收藏了，改了就 404。
 
 构建设在 `.github/workflows/build.yml`：push 到 `main` → `npm ci` → `npm run build` →
 按 `package.json` 的版本号打 `v<版本>` 的 tag 并发布 `xinggui.html`。不需要本地打包再手动传。

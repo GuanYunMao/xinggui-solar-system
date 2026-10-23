@@ -8,11 +8,21 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
   version: string;
 };
 
+// 品牌名只有这一处字面量。为什么不放 package.json：那里的 `name` 是技术标识
+// （`xinggui`，npm/仓库/发布 asset 都靠它），拿它当显示名会把两件事绑死。
+// 消费方（src/solar/brand.ts）从这两个常量读，HUD 里不该出现第二处硬编码。
+const APP_NAME = "巡星 · 未至之境"; // 全名：一整个名字，非必要不拆
+const APP_SHORT_NAME = "巡星"; // 短名：单文件产物名、手机桌面标题、窄屏占位
+
 // 纯静态前端：没有任何服务端、数据库或运行时注入。
 // base: "./" 让构建产物可以从任意子目录（甚至本地文件夹）直接打开。
 export default defineConfig({
   base: "./",
-  define: { __APP_VERSION__: JSON.stringify(pkg.version) },
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __APP_NAME__: JSON.stringify(APP_NAME),
+    __APP_SHORT_NAME__: JSON.stringify(APP_SHORT_NAME),
+  },
   resolve: { tsconfigPaths: true },
   plugins: [tailwindcss(), react()],
   server: { host: "0.0.0.0", port: 5173, strictPort: true },

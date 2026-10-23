@@ -49,6 +49,13 @@ type SimStore = GateSlice & {
   selectedId: string | null;
   days: number;
   resetToken: number;
+  /*
+   * 解锁三条门的判定机器（t2 §1 定的条件，只活在本会话、不进存档）：
+   *  - hops：真的换过几次目标（深链也算一次，但 URL 只有一个位置，刷不满 3 次）
+   *  - everReset：有没有回过一次总览（"看过 3 个"和"回得去"是两件事）
+   */
+  hops: number;
+  everReset: boolean;
   mode: Mode;
   switching: Switching;
   /** 进实境前的速度，回沙盘时恢复。 */
@@ -111,7 +118,18 @@ function mergeSlots(current: readonly GateSlot[], incoming: readonly string[]): 
   return canonicalSlots([...current, ...incoming]);
 }
 
-export const useSim = create<SimStore>((set, get) => ({
+export const useSim = create<SimStore>((set, get) => {
+  /*
+   * 「看过三颗并且回得去」这一条要在两个时刻都判：
+   * 第 3 次切换目标那一刻，以及按 Esc 回总览那一刻——顺序反过来也得算数。
+   */
+  const maybeHitTarget = () => {
+    const s = get();
+    if (s.gateLit.includes("target")) return;
+    if (s.hops >= 3 && s.everReset) get().hitGate("target");
+  };
+
+  return {
   paused: false,
   speed: 1,
   showLabels: true,
@@ -120,6 +138,8 @@ export const useSim = create<SimStore>((set, get) => ({
   selectedId: null,
   days: 0,
   resetToken: 0,
+  hops: 0,
+  everReset: false,
   mode: "sandbox",
   switching: null,
   prevSpeed: 1,
@@ -135,20 +155,42 @@ export const useSim = create<SimStore>((set, get) => ({
   togglePaused: () => {
     if (get().switching) return;
     set((s) => ({ paused: !s.paused }));
+    // 门·time：碰过时间就算（暂停/继续都算一次"我动过时间了"）
+    get().hitGate("time");
   },
   setSpeed: (speed) => {
     if (get().switching) return;
-    set({ speed: clampSpeed(speed) });
+    const next = clampSpeed(speed);
+    set({ speed: next });
+    // 门·time：拖到两端才算。hydrate() 直接 set speed，不走这里，所以进游戏不会白送。
+    if (next >= 4 || next <= 0.5) get().hitGate("time");
   },
-  toggleLabels: () => set((s) => ({ showLabels: !s.showLabels })),
-  toggleOrbits: () => set((s) => ({ showOrbits: !s.showOrbits })),
-  toggleTrails: () => set((s) => ({ showTrails: !s.showTrails })),
+  // 门·layer：关掉任意一层拐仗（名称/轨道/尾迹）就算；打开不算。
+  toggleLabels: () => {
+    set((s) => ({ showLabels: !s.showLabels }));
+    if (!get().showLabels) get().hitGate("layer");
+  },
+  toggleOrbits: () => {
+    set((s) => ({ showOrbits: !s.showOrbits }));
+    if (!get().showOrbits) get().hitGate("layer");
+  },
+  toggleTrails: () => {
+    set((s) => ({ showTrails: !s.showTrails }));
+    if (!get().showTrails) get().hitGate("layer");
+  },
 
   // 切换中禁「选择」：切模式那一刻发一个「场景里还不存在」的目标是 bug 温床。
   // 拦下来存一个，落定后再应用（只存一个，后到的覆盖先到的）。
   select: (selectedId) => {
-    if (get().switching) {
+    const s = get();
+    if (s.switching) {
       if (selectedId) set({ queuedSelectId: selectedId });
+      return;
+    }
+    if (selectedId && selectedId !== s.selectedId) {
+      // 门·target：只数"真的换了目标"，同一颗点两次不算
+      set({ selectedId, hops: s.hops + 1 });
+      maybeHitTarget();
       return;
     }
     set({ selectedId });
@@ -160,7 +202,11 @@ export const useSim = create<SimStore>((set, get) => ({
   // 起两次聚焦动画（SolarCanvas 的去重键是 `${selectedId}|${resetToken}`）。
   returnTo: (selectedId) => set((s) => ({ selectedId, resetToken: s.resetToken + 1 })),
   // 兼容老调用点（Hud 的 Esc / 关闭详情 / 返回总览 / 底栏总览）：语义一字未变。
-  requestReset: () => get().returnTo(null),
+  requestReset: () => {
+    get().returnTo(null);
+    set({ everReset: true });
+    maybeHitTarget();
+  },
 
   setMode: (mode) => {
     const s = get();
@@ -254,7 +300,8 @@ export const useSim = create<SimStore>((set, get) => ({
       gateSeen: Math.max(s.gateSeen, record.seen ?? 0),
     });
   },
-}));
+  };
+});
 
 /** 给组件用的派生读法：判定当场算，不碰存储。 */
 export function isGateUnlocked(state: Pick<SimStore, "gateLit" | "gateUnlocked">) {

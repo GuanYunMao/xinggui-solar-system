@@ -23,8 +23,12 @@ import { isGateUnlocked, useSim } from "./store";
  * 为什么面板可以点外面关、Esc 关：它是浮层不是页面，浮层的常识行为缺一条就会被记成 bug。
  */
 
-/** 实境渲染还没接通（engineer 的 1:1 摆位 + RealHud）。接通后翻真，徽标自动变分段控件。 */
-const REAL_READY = false;
+/**
+ * 实境渲染已接通（t16）：`App` 让 `SystemProvider` 跟着 store 的 `mode` 走，
+ * 相机侧由 `realPose` + 米制分支接管，所以徽标解锁后就是可用的分段控件。
+ * 这条开关留着当**总闸**：哪天实境要临时下线，翻回 false 即可，不用拆 UI。
+ */
+const REAL_READY = true;
 
 /**
  * 文案占位。**整块待换**，不要在组件里再加字——加字就是第二份真相。
@@ -61,8 +65,6 @@ const COPY = {
   saveWarn: "这次能进，下次未必记得住。", // gate.save.warn（writeGate 失败时）
   // —— 非文案：格式样例，不翻译、不进表 ——
   importPlaceholder: "XG1-ABCDE-FG",
-  // —— 临时：REAL_READY 翻真当天删，不进口径表 ——
-  unreachable: "实境还没接通", // TODO(temp) 删于 REAL_READY=true
 };
 
 export function ModeBadge() {
@@ -166,6 +168,11 @@ export function ModeBadge() {
   return (
     <div ref={rootRef} className="pointer-events-auto relative shrink-0">
       {unlocked && REAL_READY ? (
+        /*
+          解锁后是「两段 + 一个折角」：两段切模式，折角开面板。
+          折角必须留着——面板里有进度码的导出/读入，那是换设备唯一的搬家通道；
+          如果解锁后徽标变成纯分段控件，那条通道就在解锁的一瞬间消失了。
+        */
         <div
           className="flex h-8 items-center rounded-full border border-line bg-elevated p-0.5"
           role="group"
@@ -173,6 +180,23 @@ export function ModeBadge() {
         >
           {segment("sandbox", COPY.badgeSandbox)}
           {segment("real", COPY.badgeReal)}
+          {/*
+            key 必须给：上面两段是带 key 的（segment 里 key={target}），这个折角如果没 key，
+            同一个 children 列表里就混了「带 key」和「不带 key」两种身份。React 在两支之间
+            切换（锁态单按钮 ↔ 解锁分段）时按身份做插入/删除，混着来就会去删一个它以为还在的
+            旧节点 —— 实测报 `removeChild: not a child of this node`（页面没崩，但控制台有错）。
+          */}
+          <button
+            key="panel"
+            type="button"
+            className="hud-btn ml-0.5 inline-flex size-6 items-center justify-center rounded-full text-subtle"
+            aria-expanded={open}
+            aria-haspopup="dialog"
+            aria-label={COPY.panelTitle}
+            onClick={togglePanel}
+          >
+            <ChevronDown className={`size-3.5 shrink-0 ${open ? "rotate-180" : ""}`} />
+          </button>
         </div>
       ) : (
         /*
@@ -286,10 +310,6 @@ export function ModeBadge() {
             </div>
             {status && <p className="mt-1 text-xs text-subtle">{status}</p>}
           </form>
-
-          {unlocked && !REAL_READY && (
-            <p className="mt-3 border-t border-line pt-2 text-xs text-subtle">{COPY.unreachable}</p>
-          )}
         </div>
       )}
     </div>

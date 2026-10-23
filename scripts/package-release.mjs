@@ -1,6 +1,10 @@
 // 把 `vite build` 的产物打两份：
 //   1. release/site/      —— 一整个静态站点，直接拖到任意静态托管（Netlify / 仓库 Pages / Vercel）即可
-//   2. release/星轨.html   —— 单个自包含 HTML，双击就能玩，也能直接发到手机上
+//   2. release/巡星.html   —— 单个自包含 HTML，双击就能玩，也能直接发到手机上
+//
+// ⚠ 本地中间产物用中文名（`巡星.html`，取游戏短名），但**发布出去的 asset 必须仍叫 `xinggui.html`**：
+//   手机上的固定下载地址是 releases/latest/download/xinggui.html，改名会打断所有已收藏的链接。
+//   这个改名发生在 CI 的最后一步（build.yml 里 cp 成 xinggui.html），不在这里做。
 //
 // 不引入任何构建期第三方依赖，纯 Node 内置模块实现内联。
 import { readFile, writeFile, mkdir, cp, rm, stat } from "node:fs/promises";
@@ -10,6 +14,9 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dist = path.join(root, "dist");
 const release = path.join(root, "release");
+
+// 单文件产物的名字。只用于本地中间产物；发布名见上面的 ⚠。
+const SINGLE_NAME = "巡星.html";
 
 const START = "<!--SINGLE:";
 
@@ -72,11 +79,11 @@ async function main() {
     single = single.replace(id, () => replacement);
   }
 
-  const singlePath = path.join(release, "星轨.html");
+  const singlePath = path.join(release, SINGLE_NAME);
   await writeFile(singlePath, single, "utf8");
 
   const [a, b] = await Promise.all([stat(singlePath), stat(path.join(release, "site", "index.html"))]);
-  console.log(`[release] release/星轨.html        ${(a.size / 1024 / 1024).toFixed(2)} MB（双击即玩）`);
+  console.log(`[release] release/${SINGLE_NAME}        ${(a.size / 1024 / 1024).toFixed(2)} MB（双击即玩）`);
   console.log(`[release] release/site/index.html  ${(b.size / 1024).toFixed(1)} KB（用于托管）`);
   console.log(`[release] release/site/assets/     静态资源`);
 }

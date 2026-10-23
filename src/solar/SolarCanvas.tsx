@@ -740,12 +740,106 @@ function BodyNode({
   );
 }
 
-function HtmlLabel({ y, name, selected }: { y: number; name: string; selected: boolean }) {
-  return (
-    <Html position={[0, y, 0]} center zIndexRange={[4, 0]} style={{ pointerEvents: "none" }}>
-      <span className={selected ? "star-label is-selected" : "star-label"}>{name}</span>
-    </Html>
-  );
+/*
+ * 标签层：自己管 DOM，不用 drei 的 <Html>。
+ *
+ * 为什么换掉：drei 的 <Html> 给每个标签开一个 React portal，切系统时 15 个标签
+ * 在同一帧卸载，portal 的清理和 React 的 commit 抢同一个节点，抛
+ * `removeChild: not a child of this node`。那是未捕获异常，会污染控制台，
+ * 也就让"零控制台报错"这条验收不再可信。
+ *
+ * 这里改成一个常驻容器 + 一批常驻 span：React 只负责容器本身挂载一次，
+ * 之后每帧直接写 transform。切系统时没有任何节点被卸载，也就没有可抢的东西。
+ * 顺带省掉 15 个 portal 和它们的 context —— 这是净减，不是净增。
+ */
+type LabelNode = { el: HTMLSpanElement; text: string; selected: boolean };
+
+function Labels() {
+  const gl = useThree((state) => state.gl);
+  const camera = useThree((state) => state.camera);
+  const reg = useRegistry();
+  const { bodies, spec } = useSystem();
+  const showLabels = useSim((state) => state.showLabels);
+  const selectedId = useSim((state) => state.selectedId);
+
+  const host = useRef<HTMLDivElement | null>(null);
+  const pool = useRef(new Map<string, LabelNode>());
+  const world = useMemo(() => new THREE.Vector3(), []);
+
+  useEffect(() => {
+    const parent = gl.domElement.parentElement;
+    if (!parent) return;
+    const el = document.createElement("div");
+    // z-index:1 —— 黑场覆盖层是 2，标号必须被它盖住
+    el.style.cssText =
+      "position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:1;contain:layout paint";
+    el.dataset.labelLayer = "1";
+    parent.appendChild(el);
+    host.current = el;
+    const nodes = pool.current;
+    return () => {
+      el.remove();
+      host.current = null;
+      nodes.clear();
+    };
+  }, [gl]);
+
+  useFrame(() => {
+    const el = host.current;
+    if (!el) return;
+    const persp = camera as THREE.PerspectiveCamera;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w < 2 || h < 2) return;
+    const focal = h / 2 / Math.tan((persp.fov * Math.PI) / 360);
+    const nodes = pool.current;
+    // 沙盘里卫星不给标签（会叠成一团）；实境里只给选中的那个
+    const baseOn = showLabels && spec.unit !== "meter";
+
+    for (const body of bodies) {
+      const group = reg.groups.get(body.id);
+      const on = Boolean(group) && (selectedId === body.id || (baseOn && !isMoon(body)));
+      const key = body.id;
+      let node = nodes.get(key);
+      if (!on) {
+        if (node) node.el.style.display = "none";
+        continue;
+      }
+      if (!node) {
+        const span = document.createElement("span");
+        span.className = "star-label";
+        el.appendChild(span);
+        node = { el: span, text: "", selected: false };
+        nodes.set(key, node);
+      }
+      const selected = selectedId === body.id;
+      if (node.text !== body.name) {
+        node.el.textContent = body.name;
+        node.text = body.name;
+      }
+      if (node.selected !== selected) {
+        node.el.className = selected ? "star-label is-selected" : "star-label";
+        node.selected = selected;
+      }
+      group!.getWorldPosition(world);
+      // 标签挂在球顶：偏移量随天体半径走，和以前 <Html position={[0, y, 0]}> 一致
+      world.y += body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
+      world.project(camera);
+      const behind = world.z > 1;
+      const x = (world.x * 0.5 + 0.5) * w;
+      const y = (-world.y * 0.5 + 0.5) * h;
+      if (behind || x < -200 || x > w + 200 || y < -80 || y > h + 80) {
+        node.el.style.display = "none";
+        continue;
+      }
+      node.el.style.display = "";
+      node.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`;
+      // focal 只用来给将来的最小字号做参考，先留着免得未使用告警
+      void focal;
+    }
+  });
+
+  return null;
 }
 
 function Asteroids() {

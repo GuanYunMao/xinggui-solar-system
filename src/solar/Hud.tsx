@@ -26,6 +26,7 @@ export function Hud() {
   const showTrails = useSim((state) => state.showTrails);
   const selectedId = useSim((state) => state.selectedId);
   const days = useSim((state) => state.days);
+  const inReal = useSim((state) => state.mode === "real");
   const togglePaused = useSim((state) => state.togglePaused);
   const setSpeed = useSim((state) => state.setSpeed);
   const toggleLabels = useSim((state) => state.toggleLabels);
@@ -33,6 +34,7 @@ export function Hud() {
   const toggleTrails = useSim((state) => state.toggleTrails);
   const select = useSim((state) => state.select);
   const requestReset = useSim((state) => state.requestReset);
+  const setMode = useSim((state) => state.setMode);
   const { byId, byParent, chips } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
   // 卫星在三维场景里太小，靠手点很难命中；选中母行星时把它的卫星排成一行。
@@ -55,14 +57,20 @@ export function Hud() {
     const onKey = (event: KeyboardEvent) => {
       const tag = (event.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
+      // 实境里这些键全都不该生效：没有芯片行、没有图层开关、时间也冻着。
+      // 唯一留给键盘的是 Esc = 回沙盘（t2 §6.5 定的语义）。
+      const real = useSim.getState().mode === "real";
       if (event.code === "Space") {
-        if (tag === "BUTTON") return;
+        if (tag === "BUTTON" || real) return;
         event.preventDefault();
         useSim.getState().togglePaused();
       } else if (event.code === "Escape") {
         // 浮层开着时 Esc 先关浮层（浮层自己的监听负责），别顺手把镜头拉回总览
         if (document.querySelector('[data-overlay-open="true"]')) return;
-        useSim.getState().requestReset();
+        if (useSim.getState().mode === "real") useSim.getState().setMode("sandbox");
+        else useSim.getState().requestReset();
+      } else if (real) {
+        return;
       } else if (event.key === "l" || event.key === "L") {
         useSim.getState().toggleLabels();
       } else if (event.key === "o" || event.key === "O") {
@@ -110,39 +118,55 @@ export function Hud() {
         */}
         <div className="pointer-events-auto flex shrink-0 items-center gap-2">
           <ModeBadge />
-          <span className="h-4 w-px shrink-0 bg-line" aria-hidden />
-          <div className="sky-title flex items-baseline gap-1.5 whitespace-nowrap">
-            <span className="hidden text-xs text-muted sm:inline">
-              {paused ? "已暂停" : "模拟历"}
-            </span>
-            <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
-          </div>
+          {/*
+            实境里不显示模拟历：米制分支把仿真时间钉在 t=0（SolarCanvas 的
+            `spec.unit === "meter"` 那一支），模拟历会掉到「第 0 日」——一个不动的数字
+            比没有更糟，它会让人以为时钟坏了。实境的时间尺度要等真正的时间尺做出来再说。
+          */}
+          {!inReal && (
+            <>
+              <span className="h-4 w-px shrink-0 bg-line" aria-hidden />
+              <div className="sky-title flex items-baseline gap-1.5 whitespace-nowrap">
+                <span className="hidden text-xs text-muted sm:inline">
+                  {paused ? "已暂停" : "模拟历"}
+                </span>
+                <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
+              </div>
+            </>
+          )}
         </div>
       </header>
 
-      <div className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
-        {chips.map((body) => {
-          const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
-          const active = selectedId === body.id || moonOfThis;
-          return (
-            <button
-              key={body.id}
-              id={`chip-${body.id}`}
-              type="button"
-              className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
-                active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
-              }`}
-              aria-pressed={active}
-              onClick={() => select(body.id)}
-            >
-              <span className="size-2 rounded-full" style={{ backgroundColor: body.swatch }} />
-              {body.name}
-            </button>
-          );
-        })}
-      </div>
+      {/*
+        芯片行是**沙盘的概念**：它是「9 个可去的天体」的导航台。
+        实境原型只有 3 个天体且相机被钉在地球上，"一个一个点过去"不成立，
+        所以整行连同卫星行一起收起（要选谁靠点三维里的那一颗，PickLayer 会重建）。
+      */}
+      {!inReal && (
+        <div className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
+          {chips.map((body) => {
+            const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
+            const active = selectedId === body.id || moonOfThis;
+            return (
+              <button
+                key={body.id}
+                id={`chip-${body.id}`}
+                type="button"
+                className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
+                  active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
+                }`}
+                aria-pressed={active}
+                onClick={() => select(body.id)}
+              >
+                <span className="size-2 rounded-full" style={{ backgroundColor: body.swatch }} />
+                {body.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
-      {moons.length > 0 && (
+      {!inReal && moons.length > 0 && (
         <div className="chip-row pointer-events-auto mt-1 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
           <span className="inline-flex h-9 shrink-0 items-center text-xs text-subtle">
             {group?.name}的卫星
@@ -186,7 +210,10 @@ export function Hud() {
               </div>
               <button
                 type="button"
-                className="hud-btn -mr-1 -mt-1 inline-flex size-9 shrink-0 items-center justify-center rounded-md text-subtle md:hidden"
+                // 实境里桌面端也必须有个关掉卡片的出口：那张卡片下面没有「返回总览」可点。
+                className={`hud-btn -mr-1 -mt-1 inline-flex size-9 shrink-0 items-center justify-center rounded-md text-subtle ${
+                  inReal ? "" : "md:hidden"
+                }`}
                 aria-label="关闭详情"
                 onClick={requestReset}
               >
@@ -202,26 +229,45 @@ export function Hud() {
                 </div>
               ))}
             </dl>
-            <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
-              大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
-            </p>
-            <button
-              type="button"
-              className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
-              onClick={requestReset}
-            >
-              返回总览
-            </button>
+            {/*
+              「大小与轨道间距做过压缩」这句是沙盘的免责声明；实境里恰恰是**没有压缩**，
+              原样留着就是假话，所以在 real 下整句不渲染。
+            */}
+            {!inReal && (
+              <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
+                大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
+              </p>
+            )}
+            {/* 实境没有「总览」这个去处（相机被钉在地球上），按钮收起来只留 ✕ */}
+            {!inReal && (
+              <button
+                type="button"
+                className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
+                onClick={requestReset}
+              >
+                返回总览
+              </button>
+            )}
           </article>
         )}
-        {!selected && (
+        {!selected && !inReal && (
           <p className="sky-title pointer-events-none absolute bottom-4 left-6 hidden max-w-sm text-sm text-muted md:block">
             拖拽旋转，滚轮缩放。点选行星后，镜头会平滑聚焦并跟着它走。
           </p>
         )}
       </div>
 
-      <footer className="hud-dock pointer-events-auto border-t border-line bg-elevated px-3 pt-3 md:px-6">
+      {/*
+        底栏整条只在沙盘出现。逐条理由：
+        - 速度滑条：实境的仿真时间被钉在 t=0，滑它没有任何可见变化（等于坏键）。
+        - 暂停：同理，时间本来就不动。
+        - 名称/轨道/尾迹：这三样是沙盘的**地图符号**，实境里轨道线本身是错的假设
+          （真实比例下并不存在一条看得见的线）；尾迹/星空/小行星带在米制下也整体不挂载。
+        - 总览：实境没有"总览"这个去处，相机被钉在地球上。
+        回去的路径只有两条，且都在实境里永远可见：徽标的分段控件、Esc。
+      */}
+      {!inReal && (
+        <footer className="hud-dock pointer-events-auto border-t border-line bg-elevated px-3 pt-3 md:px-6">
         <label className="flex items-center gap-3">
           <span className="w-10 text-sm text-muted">速度</span>
           <input
@@ -300,7 +346,8 @@ export function Hud() {
         <p className="mt-2 hidden text-xs text-subtle md:block">
           空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
         </p>
-      </footer>
+        </footer>
+      )}
     </div>
   );
 }

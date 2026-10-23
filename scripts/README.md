@@ -22,24 +22,24 @@ npm run verify         # = node scripts/verify.mjs
 | `desktop` | 1280×720：画布起来、恰好 1 个 canvas、无横向溢出、点「地球」后卡片标题是「地球」 | 结构性 | `results[]` 里该条的 `errors` / `overflowX` / `selected` |
 | `mobile` | 390×844 @3x 触屏视口同上（不点选） | 结构性 | 同上 |
 | `mobile-selected` | 手机视口 + 点选 | 结构性 | 同上 |
-| `single-file` | `release/星轨.html` 用 `file://` 直接打开（单文件版资源没漏） | 结构性 | 该条 `errors`；漏资源会在控制台报 404 |
+| `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏） | 结构性 | 该条 `errors`；漏资源会在控制台报 404 |
 | `frame-time` | 稳态帧时间相对**本次运行的机器基线**的比值 | **数值** | `results[frame-time].normalized`，见下节 |
 | `hit-matrix` | 探针投影出 15 个天体；重叠对只记录不判 | **数值** | 大于/小于 15 说明数据层漏天体，不是渲染问题 |
 | `follow-jitter` | 选中地球后 90 帧，目标屏幕位置峰峰值 < 0.5px | **数值** | 抖动说明相机跟随里混进了逐帧噪声 |
 | `proto-real` | `?proto=1` 真实单位原型：3 个天体、地球钉在屏幕中心 ≤ 1px | **数值** | 偏移说明相机/投影没对齐 |
-| `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动 | **数值** | `modern.pp ≥ 0.7px` 或 `legacy ≤ modern×1.4`（对照失效） |
+| `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动 | **数值** | 见下节「proto-jitter 的维护契约」 |
 
 数值断言一共 5 条，但**只有 `frame-time` 会因为「这台机器现在忙」而变红**。
 其余四条量的是几何量（投影坐标、像素偏移），和帧率无关，慢机器上数字一样。
 
 ## frame-time 的红线怎么读
 
-判的不是绝对毫秒，是比值：
+判的不是绝对毫秒，是比值。三个判据共用一把尺子：分母 = 本次机器基线。
 
 ```
-normalized.ema = steady.ema ÷ denominatorMs    阈值 1.6
-normalized.p95 = steady.p95 ÷ denominatorMs    阈值 2.2
-hitch          相对量：> max(50ms, 2.5 × 本次中位数)，预算 = 基线 hitch + 1
+normalized.ema  = steady.ema ÷ denominatorMs   阈值 1.6
+normalized.p95  = steady.p95 ÷ denominatorMs   阈值 2.5
+hitch：超过 max(50ms, 2.5 × denominatorMs) 的帧，150 帧里最多允许 2 次
 ```
 
 `denominatorMs` 取两次基线里较大的那个：一次在遥测页**开起来之前**测，一次在**关掉之后**测。
@@ -50,6 +50,8 @@ hitch          相对量：> max(50ms, 2.5 × 本次中位数)，预算 = 基线
 
 分母 = `max(raster.ema, vsync.ema)`。空循环那一路是**兜底**：闲机器上 8 个 pass 可能塞进一帧、
 被 vsync 钉住，这时断言自动退化成「场景 ≤ 1.6 × vsync」——没信息的时候不假装有信息。
+p95 和 hitch 共用 `2.5 × 分母` 这个常数，和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，
+所以 hitch 仍按 50ms 地板算。
 
 红了先按这个顺序看：
 
@@ -59,15 +61,41 @@ hitch          相对量：> max(50ms, 2.5 × 本次中位数)，预算 = 基线
    （单帧光栅量真涨了，比如有人往每帧里塞了贴图重建）。
 3. `steady.ema`（绝对 ms）和 `legacy.wouldFail` 只是留档：`wouldFail: true` 但全绿是**正常**的，
    它记录「旧规矩在同样这份采样上会红」，用来对比，不参与判定。
+4. `normalized.baselineHitches`：同一把尺子量基线页。它也不为 0 说明这台机器本身在抖，
+   此时的 hitch 结论不作数。
 
 阈值 1.6 的来历写在 `verify.mjs` 顶部注释里：旧断言 `EMA ≤ 26ms` 在 60Hz 机器上等于
-26/16.7 = 1.56×，新阈值取 1.6 保持同等严格度，而实测场景÷基线在忙闲两态都是 0.85–0.91，
-留有 1.75× 裕量。
+26/16.7 = 1.56×，新阈值取 1.6 保持同等严格度。
+
+**这条断言的已知盲区（别指望它能抓小回归）**：实测「场景÷基线」在同一个代码版本上
+摆到 0.44–0.90（忙时 0.44–0.61、加压 0.48、闲时 0.55；更早一轮探针里到过 0.90）。
+阈值 1.6 意味着：**能抓住 2.5× 以上的持续光栅量回归，抓不住 1.5× 的**——那是噪声。
+要比「两倍以内」更细的结论，只能关掉机器上别的东西、在安静状态下用绝对阈值复核，
+不要指望这条相对断言。什么时候它会被推翻：如果哪天场景÷基线稳定收敛到 0.6±0.05
+（比如把基线页成本调到跟空闲场景成本接近），阈值就该往 1.0 收，那时它能抓到 1.6× 的回归。
+
+## proto-jitter 的维护契约
+
+这条 pass 有四个**非显然依赖**，动任何一个都会**静默失效**——不报错，只是测不出东西。
+（同样的说明也写在 `verify.mjs` 那段注释里，改代码前两边对一遍。）
+
+1. **断言值绑当前实测**：`modern.pp < 0.35`、`legacy.pp > 3 × modern.pp`、`legacy.pp > 0.4`。
+   当前实测 modern 0.114–0.142 / legacy 0.783–0.866（约 6–6.7×），噪声底 0.08–0.10px。
+2. **视口必须钉死 1920×1080，且 `dist = 1.2e7`**。这个距离是反解出来的：再近，圆盘左右缘
+   出画面就测不到边缘；再远，f/视距 变小、信号被噪声吃掉。
+3. **背景色不能写死** `#07090e`：输出色空间是 sRGB，`setClearColor` 的值会先转线性（实测落在
+   8.94 亮度），采样器是从四角 4×4 块**实测**背景的。
+4. **原型里必须关掉云层壳**（`spec.unit !== "meter"` 那个条件）**并冻结自转/公转**。
+   那个 1.02× 半透明壳会把圆盘轮廓偏移 8px、噪声从 0.1 抬到 0.6px；自转会把贴图暗区
+   转进转出遮罩，实测拉动质心 10–18px。开着任意一条，这条断言就废。
+
+调试入口：`?proto=1&still=1` 是相机钉死状态，噪声底应在 0.08–0.10px；
+**如果噪声底本身变高，是几何细分或云层开关被改了，不是浮点问题。**
 
 ## CI 与本地差异
 
 **先说清楚：CI 现在不跑 verify。** `.github/workflows/build.yml` 只做 `npm run build`
-+ 确认 `release/星轨.html` 产出 + 上传/发布。所以验收目前是「本机 / 发版前手动」的动作。
++ 确认 `release/巡星.html` 产出 + 上传/发布。所以验收目前是「本机 / 发版前手动」的动作。
 （要让 CI 接 verify，得给 runner 装 Edge 或用 `XG_EDGE` 指向 chromium，并接受它比本地慢一档。）
 
 真接进来时要知道的四件事：
@@ -86,3 +114,24 @@ hitch          相对量：> max(50ms, 2.5 × 本次中位数)，预算 = 基线
 
 截图落 `screenshots/`（已在 `.gitignore` 里，别提交）。每个 pass 一张，
 `proto-jitter` 两张（modern / legacy 对照）。红了先看图，往往一眼就看出是画布黑屏还是布局塌了。
+
+## scripts/ 里哪些是长期工具，哪些该删
+
+长期（进仓库、要维护）：
+
+| 文件 | 干什么 |
+| --- | --- |
+| `verify.mjs` | 本文件说的那套验收 |
+| `check-single-file.mjs` | 单文件版自检：资源是否真的内联、没有残留外链 |
+| `bake-textures.mjs` | 预烘行星贴图到 `.texture-src/`（生成物，目录已 ignore） |
+| `make-icons.mjs` | 生成 PWA 图标（`public/icon-*.png`） |
+| `package-release.mjs` | 把 dist 打成 `release/site` + `release/巡星.html` |
+| `shoot.mjs` | 纯截图脚本，出图用，不判红 |
+
+该删（临时/诊断用，`.tmp-*` 与 `screenshots/` 都已在 `.gitignore` 里，但别留着占地）：
+
+- `.tmp-*.mjs` / `.tmp-*.json`：一次性探针。用完就 `rm`。
+- `screenshots/_*.mjs`、`screenshots/_*.png`：调试期留下的诊断脚本和中间图，不是交付物。
+- 历史上误提交过 `.tmp-scan.mjs`，已删并加进 `.gitignore`；提 PR 前扫一眼 `git status`
+  里有没有新的 `.tmp-*` 混进暂存区。
+

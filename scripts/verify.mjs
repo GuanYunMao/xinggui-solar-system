@@ -11,7 +11,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SITE = path.join(root, "release", "site");
-const SINGLE = path.join(root, "release", "星轨.html");
+const SINGLE = path.join(root, "release", "巡星.html");
 const SHOTS = path.join(root, "screenshots");
 // 浏览器可执行文件。默认用系统 Edge（不下载 Chromium）；CI 或别的机器上用
 // XG_EDGE 指过去，比如 XG_EDGE=/usr/bin/chromium。
@@ -80,6 +80,9 @@ const failures = [];
 //   EMA_RATIO_MAX = 1.6
 //     · 与旧断言同严格度：旧阈值 26ms 在 60Hz 紧公差机器上就是 26/16.7 = 1.56×；
 //     · 相对实测 0.85–0.91 留 1.75× 裕量：够抓「单帧光栅量翻倍」的真回归，不给负载误伤。
+//   已知盲区（写在这里免得下次有人把它当万能断言）：同一版代码的比值实测摆到 0.44–0.90
+//   （忙 0.44–0.61、闲 0.55、更早一轮探针 0.89–0.90），所以 1.6 能抓 2.5× 以上、抓不住 1.5×。
+//   要更细只能关掉机器上别的东西、在安静状态下用绝对阈值复核。
 // 基线页若被 vsync 钉住（闲机器上 8 pass 也可能塞进一帧），分母取 max(基线, vsync)，
 // 此时断言自动退化成旧断言 —— 没信息的时候不假装有信息。
 // 尾巴（p95 / hitch）用同一把尺子：HITCH_FACTOR = 2.5 倍的「机器基线」。
@@ -528,6 +531,19 @@ try {
   //      拉动质心 10–18px。开着任意一条，这条断言就废了。
   // 调试入口：?proto=1&still=1 是相机钉死状态，噪声底应在 0.08–0.10px。
   // **噪声底本身变高 = 几何细分或云层开关被改了，不是浮点问题。**
+  //
+  // 估计量：p10–p90（120 帧）。原先用 max−min，那两个数只由两个离群点决定，测的是运气。
+  // 换 p10–p90 后实测（三次连续跑）：modern 0.073–0.079、legacy 0.408–0.474，比值 5.2–6.5×。
+  // 阈值：modern < 0.35（余量 4.4×）、legacy > 3× modern（余量 1.7–2.2×，比 max−min 时代的
+  // 3.8× 宽敞多了，这正是换估计量的目的）、legacy > 0.2。
+  // ⚠ legacy 的下限从 0.4 挪到 0.2，是**跟着估计量换算的**，不是放宽：0.4 是按 max−min
+  // （实测 0.65–0.87）定的，换 p10–p90 后整体数值下移约 40%，0.4 离实测最小值只剩 2%，
+  // 必然误红。0.2 保留了原来「约 2× 余量」的设计意图，真正负责区分的是 3× 那条。
+  const JITTER_FRAMES = 120;
+  const MODERN_PP_MAX = 0.35;
+  const LEGACY_RATIO_MIN = 3;
+  const LEGACY_PP_MIN = 0.2;
+
   const jitterCtx = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const jitterPage = await jitterCtx.newPage();
   const jitterErrors = [];
@@ -537,11 +553,10 @@ try {
     await jitterPage.goto(`${base}${query}`, { waitUntil: "load" });
     await jitterPage.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
     await jitterPage.waitForTimeout(1500);
-    return jitterPage.evaluate(async () => {
+    return jitterPage.evaluate(async (want) => {
       const out = [];
       let frames = 0;
       let bad = 0;
-      const want = 60;
       while (out.length < want && frames < want * 4) {
         await new Promise((r) => requestAnimationFrame(r));
         frames++;
@@ -550,8 +565,20 @@ try {
         else bad++;
       }
       if (!out.length) return { samples: 0, bad };
-      const pp = Math.max(...out) - Math.min(...out);
-      return { samples: out.length, bad, pp: +pp.toFixed(3), x0: +out[0].toFixed(2) };
+      const sorted = [...out].sort((a, b) => a - b);
+      const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+      // 判据用 p10–p90：max−min 只由两个离群点决定，测的是运气；p10–p90 测的是分布宽度。
+      const pp = at(0.9) - at(0.1);
+      const ppFull = sorted[sorted.length - 1] - sorted[0];
+      return {
+        samples: out.length,
+        bad,
+        pp: +pp.toFixed(3),
+        ppFull: +ppFull.toFixed(3), // 留档：旧判据（max−min）的口径，供对照走势
+        p10: +at(0.1).toFixed(2),
+        p90: +at(0.9).toFixed(2),
+        x0: +out[0].toFixed(2),
+      };
     });
   };
   try {
@@ -564,10 +591,11 @@ try {
     if (!modern.samples || !legacy.samples) {
       failures.push(`proto-jitter: 像素回读没采到样本（modern ${modern.samples} / legacy ${legacy.samples}）`);
     } else {
-      if (modern.pp >= 0.35) failures.push(`proto-jitter: 现代路径峰峰 ${modern.pp}px 未低于 0.35px`);
+      // 阈值仍是契约值（0.35 / 3× / 0.4），换的只是估计量：p10–p90 比 max−min 抗离群。
+      if (modern.pp >= 0.35) failures.push(`proto-jitter: 现代路径 p10–p90 ${modern.pp}px 未低于 0.35px`);
       if (legacy.pp <= modern.pp * 3 || legacy.pp <= 0.4) {
         failures.push(
-          `proto-jitter: legacy 峰峰 ${legacy.pp}px 未显著高于现代 ${modern.pp}px（需 >3× 且 >0.4px）—— 对照失效，断言就没意义`,
+          `proto-jitter: legacy p10–p90 ${legacy.pp}px 未显著高于现代 ${modern.pp}px（需 >3× 且 >0.4px）—— 对照失效，断言就没意义`,
         );
       }
     }
