@@ -824,7 +824,7 @@ function Trails() {
 }
 
 function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
-  const { byId } = useSystem();
+  const { byId, spec } = useSystem();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
   const reg = useRegistry();
@@ -918,6 +918,31 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   useFrame((_, raw) => {
     const controls = controlsRef.current;
     if (!controls) return;
+
+    // 实境原型（?proto=1）：相机绕地球缓慢公转且始终看向它。
+    // 地球的世界坐标是 1.5e11 米量级，相机离它 1e7 米 —— 这个比例的减法
+    // 只要发生在 float32 里就会抖。地球被 lookAt 钉在屏幕中心，
+    // 屏幕上任何偏移都只可能来自精度误差，这就是抖动断言量的东西。
+    if (spec.unit === "meter") {
+      const earth = reg.groups.get("earth");
+      if (earth) {
+        // 原型模式下相机由这里独占：OrbitControls 每帧 update() 会把相机拉回它自己的
+        // 球坐标状态，必须关掉，否则手动摆放的机位会被覆盖（表现就是一片黑）
+        controls.enabled = false;
+        earth.getWorldPosition(scratch.dest);
+        const angle = performance.now() * 0.0003;
+        const dist = 1e7;
+        camera.position.set(
+          scratch.dest.x + Math.cos(angle) * dist,
+          scratch.dest.y + dist * 0.2,
+          scratch.dest.z + Math.sin(angle) * dist,
+        );
+        controls.target.copy(scratch.dest);
+        camera.lookAt(scratch.dest);
+        tightenClipPlanes(camera as THREE.PerspectiveCamera, dist);
+      }
+      return;
+    }
 
     // 每帧按焦点距离收窄 near/far：固定值在 1:1 下不可能覆盖 4.87e9 的跨度
     tightenClipPlanes(

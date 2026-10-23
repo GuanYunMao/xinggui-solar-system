@@ -234,6 +234,46 @@ try {
     failures.push(`numeric: ${err.message}`);
   }
   await numCtx.close();
+  // ——— 实境原型（?proto=1）：真实单位、相机离地球 1e7 m ———
+  // 注意：探针读的是 JS 侧的投影结果（double），**看不见 GPU 顶点着色器里的
+  // float32 量化**。所以这里能验的是「1:1 场景没炸、相机与 near/far 站得住」，
+  // 真正的精度抖动要靠像素回读，那是下一步的事。
+  const protoCtx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const protoPage = await protoCtx.newPage();
+  const protoErrors = [];
+  protoPage.on("pageerror", (e) => protoErrors.push(e.message));
+  protoPage.on("console", (m) => m.type() === "error" && protoErrors.push(m.text()));
+  try {
+    await protoPage.goto(`${base}?proto=1`, { waitUntil: "load" });
+    await protoPage.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await protoPage.waitForTimeout(1200);
+    const proto = await protoPage.evaluate(async () => {
+      const cx = window.innerWidth / 2;
+      const cy = window.innerHeight / 2;
+      let maxOffset = 0;
+      let samples = 0;
+      let count = 0;
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => requestAnimationFrame(r));
+        const bodies = window.__solarProbe?.() ?? [];
+        count = bodies.length;
+        const earth = bodies.find((b) => b.id === "earth");
+        if (earth) {
+          samples++;
+          maxOffset = Math.max(maxOffset, Math.hypot(earth.x - cx, earth.y - cy));
+        }
+      }
+      return { bodies: count, samples, centerOffsetPx: +maxOffset.toFixed(3) };
+    });
+    await protoPage.screenshot({ path: path.join(SHOTS, "proto-real.png") });
+    results.push({ pass: "proto-real", ...proto, errors: protoErrors });
+    if (proto.bodies !== 3) failures.push(`proto-real: 原型应有 3 个天体，实际 ${proto.bodies}`);
+    if (proto.centerOffsetPx > 1) failures.push(`proto-real: 地球没钉在屏幕中心，偏移 ${proto.centerOffsetPx}px`);
+    if (protoErrors.length) failures.push(`proto-real: 报错 ${protoErrors.length} 条`);
+  } catch (err) {
+    failures.push(`proto-real: ${err.message}`);
+  }
+  await protoCtx.close();
 } finally {
   await browser.close();
   server.close();

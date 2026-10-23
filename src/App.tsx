@@ -5,11 +5,14 @@ import { BODY_BY_ID } from "./solar/data";
 import { markVisited } from "./solar/progress";
 import { useSim } from "./solar/store";
 import { SystemProvider } from "./solar/system-context";
+import { REAL_PROTO } from "./solar/systems";
 
 /**
  * 壳层组件：与 Grok 原工程的 `src/routes/index.tsx` 逐行对应，
  * 只去掉路由包装（createFileRoute），并给 h-dvh 加了一条 100vh 兜底。
  */
+const PROTO = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("proto") === "1";
+
 export function App() {
   const [ready, setReady] = useState(false);
 
@@ -37,7 +40,7 @@ export function App() {
   }, []);
 
   return (
-    <SystemProvider>
+    <SystemProvider value={PROTO ? REAL_PROTO : undefined}>
       <main className="relative h-screen w-full overflow-hidden bg-bg text-fg" style={{ height: "100dvh" }}>
         <div className="sky absolute inset-0" aria-hidden />
         <p className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-sm text-muted">
@@ -47,7 +50,7 @@ export function App() {
           {ready ? <SolarCanvas /> : null}
         </div>
         <div className="vignette pointer-events-none absolute inset-0 z-[1]" aria-hidden />
-        <Hud />
+        {PROTO ? null : <Hud />}
       </main>
     </SystemProvider>
   );
