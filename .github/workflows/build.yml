@@ -1,8 +1,9 @@
-name: 构建并发布单文件
+name: 构建与发布
 
-# 每次 push 到 main：装依赖 → 构建 → 按 package.json 的版本号打 tag 并发布单文件。
-# 手机端固定下载地址（跨版本不变，永远拿到最新版）：
-# https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xinggui.html
+# 两条通道，按 package.json 的 version 自动分流：
+#   正式版  1.0.2          → 建 release + 抢 latest（手机固定地址从这里取）
+#   快照版  1.0.2-snap.3   → 只出 Actions artifact，绝不碰 release / latest
+# 版本号是承诺不是计数器：小改动走 PATCH，随手改走快照，攒够了再并进正式版。
 
 on:
   push:
@@ -23,12 +24,19 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: 读取版本号
-        id: version
+      - name: 读取版本与摘要
+        id: meta
         run: |
-          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")
-          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "版本 $VERSION"
+          VERSION=$(node -p "require('./package.json').version")
+          NOTE=$(node -p "require('./package.json').releaseNote || ''")
+          case "$VERSION" in
+            *-snap.*) SNAP=true ;;
+            *)        SNAP=false ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "note=$NOTE"        >> "$GITHUB_OUTPUT"
+          echo "snap=$SNAP"        >> "$GITHUB_OUTPUT"
+          echo "版本 $VERSION · 通道 $([ "$SNAP" = true ] && echo 快照 || echo 正式)"
 
       - name: 安装依赖
         run: npm ci
@@ -41,19 +49,32 @@ jobs:
           test -s "release/星轨.html"
           ls -lh release/
 
-      - name: 准备发布用的文件名（避开 URL 里的中文）
+      - name: 准备发布用文件名（避开 URL 里的中文）
         run: cp "release/星轨.html" release/xinggui.html
 
-      - name: 发布 v${{ steps.version.outputs.value }}
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinggui-${{ steps.meta.outputs.version }}
+          path: release/xinggui.html
+          retention-days: 14
+
+      - name: 发布正式版
+        if: steps.meta.outputs.snap == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.value }}
-          name: 星轨 v${{ steps.version.outputs.value }}
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: 星轨 ${{ steps.meta.outputs.version }} · ${{ steps.meta.outputs.note }}
           body: |
-            版本 **v${{ steps.version.outputs.value }}**，由 GitHub Actions 从 `main` 构建。
+            ${{ steps.meta.outputs.note }}
 
-            单文件 `xinggui.html`：双击就能玩，也能发到手机上用浏览器打开。
-            更新内容见仓库里的 `CHANGELOG.md`。
+            完整记录见仓库 `CHANGELOG.md`。
           files: release/xinggui.html
           make_latest: true
           prerelease: false
+
+      - name: 快照说明（不发布）
+        if: steps.meta.outputs.snap == 'true'
+        run: |
+          echo "### 快照版 ${{ steps.meta.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "不建 release、不动 latest。下载：本页 Artifacts → \`xinggui-${{ steps.meta.outputs.version }}\`。" >> "$GITHUB_STEP_SUMMARY"

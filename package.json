@@ -1,9 +1,10 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.1-snap.1",
   "type": "module",
   "description": "星轨 — 可交互的三维太阳系轨道仪（独立版）",
+  "releaseNote": "拆分发布通道",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vite build && node scripts/package-release.mjs",
