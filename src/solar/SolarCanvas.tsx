@@ -38,29 +38,35 @@ const DRAG_THRESHOLD = 6;
 
 const PLANET_VERT = /* glsl */ `
   varying vec2 vUv;
-  varying vec3 vNormalW;
-  varying vec3 vWorld;
+  varying vec3 vN;
+  varying vec3 vPos;
   void main() {
     vUv = uv;
-    vec4 world = modelMatrix * vec4(position, 1.0);
-    vWorld = world.xyz;
-    vNormalW = normalize(mat3(modelMatrix) * normal);
-    gl_Position = projectionMatrix * viewMatrix * world;
+    // 用 modelViewMatrix 而不是 modelMatrix*viewMatrix：
+    // 后者要在 shader 里做大数相减（世界坐标 ~1e11 m），float32 只剩约 16 km 精度，
+    // 1:1 实境下地球会抖 2.5 px。modelViewMatrix 是 CPU 侧用 double 预乘的，
+    // 减完相机位置才降成 float32，抖动消失。
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vPos = mv.xyz;
+    vN = normalize(normalMatrix * normal);
+    gl_Position = projectionMatrix * mv;
   }
 `;
 
 const PLANET_FRAG = /* glsl */ `
   uniform sampler2D uMap;
   varying vec2 vUv;
-  varying vec3 vNormalW;
-  varying vec3 vWorld;
+  varying vec3 vN;
+  varying vec3 vPos;
   void main() {
     vec4 texel = texture2D(uMap, vUv);
     if (texel.a < 0.05) discard;
-    vec3 N = normalize(vNormalW);
-    vec3 L = normalize(-vWorld);
+    vec3 N = normalize(vN);
+    // 太阳在世界原点，投到观察空间再算方向（同样避开大数相减）
+    vec3 sunView = (viewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 L = normalize(sunView - vPos);
     float shade = clamp(dot(N, L) * 0.62 + 0.38, 0.08, 1.0);
-    vec3 V = normalize(cameraPosition - vWorld);
+    vec3 V = normalize(-vPos);
     float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     vec3 col = texel.rgb * shade + texel.rgb * rim * 0.16;
     gl_FragColor = vec4(col, texel.a);
@@ -70,14 +76,14 @@ const PLANET_FRAG = /* glsl */ `
 const CLOUD_FRAG = /* glsl */ `
   uniform sampler2D uMap;
   varying vec2 vUv;
-  varying vec3 vNormalW;
-  varying vec3 vWorld;
+  varying vec3 vN;
+  varying vec3 vPos;
   void main() {
     vec4 texel = texture2D(uMap, vUv);
     if (texel.a < 0.02) discard;
-    vec3 N = normalize(vNormalW);
-    vec3 L = normalize(-vWorld);
-    float ndl = dot(N, L);
+    vec3 N = normalize(vN);
+    vec3 sunView = (viewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float ndl = dot(N, normalize(sunView - vPos));
     // 云要用自己的一套明暗：套行星那套的话，背光侧半透明的白云会被压成灰黑脏斑。
     // 夜侧直接淡出，露出地表，而不是糊一层灰。
     float shade = clamp(ndl * 0.62 + 0.42, 0.28, 1.0);
