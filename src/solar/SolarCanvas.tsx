@@ -7,7 +7,8 @@ import { simClock } from "./clock";
 import { EARTH_PERIOD, isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
-import { tightenClipPlanes } from "./systems";
+import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
+import { realPose, tightenClipPlanes } from "./systems";
 import { cloudTexture, glowTexture, textureFor } from "./textures";
 
 declare global {
@@ -508,7 +509,7 @@ function Atmosphere({ body }: { body: Body }) {
   );
 }
 
-function Rings({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<PointerEvent>) => void }) {
+function Rings({ body }: { body: Body }) {
   const rings = body.rings;
   const mat = useMemo(() => {
     if (!rings) return null;
@@ -529,7 +530,7 @@ function Rings({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<PointerEve
   useEffect(() => () => mat?.dispose(), [mat]);
   if (!rings || !mat) return null;
   return (
-    <mesh rotation={[Math.PI / 2, 0, 0]} material={mat} onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
+    <mesh rotation={[Math.PI / 2, 0, 0]} material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
       <ringGeometry args={[rings.inner, rings.outer, 160]} />
     </mesh>
   );
@@ -544,7 +545,7 @@ function clearPointer() {
   document.body.style.cursor = "";
 }
 
-function SunSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<PointerEvent>) => void }) {
+function SunSurface({ body }: { body: Body }) {
   const mat = useMemo(
     () =>
       new THREE.ShaderMaterial({
@@ -601,7 +602,7 @@ function SunSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Point
   return (
     <group>
       <primitive object={sprite} />
-      <mesh material={mat} onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
+      <mesh material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
         <sphereGeometry args={[body.radius, 64, 48]} />
       </mesh>
       <mesh material={shell} scale={1.55} raycast={() => null}>
@@ -611,7 +612,7 @@ function SunSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Point
   );
 }
 
-function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<PointerEvent>) => void }) {
+function PlanetSurface({ body }: { body: Body }) {
   const reg = useRegistry();
   const map = useMemo(() => textureFor(body), [body]);
   const mat = useMemo(
@@ -658,7 +659,7 @@ function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Po
   const seg = hiFi ? 128 : body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
   return (
     <>
-      <mesh material={mat} onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
+      <mesh material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
         <sphereGeometry args={[body.radius, seg, Math.max(16, Math.round(seg * 0.7))]} />
       </mesh>
       {cloudMat && (
@@ -704,11 +705,6 @@ function BodyNode({
   // 卫星标签只在被选中时出现：全显示的话木星四颗卫星的名字会叠成一团。
   // 卫星靠 HUD 里的卫星芯片行来选择/辨认。
   const labelOn = selected || (showLabels && !isMoon(body));
-  const onPick = (event: ThreeEvent<PointerEvent>) => {
-    event.stopPropagation();
-    if (dragGuard.moved) return;
-    useSim.getState().select(body.id);
-  };
   const labelY = body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
   return (
     <group
@@ -728,17 +724,11 @@ function BodyNode({
             else reg.spins.delete(body.id);
           }}
         >
-          {body.texture === "sun" ? <SunSurface body={body} onPick={onPick} /> : <PlanetSurface body={body} onPick={onPick} />}
+          {body.texture === "sun" ? <SunSurface body={body} /> : <PlanetSurface body={body} />}
         </group>
-        <Rings body={body} onPick={onPick} />
+        <Rings body={body} />
       </group>
-      {/* 卫星太小，手指点不中；套一个透明的可点击球壳放大命中区域 */}
-      {body.radius < 0.35 && (
-        <mesh onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
-          <sphereGeometry args={[Math.max(body.radius * 2.4, 0.12), 10, 8]} />
-          <meshBasicMaterial transparent opacity={0} depthWrite={false} />
-        </mesh>
-      )}
+      {/* 热区已经挪到屏幕空间（见 pick.ts）：这里不再画那个世界空间的透明球壳 */}
       {body.texture !== "sun" && <Atmosphere body={body} />}
       {kids.map((kid) => (
         <group key={kid.id}>
@@ -927,6 +917,28 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
    * 是 `switching` 的唯一释放点（超时兜底在 store 里，不归这里管）。
    */
   const switching = useSim((state) => state.switching);
+  const mode = useSim((state) => state.mode);
+
+  /**
+   * 240ms 黑场。跨模式同时换掉映射、时间倍率、near/far 和 HUD 语义，
+   * 连续形变只会让人分不清在看什么，所以切一刀比补间诚实。
+   * 用命令式 DOM 覆盖层：这是纯过渡视觉，不该进 HUD 的布局账本。
+   */
+  const dip = () => {
+    const host = gl.domElement?.parentElement;
+    if (!host) return;
+    const el = document.createElement("div");
+    el.style.cssText =
+      "position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;transition:opacity 110ms linear;z-index:2";
+    host.appendChild(el);
+    requestAnimationFrame(() => {
+      el.style.opacity = "1";
+    });
+    window.setTimeout(() => {
+      el.style.opacity = "0";
+    }, 120);
+    window.setTimeout(() => el.remove(), 260);
+  };
   const sizeRef = useRef(size);
   sizeRef.current = size;
   // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
@@ -989,6 +1001,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   const wantReset = useRef(resetToken);
   wantReset.current = resetToken;
   const appliedKey = useRef<string | null>(null);
+  const appliedMode = useRef<string>("sandbox");
 
   const startFocus = (controls: OrbitControlsImpl, id: string | null) => {
     const reduced =
@@ -1009,6 +1022,33 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       toDist: body?.focus ?? 1,
       toId: id,
       home: !id,
+    };
+    followId.current = null;
+    controls.enableRotate = false;
+    controls.enableZoom = false;
+  };
+
+  /*
+   * 实地落点：切进实地时把相机摆到「系统外缘 2.4 倍」的全景位，方向由
+   * realPose 从太阳→地球方向推出（与时间无关，不是拿时钟转角度）。
+   * 目标点固定为原点（太阳），因为实地的观测中心是整系而不是某颗行星。
+   */
+  const startSwitchPose = (controls: OrbitControlsImpl) => {
+    const earth = reg.groups.get("earth");
+    const earthWorld = earth ? earth.getWorldPosition(new THREE.Vector3()) : null;
+    const pose = realPose(spec.bodies, earthWorld);
+    const fromPos = camera.position.clone();
+    const fromTarget = controls.target.clone();
+    anim.current = {
+      t: 0,
+      dur: 0.9,
+      fromPos,
+      fromTarget,
+      dir: new THREE.Vector3(pose.dir.x, pose.dir.y, pose.dir.z),
+      fromDist: Math.max(fromPos.distanceTo(fromTarget), 0.001),
+      toDist: pose.dist,
+      toId: null,
+      home: false,
     };
     followId.current = null;
     controls.enableRotate = false;
@@ -1137,12 +1177,20 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       setPosed(true);
     }
 
-    // 选中变化（点芯片 / 深链 / 返回总览）→ 起一次聚焦动画
-    const key = `${wantId.current ?? ""}|${wantReset.current}`;
+    // 选中变化（点芯片 / 深链 / 返回总览）或模式变化 → 起一次镜头动画。
+    // mode 必须进 key：setMode("toReal") 不 bump resetToken，只靠 selectedId|resetToken
+    // 的话切模式根本不重算相机，相机停在原位（t13 收口的三件事之一）。
+    const key = `${wantId.current ?? ""}|${wantReset.current}|${mode}`;
     if (posed && appliedKey.current !== key) {
-      const initial = appliedKey.current === null && wantId.current === null;
+      const initial = appliedKey.current === null;
+      const modeChanged = appliedKey.current !== null && !key.endsWith(`|${appliedMode.current}`);
       appliedKey.current = key;
-      if (!initial) startFocus(controls, wantId.current);
+      appliedMode.current = mode;
+      if (!initial) {
+        if (modeChanged) dip();
+        if (mode === "real") startSwitchPose(controls);
+        else startFocus(controls, wantId.current);
+      }
     }
 
     const delta = Math.min(raw, 0.1);
@@ -1427,6 +1475,70 @@ function Probe() {
   return null;
 }
 
+/**
+ * 屏幕空间拾取层。
+ *
+ * 天体身上已经没有任何 onClick —— 命中判断全在这里：指针抬起时把天体投影成
+ * 屏幕候选，按 t8 §4 的全序选一个。好处是它对单位体系、比例 ρ、模式全无感，
+ * 也不会像世界空间球壳那样在实境里退化成 0.12 米。
+ *
+ * 仍然是「点击时才算」，不是每帧算：15 次投影几微秒，没必要进帧循环。
+ */
+function PickLayer() {
+  const camera = useThree((state) => state.camera);
+  const gl = useThree((state) => state.gl);
+  const reg = useRegistry();
+  const { bodies } = useSystem();
+
+  useEffect(() => {
+    const el = gl.domElement;
+    const tmp = new THREE.Vector3();
+
+    const collect = (): PickBody[] => {
+      const out: PickBody[] = [];
+      for (const b of bodies) {
+        const g = reg.groups.get(b.id);
+        if (!g) continue;
+        g.getWorldPosition(tmp);
+        out.push({ id: b.id, world: tmp.clone(), radius: b.radius, rings: b.rings });
+      }
+      return out;
+    };
+
+    const candidates = () => {
+      const rect = el.getBoundingClientRect();
+      return projectCandidates(camera as THREE.PerspectiveCamera, rect.width, rect.height, collect());
+    };
+
+    const onUp = (ev: PointerEvent) => {
+      // 拖拽视角松手会落一个 pointerup，位移超过阈值就当没点（沿用 dragGuard）
+      if (dragGuard.moved) return;
+      // 切换动画期间不受理选择：store 会把选择排进 queuedSelectId，这里再挡一层
+      if (useSim.getState().switching) return;
+      const rect = el.getBoundingClientRect();
+      const id = resolvePick(candidates(), ev.clientX - rect.left, ev.clientY - rect.top);
+      if (id) useSim.getState().select(id);
+    };
+
+    el.addEventListener("pointerup", onUp);
+
+    // 验收钩子：坐标 → 命中 id、全量候选、热区半径
+    const api = {
+      at: (px: number, py: number) => resolvePick(candidates(), px, py),
+      candidates,
+      hotRadius: HOT_RADIUS_CSS,
+    };
+    (window as unknown as { __solarPick?: typeof api }).__solarPick = api;
+
+    return () => {
+      el.removeEventListener("pointerup", onUp);
+      delete (window as unknown as { __solarPick?: typeof api }).__solarPick;
+    };
+  }, [camera, gl, reg, bodies]);
+
+  return null;
+}
+
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
@@ -1453,6 +1565,7 @@ function Scene() {
     <RegistryContext.Provider value={registry.current}>
       {decor && <Stars />}
       <Probe />
+      <PickLayer />
       <Simulation />
       <BodyNode
         body={sun}

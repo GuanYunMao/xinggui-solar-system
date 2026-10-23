@@ -7,7 +7,7 @@ import {
   isUnlocked,
   readGate,
   writeGate,
-  type DecodeGateResult,
+  type GateFailure,
   type GateSlot,
 } from "./gate";
 
@@ -36,6 +36,8 @@ type GateSlice = {
   gateUnlocked: boolean;
   gateUnlockedAt: number | null;
   gateSeen: number;
+  /** 最近一次写盘失败：只用来在面板上说一句真话，**不参与判定**。 */
+  gatePersistFailed: boolean;
 };
 
 type SimStore = GateSlice & {
@@ -73,7 +75,7 @@ type SimStore = GateSlice & {
   hitGate: (slot: GateSlot) => void;
   bumpGateSeen: () => void;
   exportGateCode: () => string;
-  restoreGateCode: (raw: string) => DecodeGateResult | { ok: true; added: number };
+  restoreGateCode: (raw: string) => GateFailure | { ok: true; added: number };
   hydrateGate: () => void;
 };
 
@@ -95,7 +97,7 @@ function clearSwitchTimeout() {
   switchTimer = null;
 }
 
-/** 持久化只做记忆：失败返回 false，界面可以提一句，但绝不拦人。 */
+/** 持久化只做记忆：失败返回 false，界面可以据此说一句真话，但绝不拦人。 */
 function persistGate(state: GateSlice): boolean {
   return writeGate({
     v: 1,
@@ -126,6 +128,7 @@ export const useSim = create<SimStore>((set, get) => ({
   gateUnlocked: false,
   gateUnlockedAt: null,
   gateSeen: 0,
+  gatePersistFailed: false,
 
   // 切换中禁「暂停 / 调速」：这两个动作会和切换里写进去的 speed / paused 打架，
   // 与其让玩家看到自己刚拖的滑条被覆盖，不如直接不响应。
@@ -207,12 +210,13 @@ export const useSim = create<SimStore>((set, get) => ({
       gateUnlocked: unlockedNow,
       gateUnlockedAt: unlockedNow ? (s.gateUnlockedAt ?? Date.now()) : s.gateUnlockedAt,
     });
-    persistGate(get());
+    // 写盘失败只影响「下次记不记得」，不拦人；但界面要说一句真话（gate.save.warn）。
+    set({ gatePersistFailed: !persistGate(get()) });
   },
 
   bumpGateSeen: () => {
     set((s) => ({ gateSeen: s.gateSeen + 1 }));
-    persistGate(get());
+    set({ gatePersistFailed: !persistGate(get()) });
   },
 
   exportGateCode: () => {
@@ -232,7 +236,7 @@ export const useSim = create<SimStore>((set, get) => ({
       gateUnlocked: unlockedNow,
       gateUnlockedAt: unlockedNow ? (s.gateUnlockedAt ?? Date.now()) : s.gateUnlockedAt,
     });
-    persistGate(get());
+    set({ gatePersistFailed: !persistGate(get()) });
     return { ok: true, added: lit.length - s.gateLit.length };
   },
 

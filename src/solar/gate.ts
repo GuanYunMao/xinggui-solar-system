@@ -122,7 +122,12 @@ export function encodeGate(lit: readonly string[], unlocked: boolean, version = 
 
 export type DecodeGateResult =
   | { ok: true; slots: GateSlot[]; unlocked: boolean }
-  | { ok: false; reason: "empty" | "length" | "prefix" | "alphabet" | "range" | "version" | "checksum" };
+  | { ok: false; reason: GateFailureReason };
+
+export type GateFailureReason = "empty" | "length" | "prefix" | "alphabet" | "range" | "version" | "checksum";
+
+/** 失败分支单独成型：store 的成功返回值带 `added`，不能和 decode 的成功分支混在一个联合里。 */
+export type GateFailure = { ok: false; reason: GateFailureReason };
 
 export function decodeGate(raw: string): DecodeGateResult {
   const normalized = normalizeGate(raw ?? "");

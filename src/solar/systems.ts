@@ -110,3 +110,49 @@ export function tightenClipPlanes(
     camera.updateProjectionMatrix();
   }
 }
+
+/**
+ * 实地落点机位。**与时间无关**——只用「太阳→地球方向」和「系统外缘」两个量。
+ *
+ * 这条注释是给后人踩刹车用的：t9 的黑屏就是拿 `performance.now()*0.0003` 转方位角
+ * 造成的。地球公转角速度是 2π/18 = 0.349 rad/s，而 0.0003 rad/ms = 0.300 rad/s，
+ * 两者几乎同速 → 方位差被锁死在 0 → 相机永远停在地球背光侧，画面全黑。
+ * 所以落点机位一律用「相对某个真实几何量 + 固定夹角」构造，绝不出现时钟。
+ *
+ * 单位无关：外缘取各行星轨道半径的最大值，米制系统里它自然是 4.5e12 m，
+ * 沙盘里是 63 世界单位，两者都能得到一个合理的全景机位。
+ */
+export function realPose(
+  bodies: readonly Body[],
+  earthWorld: { x: number; y: number; z: number } | null,
+): { dir: { x: number; y: number; z: number }; dist: number } {
+  let outer = 0;
+  for (const b of bodies) {
+    if (b.parent && b.parent !== "sun") continue;
+    outer = Math.max(outer, b.orbitRadius);
+  }
+  if (!(outer > 0)) outer = 1;
+
+  // 默认方向：从黄道面上方看进来，与时间无关
+  let dx = 0;
+  let dy = 0.5;
+  let dz = 1;
+  if (earthWorld) {
+    // 站在「地球→太阳」方向再偏 30°：受光一侧，且这个夹角是常数，不随公转漂
+    const len = Math.hypot(earthWorld.x, earthWorld.y, earthWorld.z) || 1;
+    const sx = -earthWorld.x / len;
+    const sz = -earthWorld.z / len;
+    const c = Math.cos(Math.PI / 6);
+    const s = Math.sin(Math.PI / 6);
+    dx = sx * c;
+    dz = sz * c;
+    // 绕世界 Y 轴转 30°（等价于把 (sx,0,sz) 转一个固定角）
+    const nx = dx * Math.cos(Math.PI / 6) - dz * Math.sin(Math.PI / 6);
+    const nz = dx * Math.sin(Math.PI / 6) + dz * Math.cos(Math.PI / 6);
+    dx = nx;
+    dz = nz;
+    dy = s + 0.25;
+  }
+  const n = Math.hypot(dx, dy, dz) || 1;
+  return { dir: { x: dx / n, y: dy / n, z: dz / n }, dist: outer * 2.4 };
+}

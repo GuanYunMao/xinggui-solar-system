@@ -39,19 +39,26 @@ const COPY = {
   badgeReal: "实境", // mode.badge.real
   lockedTag: "未对齐", // gate.entry.locked
   toggleAria: "切换视图", // mode.entry.toggle
+  // 锁态只可能出现在沙盘（硬门在 sandbox→real 上），所以这句可以写死「沙盘」；
+  // 哪天出现「锁态 + 实境」的组合，这里要拆成模板，别硬改字。
+  lockedAria: "沙盘 · 未对齐，打开校准面板", // gate.badge.lockedAria
   panelTitle: "校准", // gate.panel.title
-  panelLede: "有另一种看法，还没对齐。", // gate.panel.lede
-  panelLedeRevealed: "对齐了。另一种看法在右边。", // gate.panel.lede.revealed
-  // —— TODO(copy) 新增 key：t5 的 53 条表里没有，需要补进表 ——
-  dotsAria: "已对齐的格数", // TODO(copy) gate.dots.aria（无障碍：三个点没有名字，所以要一句替代描述）
-  codeLabel: "带走进度", // TODO(copy) gate.panel.codeLabel
-  copyAction: "复制", // TODO(copy) gate.copy.action
-  copyOk: "已复制", // TODO(copy) gate.copy.ok
-  copyFallback: "已选中，长按复制", // TODO(copy) gate.copy.fallback（file:// 下 clipboard 被拒时的退路）
-  importLabel: "有旧进度？", // TODO(copy) gate.panel.importLabel
-  importAction: "读入", // TODO(copy) gate.import.action
-  importOk: "已读入", // TODO(copy) gate.import.ok
-  importFail: "这个码不对", // TODO(copy) gate.import.fail
+  panelLede: "现在这套是压缩过的。另一套等校准做完。", // gate.panel.lede
+  panelLedeRevealed: "校准已完成。", // gate.panel.lede.revealed
+  // 注意：t2 的 gate.unlock.line（定稿「校准完成。」）目前**没有渲染点**——
+  // 它属于「三点全实时面板换形态」那一刻，那个形态还没做。将来做的时候，
+  // lede.revealed 要让位给它，否则同一句话会在一屏里出现两遍。
+  dotsAria: "校准进度", // gate.dots.aria（数值由 aria-valuenow 念，label 不重复数字）
+  codeLabel: "进度码", // gate.panel.codeLabel
+  copyAction: "复制", // gate.copy.action
+  copyOk: "已复制", // gate.copy.ok
+  copyFallback: "已选中，手动复制", // gate.copy.fallback（桌面按 Ctrl+C，所以不能写"长按"）
+  importLabel: "旧进度码", // gate.panel.importLabel
+  importAction: "恢复", // gate.import.action
+  importOk: "已读入", // gate.import.ok（"已恢复"在 added=0 时是假话，故意不用）
+  importFail: "码无效，核对后重填", // gate.import.fail
+  importVersion: "这个码来自别的版本。", // TODO(copy) gate.import.version（唯一"核对"解决不了的错，单独一句）
+  saveWarn: "这次能进，下次未必记得住。", // gate.save.warn（writeGate 失败时）
   // —— 非文案：格式样例，不翻译、不进表 ——
   importPlaceholder: "XG1-ABCDE-FG",
   // —— 临时：REAL_READY 翻真当天删，不进口径表 ——
@@ -65,8 +72,13 @@ export function ModeBadge() {
   const gateLit = useSim((state) => state.gateLit);
   const gateUnlocked = useSim((state) => state.gateUnlocked);
   const unlocked = isGateUnlocked({ gateLit, gateUnlocked });
+  const persistFailed = useSim((state) => state.gatePersistFailed);
   // 派生而不是读存储：gateLit 一变就重算，同一个进度永远得到同一个码。
   const code = encodeGate(gateLit, unlocked);
+  // 点数跟「本次要求」走；超出要求的部分（追加彩蛋、没上调要求时）走 +N 角标。
+  // 夹住之后 aria-valuenow 永远 ≤ aria-valuemax，无障碍不会念出非法数字。
+  const filled = Math.min(gateLit.length, GATE_REQUIRED);
+  const overflow = Math.max(0, gateLit.length - GATE_REQUIRED);
 
   const [open, setOpen] = useState(false);
   const [codeNote, setCodeNote] = useState<string | null>(null);
@@ -127,10 +139,12 @@ export function ModeBadge() {
     event.preventDefault();
     const result = useSim.getState().restoreGateCode(draft);
     if (result.ok) {
-      setStatus(COPY.importOk);
+      // added === 0 是读自己码的常见情况：只说「已读入」，绝不暗示进度变多。
+      setStatus(result.added > 0 ? `${COPY.importOk} +${result.added}` : COPY.importOk);
       setDraft("");
     } else {
-      setStatus(COPY.importFail);
+      // version 是唯一「核对」永远解决不了的错，单独给一句，否则玩家会一直重抄。
+      setStatus(result.reason === "version" ? COPY.importVersion : COPY.importFail);
     }
   };
 
@@ -174,7 +188,7 @@ export function ModeBadge() {
           }`}
           aria-expanded={open}
           aria-haspopup="dialog"
-          aria-label={unlocked ? COPY.toggleAria : `${COPY.badgeSandbox} · ${COPY.lockedTag}`}
+          aria-label={unlocked ? COPY.toggleAria : COPY.lockedAria}
           onClick={togglePanel}
         >
           {mode === "real" ? COPY.badgeReal : COPY.badgeSandbox}
@@ -194,16 +208,37 @@ export function ModeBadge() {
             {unlocked ? COPY.panelLedeRevealed : COPY.panelLede}
           </p>
 
-          <div className="mt-2 flex items-center gap-1.5" aria-label={COPY.dotsAria}>
+          {/*
+            点数是「本次校准要求几格」，所以跟 GATE_REQUIRED，不跟 GATE_SLOTS（12 槽是短码的容量）。
+            将来追加彩蛋只有两条合法路径：
+              ① 上调 GATE_REQUIRED（点自然变多）；
+              ② 不上调 —— 多出来的点亮数走下面的 +N 角标。
+            两条路都不会出现「码里亮着 N 个、界面上没有位置」。
+            数值一律夹在 [0, GATE_REQUIRED]，这样 aria-valuenow 永远合法（无障碍不写假数字）。
+          */}
+          <div
+            className="mt-2 flex items-center gap-1.5"
+            role="progressbar"
+            aria-label={COPY.dotsAria}
+            aria-valuemin={0}
+            aria-valuemax={GATE_REQUIRED}
+            aria-valuenow={filled}
+          >
             {Array.from({ length: GATE_REQUIRED }, (_, index) => (
               <span
                 key={index}
-                className={`size-2 rounded-full ${
-                  index < gateLit.length ? "bg-accent" : "border border-line"
-                }`}
+                className={`size-2 rounded-full ${index < filled ? "bg-accent" : "border border-line"}`}
               />
             ))}
+            {overflow > 0 && (
+              <span className="text-[10px] leading-none tabular-nums text-subtle">+{overflow}</span>
+            )}
           </div>
+
+          {/* 写盘失败时说一句真话：进度没丢，只是没记住。等金色 token 落地后这里可以换 text-gold。 */}
+          {persistFailed && (
+            <p className="mt-2 text-xs leading-relaxed text-muted">{COPY.saveWarn}</p>
+          )}
 
           <div className="mt-3">
             <p className="text-xs text-muted">{COPY.codeLabel}</p>

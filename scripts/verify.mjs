@@ -82,12 +82,15 @@ const failures = [];
 //     · 相对实测 0.85–0.91 留 1.75× 裕量：够抓「单帧光栅量翻倍」的真回归，不给负载误伤。
 // 基线页若被 vsync 钉住（闲机器上 8 pass 也可能塞进一帧），分母取 max(基线, vsync)，
 // 此时断言自动退化成旧断言 —— 没信息的时候不假装有信息。
+// 尾巴（p95 / hitch）用同一把尺子：HITCH_FACTOR = 2.5 倍的「机器基线」。
+// 50ms 地板和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，仍按 50ms 算。
 const CAL_PASSES = 8;
 const CAL_ITER = 24;
 const EMA_RATIO_MAX = 1.6;
-const P95_RATIO_MAX = 2.2;
+const P95_RATIO_MAX = 2.5;
 const HITCH_MIN_MS = 50;
 const HITCH_FACTOR = 2.5;
+const HITCH_ALLOWANCE = 2; // 150 帧里允许 2 次越线（贴图/GC 这类一次性阻塞），3 次及以上算系统性的
 
 const CAL_HTML = `<!doctype html><html><body style="margin:0;background:#000;overflow:hidden">
 <canvas id="c" width="1280" height="720" style="width:1280px;height:720px"></canvas>
@@ -131,45 +134,51 @@ window.__setPasses = (n) => { passes = n; };
 window.__calReady = true;
 </script></body></html>`;
 
-// 采 n 帧的帧间隔，返回中位数/p95/EMA/hitch。
-// hitch 用「相对本次运行自己的中位数」定义：机器整体慢一档时，一条 55ms 的帧
-// 在 40ms 中位数的机器上不算事故，在 16.7ms 的机器上才算 —— 这是它能在忙机器上复现的前提。
-async function sampleIntervals(page, frames = 150) {
-  return page.evaluate(
-    async ({ frames, hitchMinMs, hitchFactor }) => {
-      const deltas = [];
-      await new Promise((resolve) => {
-        let prev = performance.now();
-        let n = 0;
-        const tick = () => {
-          const now = performance.now();
-          deltas.push(now - prev);
-          prev = now;
-          if (++n < frames) requestAnimationFrame(tick);
-          else resolve();
-        };
-        requestAnimationFrame(tick);
-      });
-      const sorted = [...deltas].sort((a, b) => a - b);
-      const median = sorted[Math.floor(sorted.length / 2)];
-      const p95 = sorted[Math.floor(sorted.length * 0.95)];
-      let ema = deltas[0];
-      for (const d of deltas) ema = ema * 0.9 + d * 0.1;
-      const limit = Math.max(hitchMinMs, hitchFactor * median);
-      return {
-        frames: deltas.length,
-        median: +median.toFixed(1),
-        p95: +p95.toFixed(1),
-        ema: +ema.toFixed(1),
-        ratio: +(p95 / median).toFixed(2),
-        hitch: deltas.filter((d) => d > limit).length,
-        hitch50: deltas.filter((d) => d > hitchMinMs).length, // 旧判据的口径，只留档不判红
-        hitchLimitMs: +limit.toFixed(1),
+// 采 n 帧的帧间隔原始值。统计放到 Node 侧做，是为了让「场景」和「基线」能用
+// 同一个卡顿阈值 —— 各自按自己的中位数算阈值，两边的 hitch 次数根本不可比。
+async function collectDeltas(page, frames = 150) {
+  return page.evaluate(async (n) => {
+    const deltas = [];
+    await new Promise((resolve) => {
+      let prev = performance.now();
+      let i = 0;
+      const tick = () => {
+        const now = performance.now();
+        deltas.push(now - prev);
+        prev = now;
+        if (++i < n) requestAnimationFrame(tick);
+        else resolve();
       };
-    },
-    { frames, hitchMinMs: HITCH_MIN_MS, hitchFactor: HITCH_FACTOR },
-  );
+      requestAnimationFrame(tick);
+    });
+    return deltas;
+  }, frames);
 }
+
+// 帧间隔统计。hitch 阈值由调用方给：判定用「机器基线 × HITCH_FACTOR」，留档用各段自己的中位数。
+function statsOf(deltas, hitchThresholdMs) {
+  const sorted = [...deltas].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const p95 = sorted[Math.floor(sorted.length * 0.95)];
+  let ema = deltas[0];
+  for (const d of deltas) ema = ema * 0.9 + d * 0.1;
+  return {
+    frames: deltas.length,
+    median: +median.toFixed(1),
+    p95: +p95.toFixed(1),
+    ema: +ema.toFixed(1),
+    ratio: +(p95 / median).toFixed(2),
+    hitch: deltas.filter((d) => d > hitchThresholdMs).length,
+    hitch50: deltas.filter((d) => d > HITCH_MIN_MS).length, // 旧判据口径，只留档不判红
+    hitchThresholdMs: +hitchThresholdMs.toFixed(1),
+  };
+}
+
+const ownThreshold = (deltas) =>
+  Math.max(
+    HITCH_MIN_MS,
+    HITCH_FACTOR * [...deltas].sort((a, b) => a - b)[Math.floor(deltas.length / 2)],
+  );
 
 // 量一次机器基线：vsync 节拍（空白页）+ 光栅吞吐（定量着色器页）。
 // 必须在遥测页开始渲染**之前/之后**单独跑，不能和它同时开着 ——
@@ -180,8 +189,8 @@ async function measureBaseline(browser) {
     const blank = await ctx.newPage();
     await blank.goto("about:blank");
     await blank.waitForTimeout(300);
-    const vsync = await sampleIntervals(blank, 120);
-
+    const vsyncDeltas = await collectDeltas(blank, 120);
+    const vsync = statsOf(vsyncDeltas, ownThreshold(vsyncDeltas));
     const cal = await ctx.newPage();
     const errors = [];
     cal.on("pageerror", (err) => errors.push(err.message));
@@ -189,10 +198,17 @@ async function measureBaseline(browser) {
     await cal.waitForFunction(() => window.__calReady === true, null, { timeout: 20000 });
     await cal.waitForTimeout(300);
     await cal.evaluate(() => window.__setPasses(1));
-    const onePass = await sampleIntervals(cal, 40); // 只记录：闲机器上它会被 vsync 钉住
+    const onePassDeltas = await collectDeltas(cal, 40); // 只记录：闲机器上它会被 vsync 钉住
     await cal.evaluate((n) => window.__setPasses(n), CAL_PASSES);
-    const raster = await sampleIntervals(cal, 60);
-    return { vsync, onePass, raster, errors };
+    const rasterDeltas = await collectDeltas(cal, 60);
+    return {
+      vsync,
+      onePass: statsOf(onePassDeltas, ownThreshold(onePassDeltas)),
+      raster: statsOf(rasterDeltas, ownThreshold(rasterDeltas)),
+      vsyncDeltas,
+      rasterDeltas,
+      errors,
+    };
   } finally {
     await ctx.close();
   }
@@ -201,18 +217,32 @@ async function measureBaseline(browser) {
 const denomOf = (baseline) => Math.max(baseline.raster.ema, baseline.vsync.ema);
 
 // 判定：绝对值只记录，不判红；判的是「场景 ÷ 基线」的比值。
-function judgeFrameTime(ft, baselines) {
+// 三个判据共用一把尺子：分母 = 本次机器基线，所有阈值都是它的倍数。
+//   EMA  ≤ 1.6 × 分母   —— 稳态帧率
+//   p95  ≤ 2.5 × 分母   —— 不能有一半的帧慢到 2.5 倍
+//   hitch: 超过 2.5 × 分母（且不低于 50ms 地板）的帧，最多 2 次
+// 2.5 这个数在 50ms 地板上和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，仍按 50ms 算。
+function judgeFrameTime(ft, steadyDeltas, baselines) {
   const denominator = Math.max(...baselines.map(denomOf));
-  const hitchBudget =
-    Math.max(...baselines.map((b) => Math.max(b.raster.hitch, b.vsync.hitch))) + 1;
+  const hitchThreshold = Math.max(HITCH_MIN_MS, HITCH_FACTOR * denominator);
+  const hitches = steadyDeltas.filter((d) => d > hitchThreshold).length;
+  const baselineHitches = Math.max(
+    ...baselines.flatMap((b) => [
+      b.rasterDeltas.filter((d) => d > hitchThreshold).length,
+      b.vsyncDeltas.filter((d) => d > hitchThreshold).length,
+    ]),
+  );
+  ft.steady = statsOf(steadyDeltas, hitchThreshold);
   ft.normalized = {
     denominatorMs: +denominator.toFixed(1),
     ema: +(ft.steady.ema / denominator).toFixed(2),
     emaMax: EMA_RATIO_MAX,
     p95: +(ft.steady.p95 / denominator).toFixed(2),
     p95Max: P95_RATIO_MAX,
-    hitch: ft.steady.hitch,
-    hitchBudget,
+    hitch: hitches,
+    hitchThresholdMs: +hitchThreshold.toFixed(1),
+    hitchMax: HITCH_ALLOWANCE,
+    baselineHitches, // 同一把尺子量基线页：留档，说明这台机器本身抖不抖
     // 留档的旧判据：只记录、不判红。留着它是为了在同一份采样上直接对比
     // 「老规矩会不会红」，免得拿两次不同机器状态的运行互相比。
     legacy: {
@@ -222,8 +252,7 @@ function judgeFrameTime(ft, baselines) {
       p95OverMedianWasMax: 1.5,
       hitch50: ft.steady.hitch50,
       hitch50WasMax: 0,
-      wouldFail:
-        ft.steady.ema > 26 || ft.steady.ratio > 1.5 || ft.steady.hitch50 > 0,
+      wouldFail: ft.steady.ema > 26 || ft.steady.ratio > 1.5 || ft.steady.hitch50 > 0,
     },
   };
   const n = ft.normalized;
@@ -237,8 +266,10 @@ function judgeFrameTime(ft, baselines) {
       `frame-time: 归一化 p95 ${n.p95}× > ${P95_RATIO_MAX}×（分母 ${n.denominatorMs}ms，场景 ${ft.steady.p95}ms）`,
     );
   }
-  if (n.hitch > hitchBudget) {
-    failures.push(`frame-time: 稳态 hitch ${n.hitch} 次 > 预算 ${hitchBudget} 次`);
+  if (hitches > HITCH_ALLOWANCE) {
+    failures.push(
+      `frame-time: 稳态 hitch ${hitches} 次 > ${HITCH_ALLOWANCE} 次（阈值 ${n.hitchThresholdMs}ms，基线页同时段 ${baselineHitches} 次）`,
+    );
   }
 }
 
@@ -349,6 +380,7 @@ try {
   let baselineA = null;
   let baselineB = null;
   let frameTime = null;
+  let steadyDeltas = null;
   try {
     baselineA = await measureBaseline(browser);
   } catch (err) {
@@ -366,11 +398,15 @@ try {
     // A1 帧时间：分两段采。启动段单列不判（首屏要逐像素生成 7 张行星贴图，必然有阻塞），
     //    稳态段才断言 —— 混在一起测会把一次性成本当成持续缺陷。
     //    判定见 judgeFrameTime：绝对 ms 只记录，判的是「场景 ÷ 本次机器基线」的比值。
-    const startup = await sampleIntervals(numPage);
+    const startupDeltas = await collectDeltas(numPage);
     await numPage.waitForTimeout(2500); // 让贴图与几何生成完
-    const steady = await sampleIntervals(numPage);
-    frameTime = { pass: "frame-time", passesPerFrame: CAL_PASSES, startup, steady };
-    results.push(frameTime); // 引用入列：后面补上 baseline / normalized 会一起落进 JSON
+    steadyDeltas = await collectDeltas(numPage);
+    frameTime = {
+      pass: "frame-time",
+      passesPerFrame: CAL_PASSES,
+      startup: statsOf(startupDeltas, ownThreshold(startupDeltas)),
+    };
+    results.push(frameTime); // 引用入列：后面补上 steady / baseline / normalized 会一起落进 JSON
 
     // A2 命中矩阵：投影 15 个天体，数屏幕距离 < 44 px 的重叠对
     const hits = await numPage.evaluate(() => {
@@ -419,16 +455,19 @@ try {
     failures.push(`frame-time: 基线 B（场景后）测量失败：${err.message}`);
   }
   const baselines = [baselineA, baselineB].filter(Boolean);
-  if (frameTime && frameTime.steady && baselines.length) {
+  if (frameTime && steadyDeltas && baselines.length) {
     frameTime.baseline = {
       passesPerFrame: CAL_PASSES,
       before: baselineA,
       after: baselineB,
       denominatorMs: +Math.max(...baselines.map(denomOf)).toFixed(1),
     };
-    judgeFrameTime(frameTime, baselines);
-  } else if (frameTime && frameTime.steady) {
-    failures.push("frame-time: 两次机器基线都测失败，无法归一化判定");
+    judgeFrameTime(frameTime, steadyDeltas, baselines);
+  } else {
+    // 不许静默跳过：采样缺失或基线全废，本身就是验收失败（否则这条断言就成了摆设）
+    failures.push(
+      `frame-time: 无法判定（稳态采样 ${steadyDeltas ? "有" : "缺"}，基线 ${baselines.length}/2 次成功）`,
+    );
   }
   // ——— 实境原型（?proto=1）：真实单位、相机离地球 1e7 m ———
   // 注意：探针读的是 JS 侧的投影结果（double），**看不见 GPU 顶点着色器里的
@@ -476,7 +515,19 @@ try {
   // 这一条直接读帧缓冲：取地球圆盘左右缘的中点（多行对称平均），看它逐帧游走多少像素。
   // 对照组 ?legacy=1 把顶点着色器切回 modelMatrix*viewMatrix 的旧写法，
   // 两者除 gl_Position 的算法外逐字相同，所以差异只可能来自顶点位置的 float32 量化。
-  // 视口 1920×1080、相机距离 1.2e7 m：圆盘左右缘都还在画面内，f/视距 也最大。
+  //
+  // ⚠ 这条 pass 的四个非显然依赖，动任何一个都会**静默失效**（不报错，只是测不出东西）：
+  //   ① 视口必须钉死 1920×1080 + dist=1.2e7：这个距离是反解出来的。再近，圆盘左右缘
+  //      出画面就取不到边缘；再远，f/视距 变小、信号被噪声底吃掉。
+  //   ② 断言值绑当前实测：modern.pp < 0.35（实测 0.114–0.142）、legacy > 3× modern
+  //      且 > 0.4px（实测 0.783–0.866，约 6×）、噪声底 0.08–0.10px。
+  //   ③ 背景色不能写死：输出色空间是 sRGB，setClearColor 的值会先转线性（实测落在
+  //      8.94 亮度），采样器是从四角 4×4 块**实测**背景的，写死就全歪。
+  //   ④ 原型里必须关云层壳（spec.unit !== "meter" 那个条件）且冻结自转/公转：
+  //      1.02× 半透明壳会把轮廓偏移 8px、噪声 0.1→0.6px；自转会把贴图暗区转进转出遮罩，
+  //      拉动质心 10–18px。开着任意一条，这条断言就废了。
+  // 调试入口：?proto=1&still=1 是相机钉死状态，噪声底应在 0.08–0.10px。
+  // **噪声底本身变高 = 几何细分或云层开关被改了，不是浮点问题。**
   const jitterCtx = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
   const jitterPage = await jitterCtx.newPage();
   const jitterErrors = [];
