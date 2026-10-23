@@ -38,10 +38,50 @@ function useRegistry() {
 const dragGuard = { moved: false, x: 0, y: 0, active: false };
 const DRAG_THRESHOLD = 6;
 
-const PLANET_VERT = /* glsl */ `
+/**
+ * 诊断开关。?diag=1 时每 20 帧把「相机在哪 / 天体在哪 / 裁剪面 / NDC」打到控制台。
+ * 黑屏这类问题只能靠数字定案：这三种成因（相机没到位、天体没到位、被裁剪）在
+ * 屏幕上都表现为一片黑，只有这四组数能区分开。
+ */
+const DIAG =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).has("diag");
+
+/**
+ * 像素回读开关。WebGL 默认不保留绘制缓冲，readPixels 只能在渲染当帧内读；
+ * 打开 preserveDrawingBuffer 才能在任意时刻读帧。只在原型/对照/诊断模式下开，
+ * 默认路径（沙盘）一个字节都不变。
+ */
+const READBACK =
+  typeof window !== "undefined" &&
+  ["proto", "legacy", "diag"].some((k) => new URLSearchParams(window.location.search).has(k));
+
+/** ?legacy=1：把行星顶点着色器切回"世界坐标过 float32 再减相机"的旧写法，作为抖动对照。 */
+const LEGACY_SHADER =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("legacy") === "1";
+
+/**
+ * 原型相机到地球的距离（米）。默认 1e7，这个距离下地球张角约 1195 px，
+ * float32 的 16384 m 量化在本机 720p 上折合约 1.6 px —— 信噪比最高的测量点。
+ * 允许用 ?dist= 覆盖，纯为了截图取景和极端距离回归。
+ */
+const PROTO_DIST = (() => {
+  const raw = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dist");
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : 1e7;
+})();
+
+/** ?still=1：相机完全钉死。用来量"测量本身的噪声底"，不参与正常断言。 */
+const STILL =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).get("still") === "1";
+
+const VARYINGS = `
   varying vec2 vUv;
   varying vec3 vN;
   varying vec3 vPos;
+`;
+
+const PLANET_VERT_MODERN = /* glsl */ `
+  ${VARYINGS}
   void main() {
     vUv = uv;
     // 用 modelViewMatrix 而不是 modelMatrix*viewMatrix：
@@ -54,6 +94,32 @@ const PLANET_VERT = /* glsl */ `
     gl_Position = projectionMatrix * mv;
   }
 `;
+
+/**
+ * 对照用的旧写法（?legacy=1）。除了 gl_Position 的算法之外与上面逐字相同，
+ * 所以两者画面差异只可能来自顶点位置的 float32 量化，不该有别的东西混进来。
+ */
+const PLANET_VERT_LEGACY = /* glsl */ `
+  ${VARYINGS}
+  void main() {
+    vUv = uv;
+    vec4 world = modelMatrix * vec4(position, 1.0);
+    vec4 mv = viewMatrix * world;
+    vPos = mv.xyz;
+    vN = normalize(normalMatrix * normal);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const PLANET_VERT = LEGACY_SHADER ? PLANET_VERT_LEGACY : PLANET_VERT_MODERN;
+
+/** 复用同一个 Y 轴向量，避免每帧 new Vector3（原型分支里每帧都会用到）。 */
+const Y_AXIS = /* @__PURE__ */ new THREE.Vector3(0, 1, 0);
+
+/** 取一个与给定单位向量垂直的轴（优先用世界 Y，退化时用世界 X）。 */
+function perpAxis(dir: THREE.Vector3) {
+  return Math.abs(dir.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : Y_AXIS;
+}
 
 const PLANET_FRAG = /* glsl */ `
   uniform sampler2D uMap;
@@ -334,15 +400,21 @@ function Stars() {
 function Simulation() {
   const reg = useRegistry();
   // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
-  const { bodies } = useSystem();
+  const { bodies, spec } = useSystem();
   const time = useRef(0);
   const acc = useRef(0);
   useFrame((_, raw) => {
     const delta = Math.min(raw, 0.1);
     const state = useSim.getState();
     if (!state.paused) time.current += delta * state.speed;
-    const t = time.current;
+    const t = spec.unit === "meter" ? 0 : time.current;
     simClock.time = t;
+    // 实境原型只验证相机与深度精度，不自转也不公转：
+    // 地球在 1e7 m 处占屏幕近半，自转会把贴图暗区（深海）转进转出"偏离背景"的遮罩，
+    // 公转会带着月球在画面里乱飞，两者都能把圆盘质心拖出 10~18 px —— 那是纹理和
+    // 别的天体在动，不是渲染在抖。要让 float32 量化暴露出来，靠相机自己的径向呼吸
+    // 就够了（±3% × 1.3e7 m = ±3.9e5 m，约 24 个 16384 m 的量化格）。
+    const spinOn = spec.unit !== "meter";
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
       if (group && body.orbitRadius > 0) {
@@ -352,12 +424,12 @@ function Simulation() {
         group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
       }
       const spin = reg.spins.get(body.id);
-      if (spin) {
+      if (spin && spinOn) {
         const rate = body.locked ? (Math.PI * 2) / body.period : body.spin;
         spin.rotation.y = t * rate;
       }
       const clouds = reg.clouds.get(body.id);
-      if (clouds) clouds.rotation.y = t * body.spin * 1.35;
+      if (clouds && spinOn) clouds.rotation.y = t * body.spin * 1.35;
     }
     if (reg.belt) reg.belt.rotation.y = t * 0.015;
     acc.current += delta;
@@ -566,7 +638,16 @@ function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Po
     },
     [mat, cloudMat],
   );
-  const seg = body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
+  /*
+   * 实境原型（米）下把球面细分拉高。原因不是好看，是测量：
+   * 屏幕上的轮廓是一个多面体而不是圆，弦高 = r·(1−cos(π/N))。
+   * N=56、r=530 px 时弦高 0.83 px，相机一转，哪一圈顶点落在轮廓上就在换，
+   * 轮廓的亚像素形状跟着抖 —— 这个抖动（实测 0.4 px）和要测的 float32 抖动
+   * （同视距下 1.2 px）是同一个量级，会直接盖住信号。
+   * 拉到 128 段后弦高降到 0.16 px，信噪比才够。
+   */
+  const hiFi = useSystem().spec.unit === "meter";
+  const seg = hiFi ? 128 : body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
   return (
     <>
       <mesh material={mat} onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
@@ -580,7 +661,7 @@ function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Po
           }}
         >
           <mesh material={cloudMat} raycast={() => null}>
-            <sphereGeometry args={[body.radius * 1.02, 40, 28]} />
+            <sphereGeometry args={[body.radius * 1.02, hiFi ? 128 : 40, hiFi ? 64 : 28]} />
           </mesh>
         </group>
       )}
@@ -827,6 +908,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   const { byId, spec } = useSystem();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
+  const gl = useThree((state) => state.gl);
   const reg = useRegistry();
   const selectedId = useSim((state) => state.selectedId);
   const resetToken = useSim((state) => state.resetToken);
@@ -848,6 +930,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   } | null>(null);
   const followId = useRef<string | null>(null);
   const prevPlanet = useRef(new THREE.Vector3());
+  const diagTick = useRef(0);
   const scratch = useMemo(
     () => ({
       target: new THREE.Vector3(),
@@ -856,6 +939,8 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       home: new THREE.Vector3(),
       origin: new THREE.Vector3(),
       delta: new THREE.Vector3(),
+      sunDir: new THREE.Vector3(),
+      camDir: new THREE.Vector3(),
     }),
     [],
   );
@@ -927,19 +1012,69 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       const earth = reg.groups.get("earth");
       if (earth) {
         // 原型模式下相机由这里独占：OrbitControls 每帧 update() 会把相机拉回它自己的
-        // 球坐标状态，必须关掉，否则手动摆放的机位会被覆盖（表现就是一片黑）
+        // 球坐标状态，必须关掉，否则手动摆放的机位会被覆盖。
         controls.enabled = false;
         earth.getWorldPosition(scratch.dest);
-        const angle = performance.now() * 0.0003;
-        const dist = 1e7;
-        camera.position.set(
-          scratch.dest.x + Math.cos(angle) * dist,
-          scratch.dest.y + dist * 0.2,
-          scratch.dest.z + Math.sin(angle) * dist,
-        );
+        const dist = PROTO_DIST;
+
+        /*
+         * 机位必须落在「地球→太阳」这个方向上，不能挂在世界固定角上。
+         * 之前的写法用 performance.now()*0.0003 转方位角，而地球公转角速度是
+         * 2π/18 = 0.349 rad/s —— 两者几乎同速，方位差被锁死在 ~0。
+         * 结果相机永远停在地球背光侧（实测 toSun·toCam = −0.98），
+         * 片元着色器的 shade 地板 0.08 把整颗球压到 RGB(2,3,5)，
+         * 比清屏色 #07090e 还暗 —— 画面全黑的真正原因就在这里，
+         * 不是相机没到位、不是天体没到位、也不是被 near/far 裁掉。
+         *
+         * 现在：相机站在地球与太阳之间（相位角 0），整面受光；再抬 12° 俯视一点，
+         * 相位角 12° 时最远端点的 dot(N,L) = −sin12° = −0.21，
+         * shade 仍有 0.25，整个轮廓都亮 —— 像素回读的遮罩才能量到真正的圆盘，
+         * 而不是"受光的那一块"。
+         *
+         * 运动改成径向呼吸（±3%），不是绕转：绕转会改变受光区域大小，
+         * 质心会跟着系统性漂移，把 1 px 级的抖动淹掉。
+         */
+        scratch.sunDir.copy(scratch.dest).negate().normalize();
+        scratch.camDir.copy(scratch.sunDir);
+        scratch.camDir.applyAxisAngle(perpAxis(scratch.sunDir), 0.2126); // 抬 12° 俯视
+        // 绕「日向轴」滚转 ±10°：与太阳的夹角恒定，受光区域完全不变，
+        // 但相机在三维里扫一个锥面，float32 的量化误差才会在屏幕横向扫出来。
+        // 只做径向呼吸的话，误差几乎全落在视线方向上，投影上根本看不见。
+        scratch.camDir.applyAxisAngle(scratch.sunDir, 0.17 * Math.sin(performance.now() * 0.0016));
+        const breath = 1 + 0.01 * Math.sin(performance.now() * 0.00314);
+        camera.position.copy(scratch.dest).addScaledVector(scratch.camDir, STILL ? dist : dist * breath);
+
         controls.target.copy(scratch.dest);
         camera.lookAt(scratch.dest);
         tightenClipPlanes(camera as THREE.PerspectiveCamera, dist);
+
+        if (DIAG && diagTick.current++ % 20 === 0) {
+          const persp = camera as THREE.PerspectiveCamera;
+          const ndc = scratch.dest.clone().project(camera);
+          // 太阳（原点）→地球 与 地球→相机 两个单位向量的点积：>0 表示看着昼半球
+          const toSun = scratch.sunDir;
+          const toCam = camera.position.clone().sub(scratch.dest).normalize();
+          const lit = toSun.dot(toCam);
+          const ctx = gl.getContext();
+          const bw = gl.domElement.width;
+          const bh = gl.domElement.height;
+          const px = new Uint8Array(4);
+          ctx.readPixels(bw >> 1, bh >> 1, 1, 1, ctx.RGBA, ctx.UNSIGNED_BYTE, px);
+          console.log(
+            "[proto]",
+            JSON.stringify({
+              camToEarth: camera.position.distanceTo(scratch.dest).toExponential(3),
+              near: persp.near.toExponential(3),
+              far: persp.far.toExponential(3),
+              ndc: [ndc.x, ndc.y, ndc.z].map((n) => +n.toFixed(4)),
+              draws: gl.info.render.calls,
+              tris: gl.info.render.triangles,
+              litFace: +lit.toFixed(4),
+              centerRGBA: Array.from(px),
+              legacy: LEGACY_SHADER,
+            }),
+          );
+        }
       }
       return;
     }
@@ -1028,6 +1163,7 @@ function Probe() {
   const reg = useRegistry();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
+  const gl = useThree((state) => state.gl);
   const { bodies } = useSystem();
 
   useEffect(() => {
@@ -1054,10 +1190,161 @@ function Probe() {
       return projected;
     };
     (window as unknown as { __solarProbe?: typeof probe }).__solarProbe = probe;
+
+    /*
+     * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
+     * 算亮斑的水平质心。为什么不是别的做法：
+     *
+     *  - 不用亮度的绝对值：地球有昼夜面，片元着色器的 shade 地板是 0.08，
+     *    夜面亮度比清屏色 #07090e 还低，绝对亮度阈值会把夜面判成背景。
+     *    「偏离背景」这个判据对光照免疫，只认轮廓。
+     *  - 不用单行扫描线找边缘：地球在 1e7 m 处直径约 1195 px，纵向早被视口裁掉了，
+     *    单行只能保证找到左右边；而质心法对裁切免疫——纵向裁切是上下对称的，
+     *    不会把水平质心带偏。
+     *  - 不用 probe 的 JS 投影：探针算的是 double 结果，看不见顶点着色器里的
+     *    float32 量化。这正是 t7 报的那个 2.51 px 抖动测不出来的原因。
+     *
+     * 返回 null 表示这一帧没有可分辨的亮斑（还没渲染 / 全黑），调用方应按失败处理。
+     */
+    const pixels = (radiusPx?: number) => {
+      // 没开 preserveDrawingBuffer 时绘制缓冲在合成后即失效，读回来是空的。
+      // 与其返回一个看似有效的假数据，不如直接说"这个模式下测不了"。
+      if (!READBACK) return null;
+      const ctx = gl.getContext();
+      const W = gl.domElement.width;
+      const H = gl.domElement.height;
+      const buf = new Uint8Array(W * H * 4);
+      ctx.readPixels(0, 0, W, H, ctx.RGBA, ctx.UNSIGNED_BYTE, buf);
+      /*
+       * 背景色不能写死 #07090e。渲染器的 outputColorSpace 是 sRGB，setClearColor
+       * 传进去的 sRGB 值会先转成线性工作空间再进缓冲。所以背景色从四个角落的
+       * 4×4 块里量，量到什么算什么（实测 8.94）。
+       */
+      const lumAt = (x: number, y: number) => {
+        const i = (y * W + x) * 4;
+        return 0.2126 * buf[i]! + 0.7152 * buf[i + 1]! + 0.0722 * buf[i + 2]!;
+      };
+      let bg = 0;
+      let bgN = 0;
+      for (const [ox, oy] of [
+        [0, 0],
+        [W - 4, 0],
+        [0, H - 4],
+        [W - 4, H - 4],
+      ] as const) {
+        for (let y = oy; y < oy + 4; y++) for (let x = ox; x < ox + 4; x++) bg += lumAt(x, y);
+        bgN += 16;
+      }
+      bg /= bgN;
+      const EPS = 1;
+
+      /*
+       * 为什么量「边缘」而不是「质心」：
+       * 二值遮罩的质心会被"活到阈值以上"的面积带偏 —— 圆盘左缘那片深海
+       * （线性反照率 0.003，乘上边缘 0.38 的 shade 后落在输出 8/255，正好等于背景 8.9）
+       * 会整块掉出遮罩，质心因此系统性右移 0.6% 画宽，并且随相机滚转来回摆。
+       * 实测：圆盘左右缘的中点稳定在 640，而质心在 648 —— 差 8 px。
+       *
+       * 边缘法对这件事免疫：只找"背景 → 圆盘"的那一次跃变。
+       * 再用多行平均压噪声：float32 量化带来的位移是全画面相干的（每行一起动），
+       * 纹理造成的边缘抖动是各行独立的，平均 9 行能压掉 sqrt(9)=3 倍。
+       */
+      const edgeAt = (y: number, fromLeft: boolean) => {
+        const lum = (x: number) => lumAt(x, y);
+        let x0 = -1;
+        if (fromLeft) {
+          for (let x = 2; x < W - 2; x++)
+            if (lum(x) > bg + 6) {
+              x0 = x;
+              break;
+            }
+        } else {
+          for (let x = W - 3; x > 1; x--)
+            if (lum(x) > bg + 6) {
+              x0 = x;
+              break;
+            }
+        }
+        if (x0 < 0) return null;
+        // 局部峰值当参考，阈值取半高：边缘亮度随贴图变化，绝对阈值会跟着漂
+        let peak = -1;
+        if (fromLeft) for (let x = x0; x < Math.min(W, x0 + 48); x++) peak = Math.max(peak, lum(x));
+        else for (let x = Math.max(0, x0 - 48); x <= x0; x++) peak = Math.max(peak, lum(x));
+        if (peak < bg + 12) return null;
+        const thr = bg + (peak - bg) * 0.5;
+        if (fromLeft) {
+          // 从里往外走，找第一次跌破阈值的位置，再线性插值到亚像素
+          for (let x = x0 + 12; x > x0 - 2 && x > 1; x--) {
+            const a = lum(x - 1);
+            const b = lum(x);
+            if (a >= thr && b < thr) return x - 1 + (a - thr) / (a - b);
+          }
+        } else {
+          for (let x = x0 - 12; x < x0 + 2 && x < W - 2; x++) {
+            const a = lum(x);
+            const b = lum(x + 1);
+            if (a >= thr && b < thr) return x + (a - thr) / (a - b);
+          }
+        }
+        return null;
+      };
+
+      /*
+       * 取左右两缘的中点，不取单边：
+       * 单边位置 = 圆心 − 半径，而相机在径向呼吸（±1%），半径就有 ±6 px 的变化，
+       * 单边量出来的"抖动"全是呼吸，跟浮点无关（实测单边 16 px）。
+       * 中点对缩放免疫：两缘同步外扩/内收，中点不动。
+       */
+      let sumC = 0;
+      let rows = 0;
+      const used: number[] = [];
+      for (let k = -4; k <= 4; k++) {
+        const y = Math.round(H / 2 + (k * H) / 24);
+        if (y < 1 || y > H - 2) continue;
+        const l = edgeAt(y, true);
+        const r = edgeAt(y, false);
+        if (l === null || r === null || r - l < W * 0.1) continue;
+        // 记下来供诊断：半径可以和探针给的 radiusPx 对账
+        used.push(+(r - l).toFixed(2));
+        sumC += (l + r) / 2;
+        rows++;
+      }
+      if (!rows) return null;
+      const centerX = sumC / rows;
+      const radiusPxMeasured = used.reduce((a, b) => a + b, 0) / used.length / 2;
+
+      // 兜底的全画面质心（诊断用，不参与断言）
+      let sx = 0;
+      let sy = 0;
+      let n = 0;
+      for (let y = 0; y < H; y += 2) {
+        for (let x = 0; x < W; x += 2) {
+          if (Math.abs(lumAt(x, y) - bg) > EPS) {
+            sx += x;
+            sy += y;
+            n++;
+          }
+        }
+      }
+      return {
+        x: centerX,
+        y: n ? sy / n : 0,
+        rows,
+        radiusPx: +radiusPxMeasured.toFixed(2),
+        probeRadiusPx: radiusPx ?? null,
+        pixels: n * 4,
+        width: W,
+        height: H,
+        bg: +bg.toFixed(2),
+      };
+    };
+    (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels = pixels;
+
     return () => {
       delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
+      delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
     };
-  }, [reg, camera, bodies, size.height, size.width]);
+  }, [reg, camera, gl, bodies, size.height, size.width]);
 
   return null;
 }
@@ -1073,17 +1360,30 @@ function Scene() {
     belt: null,
   });
   const controlsRef = useRef<OrbitControlsImpl>(null);
-  const { byId } = useSystem();
+  const { byId, spec } = useSystem();
   const sun = byId.sun;
   if (!sun) return null;
+  /*
+   * 实境原型（米）下不挂沙盘装饰：星空、小行星带、尾迹的几何体都建在
+   * 「离原点几十到几百」这个量级上，而原型里那个量级是"几十米"。
+   * 更麻烦的是尾迹——它记录的是世界坐标（~1.5e11 m）且 frustumCulled=false，
+   * 在 float32 下大数相减会把它画到屏幕上任意位置，像素回读的亮斑质心
+   * 会被它拖走 10~18 px（proto 与 legacy 同样漂移，就是这个东西干的）。
+   */
+  const decor = spec.unit !== "meter";
   return (
     <RegistryContext.Provider value={registry.current}>
-      <Stars />
+      {decor && <Stars />}
       <Probe />
       <Simulation />
-      <BodyNode body={sun} showOrbits={showOrbits} showLabels={showLabels} selectedId={selectedId} />
-      <Asteroids />
-      <Trails />
+      <BodyNode
+        body={sun}
+        showOrbits={showOrbits && decor}
+        showLabels={showLabels && decor}
+        selectedId={selectedId}
+      />
+      {decor && <Asteroids />}
+      {decor && <Trails />}
       <CameraRig controlsRef={controlsRef} />
       <OrbitControls
         ref={controlsRef}
@@ -1107,7 +1407,7 @@ export function SolarCanvas() {
       className="space-canvas"
       dpr={[1, 1.6]}
       camera={{ position: [0, 40, 112], fov: 42, near: 0.06, far: 2400 }}
-      gl={{ antialias: true, alpha: false, powerPreference: "high-performance" }}
+      gl={{ antialias: true, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: READBACK }}
       onPointerDown={(event) => {
         dragGuard.x = event.clientX;
         dragGuard.y = event.clientY;

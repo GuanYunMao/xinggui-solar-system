@@ -64,7 +64,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.meta.outputs.version }}
-          name: 星轨 ${{ steps.meta.outputs.version }} · ${{ steps.meta.outputs.note }}
+          name: 巡星 ${{ steps.meta.outputs.version }} · ${{ steps.meta.outputs.note }}
           body: |
             ${{ steps.meta.outputs.note }}
 

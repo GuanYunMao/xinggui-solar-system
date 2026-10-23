@@ -1,7 +1,7 @@
 {
-  "name": "星轨",
-  "short_name": "星轨",
-  "description": "可交互的三维太阳系轨道仪",
+  "name": "巡星 · 未至之境",
+  "short_name": "巡星",
+  "description": "巡星 · 未至之境 —— 可交互的三维太阳系",
   "lang": "zh-CN",
   "start_url": "./",
   "scope": "./",
