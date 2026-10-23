@@ -1,7 +1,7 @@
 import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { useEffect } from "react";
-import { BODY_BY_ID, CHIP_BODIES, childrenOf } from "./data";
 import { bindSettingsPersistence, loadSettings, useSim } from "./store";
+import { useSystem } from "./system-context";
 
 function formatSpeed(speed: number) {
   return `${speed.toFixed(1)}×`;
@@ -30,15 +30,16 @@ export function Hud() {
   const toggleTrails = useSim((state) => state.toggleTrails);
   const select = useSim((state) => state.select);
   const requestReset = useSim((state) => state.requestReset);
-  const selected = selectedId ? BODY_BY_ID[selectedId] : undefined;
+  const { byId, byParent, chips } = useSystem();
+  const selected = selectedId ? byId[selectedId] : undefined;
   // 卫星在三维场景里太小，靠手点很难命中；选中母行星时把它的卫星排成一行。
-  // 注意 childrenOf("sun") 是八大行星，不是卫星，别让它变成「太阳的卫星」。
+  // 注意 chips 是「无 parent 或 parent 是太阳」的天体，不是卫星，别让它变成「太阳的卫星」。
   const group = selected
     ? selected.parent && selected.parent !== "sun"
-      ? BODY_BY_ID[selected.parent]
+      ? byId[selected.parent]
       : selected
     : undefined;
-  const moons = group && group.id !== "sun" ? childrenOf(group.id) : [];
+  const moons = group && group.id !== "sun" ? (byParent.get(group.id) ?? []) : [];
 
   useEffect(() => {
     useSim.getState().hydrate(loadSettings());
@@ -63,13 +64,13 @@ export function Hud() {
         useSim.getState().toggleTrails();
       } else if (/^[1-9]$/.test(event.key)) {
         // 1–9 直接跳到对应行星，比横着找芯片快
-        const body = CHIP_BODIES[Number(event.key) - 1];
+        const body = chips[Number(event.key) - 1];
         if (body) useSim.getState().select(body.id);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [chips]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -94,7 +95,7 @@ export function Hud() {
       </header>
 
       <div className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
-        {CHIP_BODIES.map((body) => {
+        {chips.map((body) => {
           const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
           const active = selectedId === body.id || moonOfThis;
           return (

@@ -4,8 +4,9 @@ import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef,
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { simClock } from "./clock";
-import { BODY_BY_ID, BODIES, childrenOf, EARTH_PERIOD, isMoon, type Body } from "./data";
+import { BODY_BY_ID, EARTH_PERIOD, isMoon, type Body } from "./data";
 import { useSim } from "./store";
+import { useSystem } from "./system-context";
 import { tightenClipPlanes } from "./systems";
 import { cloudTexture, glowTexture, textureFor } from "./textures";
 
@@ -332,6 +333,8 @@ function Stars() {
 
 function Simulation() {
   const reg = useRegistry();
+  // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
+  const { bodies } = useSystem();
   const time = useRef(0);
   const acc = useRef(0);
   useFrame((_, raw) => {
@@ -340,7 +343,7 @@ function Simulation() {
     if (!state.paused) time.current += delta * state.speed;
     const t = time.current;
     simClock.time = t;
-    for (const body of BODIES) {
+    for (const body of bodies) {
       const group = reg.groups.get(body.id);
       if (group && body.orbitRadius > 0) {
         const angle = (t / body.period) * Math.PI * 2 + body.phase;
@@ -606,7 +609,8 @@ function BodyNode({
   selectedId: string | null;
 }) {
   const reg = useRegistry();
-  const kids = childrenOf(body.id);
+  const { byParent } = useSystem();
+  const kids = byParent.get(body.id) ?? [];
   const selected = selectedId === body.id;
   // 卫星标签只在被选中时出现：全显示的话木星四颗卫星的名字会叠成一团。
   // 卫星靠 HUD 里的卫星芯片行来选择/辨认。
@@ -808,7 +812,8 @@ function Trail({ id, color, visible }: { id: string; color: string; visible: boo
 
 function Trails() {
   const showTrails = useSim((state) => state.showTrails);
-  const planets = useMemo(() => BODIES.filter((body) => body.parent === "sun" && body.orbitRadius > 0), []);
+  const { bodies } = useSystem();
+  const planets = useMemo(() => bodies.filter((body) => body.parent === "sun" && body.orbitRadius > 0), [bodies]);
   return (
     <group>
       {planets.map((body) => (
@@ -819,6 +824,7 @@ function Trails() {
 }
 
 function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
+  const { byId } = useSystem();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
   const reg = useRegistry();
@@ -892,7 +898,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     const offset = fromPos.clone().sub(fromTarget);
     const fromDist = Math.max(offset.length(), 0.001);
     offset.multiplyScalar(1 / fromDist);
-    const body = id ? BODY_BY_ID[id] : undefined;
+    const body = id ? byId[id] : undefined;
     anim.current = {
       t: 0,
       dur: reduced ? 0.01 : 0.95,
@@ -997,12 +1003,13 @@ function Probe() {
   const reg = useRegistry();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
+  const { bodies } = useSystem();
 
   useEffect(() => {
     const v = new THREE.Vector3();
     const probe = () => {
-      const bodies: { id: string; x: number; y: number; z: number; radiusPx: number }[] = [];
-      for (const body of BODIES) {
+      const projected: { id: string; x: number; y: number; z: number; radiusPx: number }[] = [];
+      for (const body of bodies) {
         const group = reg.groups.get(body.id);
         if (!group) continue;
         group.getWorldPosition(v);
@@ -1011,7 +1018,7 @@ function Probe() {
         // 屏幕半径：透视相机的像素焦距 = 视口高一半 / tan(fov/2)
         const persp = camera as THREE.PerspectiveCamera;
         const focal = size.height / 2 / Math.tan((persp.fov * Math.PI) / 360);
-        bodies.push({
+        projected.push({
           id: body.id,
           x: (v.x * 0.5 + 0.5) * size.width,
           y: (-v.y * 0.5 + 0.5) * size.height,
@@ -1019,13 +1026,13 @@ function Probe() {
           radiusPx: distance > 0 ? (body.radius / distance) * focal : 0,
         });
       }
-      return bodies;
+      return projected;
     };
     (window as unknown as { __solarProbe?: typeof probe }).__solarProbe = probe;
     return () => {
       delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
     };
-  }, [reg, camera, size.height, size.width]);
+  }, [reg, camera, bodies, size.height, size.width]);
 
   return null;
 }
@@ -1041,7 +1048,8 @@ function Scene() {
     belt: null,
   });
   const controlsRef = useRef<OrbitControlsImpl>(null);
-  const sun = BODY_BY_ID.sun;
+  const { byId } = useSystem();
+  const sun = byId.sun;
   if (!sun) return null;
   return (
     <RegistryContext.Provider value={registry.current}>
