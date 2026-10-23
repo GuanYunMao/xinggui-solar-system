@@ -982,6 +982,47 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   return null;
 }
 
+/**
+ * 验收探针：把 15 个天体的屏幕投影暴露成纯函数，供 verify.mjs 做数值断言
+ * （命中矩阵、跟随抖动）。只读、无副作用，生产环境也就是多挂一个全局函数。
+ */
+function Probe() {
+  const reg = useRegistry();
+  const camera = useThree((state) => state.camera);
+  const size = useThree((state) => state.size);
+
+  useEffect(() => {
+    const v = new THREE.Vector3();
+    const probe = () => {
+      const bodies: { id: string; x: number; y: number; z: number; radiusPx: number }[] = [];
+      for (const body of BODIES) {
+        const group = reg.groups.get(body.id);
+        if (!group) continue;
+        group.getWorldPosition(v);
+        const distance = camera.position.distanceTo(v);
+        v.project(camera);
+        // 屏幕半径：透视相机的像素焦距 = 视口高一半 / tan(fov/2)
+        const persp = camera as THREE.PerspectiveCamera;
+        const focal = size.height / 2 / Math.tan((persp.fov * Math.PI) / 360);
+        bodies.push({
+          id: body.id,
+          x: (v.x * 0.5 + 0.5) * size.width,
+          y: (-v.y * 0.5 + 0.5) * size.height,
+          z: v.z,
+          radiusPx: distance > 0 ? (body.radius / distance) * focal : 0,
+        });
+      }
+      return bodies;
+    };
+    (window as unknown as { __solarProbe?: typeof probe }).__solarProbe = probe;
+    return () => {
+      delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
+    };
+  }, [reg, camera, size.height, size.width]);
+
+  return null;
+}
+
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
@@ -998,6 +1039,7 @@ function Scene() {
   return (
     <RegistryContext.Provider value={registry.current}>
       <Stars />
+      <Probe />
       <Simulation />
       <BodyNode body={sun} showOrbits={showOrbits} showLabels={showLabels} selectedId={selectedId} />
       <Asteroids />
