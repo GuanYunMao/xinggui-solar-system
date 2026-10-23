@@ -1,6 +1,6 @@
-import { LocateFixed, Orbit, Pause, Play, Tag } from "lucide-react";
+import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { useEffect } from "react";
-import { BODY_BY_ID, CHIP_BODIES } from "./data";
+import { BODY_BY_ID, CHIP_BODIES, childrenOf } from "./data";
 import { bindSettingsPersistence, loadSettings, useSim } from "./store";
 
 function formatSpeed(speed: number) {
@@ -20,15 +20,25 @@ export function Hud() {
   const speed = useSim((state) => state.speed);
   const showLabels = useSim((state) => state.showLabels);
   const showOrbits = useSim((state) => state.showOrbits);
+  const showTrails = useSim((state) => state.showTrails);
   const selectedId = useSim((state) => state.selectedId);
   const days = useSim((state) => state.days);
   const togglePaused = useSim((state) => state.togglePaused);
   const setSpeed = useSim((state) => state.setSpeed);
   const toggleLabels = useSim((state) => state.toggleLabels);
   const toggleOrbits = useSim((state) => state.toggleOrbits);
+  const toggleTrails = useSim((state) => state.toggleTrails);
   const select = useSim((state) => state.select);
   const requestReset = useSim((state) => state.requestReset);
   const selected = selectedId ? BODY_BY_ID[selectedId] : undefined;
+  // 卫星在三维场景里太小，靠手点很难命中；选中母行星时把它的卫星排成一行。
+  // 注意 childrenOf("sun") 是八大行星，不是卫星，别让它变成「太阳的卫星」。
+  const group = selected
+    ? selected.parent && selected.parent !== "sun"
+      ? BODY_BY_ID[selected.parent]
+      : selected
+    : undefined;
+  const moons = group && group.id !== "sun" ? childrenOf(group.id) : [];
 
   useEffect(() => {
     useSim.getState().hydrate(loadSettings());
@@ -49,6 +59,8 @@ export function Hud() {
         useSim.getState().toggleLabels();
       } else if (event.key === "o" || event.key === "O") {
         useSim.getState().toggleOrbits();
+      } else if (event.key === "t" || event.key === "T") {
+        useSim.getState().toggleTrails();
       } else if (/^[1-9]$/.test(event.key)) {
         // 1–9 直接跳到对应行星，比横着找芯片快
         const body = CHIP_BODIES[Number(event.key) - 1];
@@ -102,6 +114,31 @@ export function Hud() {
           );
         })}
       </div>
+
+      {moons.length > 0 && (
+        <div className="chip-row pointer-events-auto mt-1 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
+          <span className="inline-flex h-9 shrink-0 items-center text-xs text-subtle">
+            {group?.name}的卫星
+          </span>
+          {moons.map((moon) => (
+            <button
+              key={moon.id}
+              id={`chip-${moon.id}`}
+              type="button"
+              className={`hud-btn inline-flex h-9 shrink-0 items-center gap-2 rounded-full border px-3 text-xs ${
+                selectedId === moon.id
+                  ? "border-accent bg-accent text-accent-fg"
+                  : "border-line bg-elevated text-fg"
+              }`}
+              aria-pressed={selectedId === moon.id}
+              onClick={() => select(moon.id)}
+            >
+              <span className="size-1.5 rounded-full" style={{ backgroundColor: moon.swatch }} />
+              {moon.name}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="relative min-h-0 flex-1">
         {/*
@@ -176,7 +213,7 @@ export function Hud() {
           />
           <span className="w-12 text-right text-sm tabular-nums text-fg">{formatSpeed(speed)}</span>
         </label>
-        <div className="mt-1 grid grid-cols-4 gap-2">
+        <div className="mt-1 grid grid-cols-5 gap-1.5">
           <button
             type="button"
             className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md bg-accent text-sm text-accent-fg"
@@ -192,34 +229,49 @@ export function Hud() {
             className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
               showLabels ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
             }`}
+            aria-label="名称"
             aria-pressed={showLabels}
             onClick={toggleLabels}
           >
             <Tag className="size-4" />
-            名称
+            <span className="hidden sm:inline">名称</span>
           </button>
           <button
             type="button"
             className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
               showOrbits ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
             }`}
+            aria-label="轨道"
             aria-pressed={showOrbits}
             onClick={toggleOrbits}
           >
             <Orbit className="size-4" />
-            轨道
+            <span className="hidden sm:inline">轨道</span>
+          </button>
+          <button
+            type="button"
+            className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
+              showTrails ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
+            }`}
+            aria-label="尾迹"
+            aria-pressed={showTrails}
+            onClick={toggleTrails}
+          >
+            <Sparkles className="size-4" />
+            <span className="hidden sm:inline">尾迹</span>
           </button>
           <button
             type="button"
             className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border border-line text-sm text-fg"
+            aria-label="返回总览"
             onClick={requestReset}
           >
             <LocateFixed className="size-4" />
-            总览
+            <span className="hidden sm:inline">总览</span>
           </button>
         </div>
         <p className="mt-2 hidden text-xs text-subtle md:block">
-          空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · 1–9 选行星
+          空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
         </p>
       </footer>
     </div>

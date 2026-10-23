@@ -15,6 +15,8 @@ const PORT = 4180;
 
 const ALL = ["sun", "mercury", "venus", "earth", "moon", "mars", "jupiter", "io", "europa", "saturn", "titan", "uranus", "neptune"];
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : ALL;
+// 星球会自转公转，等多久决定拍到的是白天面还是夜面；默认 1.8 秒，可用 SHOOT_WAIT 调
+const WAIT = Number(process.env.SHOOT_WAIT ?? 1800);
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 const server = await new Promise((resolve) => {
@@ -46,7 +48,7 @@ page.on("pageerror", (e) => errors.push(e.message));
 for (const id of wanted) {
   await page.goto(`http://127.0.0.1:${PORT}/?body=${id}`, { waitUntil: "load" });
   await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
-  await page.waitForTimeout(1800); // 等镜头聚焦动画走完
+  await page.waitForTimeout(WAIT); // 等镜头聚焦动画走完，同时等星球转到受光面
   // 裁掉 HUD，只留星球（桌面端卡片在右侧，裁剪区避开它）
   await page.screenshot({
     path: path.join(SHOTS, `body-${id}.png`),

@@ -4,3 +4,4 @@ release/
 .vite/
 *.log
 screenshots/
+.texture-src/

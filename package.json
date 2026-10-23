@@ -1,7 +1,7 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "星轨 — 可交互的三维太阳系轨道仪（独立版）",
   "scripts": {

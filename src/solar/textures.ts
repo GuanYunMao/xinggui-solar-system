@@ -1,16 +1,32 @@
 import * as THREE from "three";
 import type { Body } from "./data";
+import earthDayUrl from "./assets/earth-day.jpg";
+import moonUrl from "./assets/moon.jpg";
 
 /**
- * 程序化贴图：全部在运行时用 canvas 逐像素生成，不依赖任何图片资源。
+ * 贴图来源分两类：
  *
- * 关键教训（v1.1.0 重写）：决定「像不像行星」的是噪声的周期数，不是分辨率。
- * 旧版在 u 方向铺了 GRID*3 = 192 个格子再叠 5 层倍频，512 宽的贴图上一格只有
- * 2~3 像素 —— 大陆做成了撒胡椒面，地球看着像一团乱麻。
- * 现在大陆尺度用 cycles=3（绕球一圈只有 3 个起伏），细节交给倍频去补。
+ * 1. 真实摄影贴图（地球、月球）—— 程序化噪声再怎么调也不像真实星球，
+ *    这两颗直接用 NASA Blue Marble / LRO 的公有领域影像，经 scripts/bake-textures.mjs
+ *    烘到 1024×512 / 512×256 再压 JPEG。
+ * 2. 程序化贴图（其余行星）—— 运行时用 canvas 逐像素生成，不依赖图片资源。
+ *    决定「像不像行星」的是噪声的周期数，不是分辨率；大陆尺度用 cycles=3。
  */
 
-const cache = new Map<string, THREE.CanvasTexture>();
+const cache = new Map<string, THREE.Texture>();
+const fileCache = new Map<string, THREE.Texture>();
+
+function loadFileTexture(url: string) {
+  const hit = fileCache.get(url);
+  if (hit) return hit;
+  const tex = new THREE.TextureLoader().load(url);
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = 8;
+  fileCache.set(url, tex);
+  return tex;
+}
 
 function mulberry32(seed: number) {
   let s = seed >>> 0;
@@ -474,6 +490,15 @@ function paintBody(body: Body, data: Uint8ClampedArray, w: number, h: number) {
 export function textureFor(body: Body) {
   const hit = cache.get(body.id);
   if (hit) return hit;
+
+  // 地球、月球用真实摄影贴图：噪声凑不出真实的海陆轮廓与陨石坑分布
+  const photo = body.texture === "earth" ? earthDayUrl : body.texture === "moon" ? moonUrl : null;
+  if (photo) {
+    const tex = loadFileTexture(photo);
+    cache.set(body.id, tex);
+    return tex;
+  }
+
   const large = body.radius > 0.4;
   const tex = canvasTexture(large ? 512 : 256, large ? 256 : 128, (data, w, h) => paintBody(body, data, w, h));
   cache.set(body.id, tex);

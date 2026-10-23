@@ -19,6 +19,9 @@ export default defineConfig({
   preview: { host: "127.0.0.1", port: 4173, strictPort: true },
   build: {
     target: "es2020",
+    // 真实行星贴图（地球/月球，约 120KB）必须内联进 JS，
+    // 否则单文件版本还要额外带 assets 目录，双击就不完整了。
+    assetsInlineLimit: 4 * 1024 * 1024,
     // 单入口、单分块，方便打进一个 HTML 文件里。
     cssCodeSplit: false,
     rolldownOptions: {

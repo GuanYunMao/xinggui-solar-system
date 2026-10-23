@@ -22,22 +22,24 @@
 ## 目录
 
 ```
-src/solar/          游戏本体（6 个文件，与原工程 SHA256 一致）
+src/solar/          游戏本体
+src/solar/assets/   地球与月球的真实贴图（NASA 公有领域，烘焙后共 ~120 KB）
 src/App.tsx         入口壳（原 src/routes/index.tsx，去掉路由包装）
 src/main.tsx        挂载
 src/styles.css      样式（仅字体栈改成系统字体）
 index.html          页面壳
 public/             图标 + manifest
 scripts/package-release.mjs   打包出「单文件」和「静态站点」两份
+scripts/bake-textures.mjs     把原始行星贴图烘成合适尺寸
 ```
 
-游戏本体全部在这 6 个文件里，改游戏只改它们：
+改游戏只改 `src/solar/`：
 
 ```
 solar/data.ts          天体数据、文案、事实卡片
-solar/textures.ts      程序化贴图（canvas 逐像素生成，没有图片资源）
-solar/SolarCanvas.tsx  3D 场景、着色器、镜头跟随
-solar/Hud.tsx          界面、速度条、芯片、键位
+solar/textures.ts      贴图：地球/月球读真实影像，其余运行时逐像素生成
+solar/SolarCanvas.tsx  3D 场景、着色器、镜头、尾迹
+solar/Hud.tsx          界面、速度条、芯片、卫星行、键位
 solar/store.ts         状态 + localStorage 存档
 solar/clock.ts         共享时钟
 ```
@@ -155,10 +157,11 @@ release 名字都从它取。每次改动都写进 [CHANGELOG.md](CHANGELOG.md)�
 
 | 文件 | 改了什么 |
 | --- | --- |
-| `solar/textures.ts` | 重写：噪声格点周期修正、地球地貌、陨石坑、气态行星条带、冰壳裂缝 |
-| `solar/SolarCanvas.tsx` | 首次摆位与聚焦动画挪进帧循环；竖屏镜头抬升；云层独立着色器；拖动误触防护 |
-| `solar/Hud.tsx` | 手机端详情卡改底部抽屉；1–9 键选行星；显示版本号 |
-| `solar/data.ts` / `store.ts` / `clock.ts` | **未改动** |
+| `solar/textures.ts` | 重写：噪声格点周期修正、陨石坑、气态行星条带、冰壳裂缝；地球与月球改用真实影像 |
+| `solar/SolarCanvas.tsx` | 首次摆位与聚焦动画挪进帧循环；竖屏镜头抬升；云层独立着色器；拖动误触防护；行星尾迹；卫星透明命中球 |
+| `solar/Hud.tsx` | 手机端详情卡改底部抽屉；卫星芯片行；1–9 键选行星；显示版本号 |
+| `solar/store.ts` | 新增尾迹开关（含存档） |
+| `solar/data.ts` / `clock.ts` | **未改动** |
 
 ---
 

@@ -6,6 +6,7 @@ type Settings = {
   speed?: number;
   showLabels?: boolean;
   showOrbits?: boolean;
+  showTrails?: boolean;
 };
 
 function clampSpeed(value: number) {
@@ -18,6 +19,7 @@ type SimStore = {
   speed: number;
   showLabels: boolean;
   showOrbits: boolean;
+  showTrails: boolean;
   selectedId: string | null;
   days: number;
   resetToken: number;
@@ -25,6 +27,7 @@ type SimStore = {
   setSpeed: (speed: number) => void;
   toggleLabels: () => void;
   toggleOrbits: () => void;
+  toggleTrails: () => void;
   select: (id: string | null) => void;
   setDays: (days: number) => void;
   requestReset: () => void;
@@ -36,6 +39,7 @@ export const useSim = create<SimStore>((set) => ({
   speed: 1,
   showLabels: true,
   showOrbits: true,
+  showTrails: true,
   selectedId: null,
   days: 0,
   resetToken: 0,
@@ -43,6 +47,7 @@ export const useSim = create<SimStore>((set) => ({
   setSpeed: (speed) => set({ speed: clampSpeed(speed) }),
   toggleLabels: () => set((s) => ({ showLabels: !s.showLabels })),
   toggleOrbits: () => set((s) => ({ showOrbits: !s.showOrbits })),
+  toggleTrails: () => set((s) => ({ showTrails: !s.showTrails })),
   select: (selectedId) => set({ selectedId }),
   setDays: (days) => set({ days }),
   requestReset: () => set((s) => ({ selectedId: null, resetToken: s.resetToken + 1 })),
@@ -51,6 +56,7 @@ export const useSim = create<SimStore>((set) => ({
       speed: clampSpeed(settings.speed ?? 1),
       showLabels: settings.showLabels ?? true,
       showOrbits: settings.showOrbits ?? true,
+      showTrails: settings.showTrails ?? true,
     }),
 }));
 
@@ -74,6 +80,7 @@ export function bindSettingsPersistence() {
       speed: state.speed,
       showLabels: state.showLabels,
       showOrbits: state.showOrbits,
+      showTrails: state.showTrails,
     });
     if (next === prev) return;
     prev = next;

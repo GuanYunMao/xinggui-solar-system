@@ -601,7 +601,9 @@ function BodyNode({
   const reg = useRegistry();
   const kids = childrenOf(body.id);
   const selected = selectedId === body.id;
-  const labelOn = selected || (showLabels && (!isMoon(body) || selectedId === body.parent));
+  // 卫星标签只在被选中时出现：全显示的话木星四颗卫星的名字会叠成一团。
+  // 卫星靠 HUD 里的卫星芯片行来选择/辨认。
+  const labelOn = selected || (showLabels && !isMoon(body));
   const onPick = (event: ThreeEvent<PointerEvent>) => {
     event.stopPropagation();
     if (dragGuard.moved) return;
@@ -630,6 +632,13 @@ function BodyNode({
         </group>
         <Rings body={body} onPick={onPick} />
       </group>
+      {/* 卫星太小，手指点不中；套一个透明的可点击球壳放大命中区域 */}
+      {body.radius < 0.35 && (
+        <mesh onClick={onPick} onPointerOver={setPointer} onPointerOut={clearPointer}>
+          <sphereGeometry args={[Math.max(body.radius * 2.4, 0.12), 10, 8]} />
+          <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+        </mesh>
+      )}
       {body.texture !== "sun" && <Atmosphere body={body} />}
       {kids.map((kid) => (
         <group key={kid.id}>
@@ -710,6 +719,94 @@ function Asteroids() {
     >
       <instancedMesh ref={mesh} args={[geometry, material, rocks.length]} frustumCulled={false} raycast={() => undefined}>
       </instancedMesh>
+    </group>
+  );
+}
+
+const TRAIL_POINTS = 90;
+
+/**
+ * 行星尾迹。调研了 13 个同类开源项目，没有一个把动态尾迹做进主线，
+ * 但它对「看见公转」的帮助比静态轨道线大得多：轨道线是标尺，尾迹是走过的路。
+ * 记录的是世界坐标，所以不会随行星自转打螺旋。
+ */
+function Trail({ id, color, visible }: { id: string; color: string; visible: boolean }) {
+  const reg = useRegistry();
+  const line = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(TRAIL_POINTS * 3), 3));
+    g.setDrawRange(0, 0);
+    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5, depthWrite: false });
+    const l = new THREE.Line(g, m);
+    l.frustumCulled = false;
+    return l;
+  }, [color]);
+  const filled = useRef(0);
+  const cursor = useMemo(() => new THREE.Vector3(), []);
+
+  useEffect(
+    () => () => {
+      line.geometry.dispose();
+      const material = line.material;
+      if (!Array.isArray(material)) material.dispose();
+    },
+    [line],
+  );
+
+  // 关掉开关就清空，避免关着的时候攒出一条没意义的旧轨迹
+  useEffect(() => {
+    if (visible) return;
+    filled.current = 0;
+    line.geometry.setDrawRange(0, 0);
+  }, [visible, line]);
+
+  useFrame(() => {
+    if (!visible) return;
+    const obj = reg.groups.get(id);
+    if (!obj) return;
+    obj.getWorldPosition(cursor);
+    const geometry = line.geometry;
+    const attr = geometry.attributes.position as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+
+    if (filled.current === 0) {
+      arr[0] = cursor.x;
+      arr[1] = cursor.y;
+      arr[2] = cursor.z;
+      filled.current = 1;
+    } else {
+      const i = (filled.current - 1) * 3;
+      // 位移太小就不记点，否则 90 个点全堆在同一处，看着像一团
+      const moved =
+        Math.abs(arr[i]! - cursor.x) + Math.abs(arr[i + 1]! - cursor.y) + Math.abs(arr[i + 2]! - cursor.z);
+      if (moved < 0.06) return;
+      if (filled.current < TRAIL_POINTS) {
+        arr[filled.current * 3] = cursor.x;
+        arr[filled.current * 3 + 1] = cursor.y;
+        arr[filled.current * 3 + 2] = cursor.z;
+        filled.current += 1;
+      } else {
+        arr.copyWithin(0, 3);
+        arr[(TRAIL_POINTS - 1) * 3] = cursor.x;
+        arr[(TRAIL_POINTS - 1) * 3 + 1] = cursor.y;
+        arr[(TRAIL_POINTS - 1) * 3 + 2] = cursor.z;
+      }
+    }
+    attr.needsUpdate = true;
+    geometry.setDrawRange(0, filled.current);
+  });
+
+  return <primitive object={line} />;
+}
+
+function Trails() {
+  const showTrails = useSim((state) => state.showTrails);
+  const planets = useMemo(() => BODIES.filter((body) => body.parent === "sun" && body.orbitRadius > 0), []);
+  return (
+    <group>
+      {planets.map((body) => (
+        <Trail key={body.id} id={body.id} color={body.swatch} visible={showTrails} />
+      ))}
     </group>
   );
 }
@@ -898,6 +995,7 @@ function Scene() {
       <Simulation />
       <BodyNode body={sun} showOrbits={showOrbits} showLabels={showLabels} selectedId={selectedId} />
       <Asteroids />
+      <Trails />
       <CameraRig controlsRef={controlsRef} />
       <OrbitControls
         ref={controlsRef}
