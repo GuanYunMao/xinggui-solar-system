@@ -92,8 +92,29 @@ npm run build
 
 建议第一件事先建个版本库，之后每次更新都有 diff 可查：
 
+---
+
+## 版本库
+
+源码在 GitHub：[GuanYunMao/xinggui-solar-system](https://github.com/GuanYunMao/xinggui-solar-system)（public）
+
+**只提交源码。** `node_modules`（283 MB）、`dist/`、`release/`、`screenshots/` 都在 `.gitignore` 里。
+提交进 git 历史的东西很难再弄出来，所以别在网页上整文件夹上传——只走 `git push`。
+
+**手机上的固定下载地址**（每次 push 自动更新，收藏这一个就够）：
+
+```
+https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xinggui.html
+```
+
+构建设在 `.github/workflows/build.yml`：push 到 `main` → `npm ci` → `npm run build` →
+把单文件挂到 `latest` 这个 release 的 `xinggui.html` 上。不需要本地打包再手动传。
+
+**本机推送需要走代理**（直连 GitHub 会 TLS 中断）。仓库的 local config 里已经写死了：
+
 ```bash
-git init && git add -A && git commit -m "星轨 1.0：从 Grok 工作区抽出"
+git config http.proxy http://127.0.0.1:7890   # 换网络后要么改这个，要么删掉
+git push
 ```
 
 ---

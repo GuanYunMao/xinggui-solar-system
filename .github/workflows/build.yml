@@ -1,0 +1,52 @@
+name: 构建并发布单文件
+
+# 每次 push 到 main：装依赖 → 构建 → 把单文件 HTML 挂到一个固定下载地址上。
+# 手机端只要收藏这个地址，永远拿到最新版：
+# https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xinggui.html
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建
+        run: npm run build
+
+      - name: 确认单文件真的产出了
+        run: |
+          test -s "release/星轨.html"
+          ls -lh release/
+
+      - name: 发布到固定下载地址
+        run: cp "release/星轨.html" release/xinggui.html
+
+      - name: 更新 latest 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 星轨 · 最新版
+          body: |
+            由 GitHub Actions 从 `main` 自动构建。
+
+            直接下载：`xinggui.html`（单文件，双击即玩，也能发到手机上打开。
+            改自 Grok 工作区版本，游戏本体未做改动。）
+          files: release/xinggui.html
+          make_latest: true
+          prerelease: false
