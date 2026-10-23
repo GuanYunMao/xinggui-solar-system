@@ -1,7 +1,7 @@
 name: 构建并发布单文件
 
-# 每次 push 到 main：装依赖 → 构建 → 把单文件 HTML 挂到一个固定下载地址上。
-# 手机端只要收藏这个地址，永远拿到最新版：
+# 每次 push 到 main：装依赖 → 构建 → 按 package.json 的版本号打 tag 并发布单文件。
+# 手机端固定下载地址（跨版本不变，永远拿到最新版）：
 # https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xinggui.html
 
 on:
@@ -23,6 +23,13 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: 读取版本号
+        id: version
+        run: |
+          VERSION=$(node -p "JSON.parse(require('fs').readFileSync('package.json','utf8')).version")
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本 $VERSION"
+
       - name: 安装依赖
         run: npm ci
 
@@ -34,19 +41,19 @@ jobs:
           test -s "release/星轨.html"
           ls -lh release/
 
-      - name: 发布到固定下载地址
+      - name: 准备发布用的文件名（避开 URL 里的中文）
         run: cp "release/星轨.html" release/xinggui.html
 
-      - name: 更新 latest 发布
+      - name: 发布 v${{ steps.version.outputs.value }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest
-          name: 星轨 · 最新版
+          tag_name: v${{ steps.version.outputs.value }}
+          name: 星轨 v${{ steps.version.outputs.value }}
           body: |
-            由 GitHub Actions 从 `main` 自动构建。
+            版本 **v${{ steps.version.outputs.value }}**，由 GitHub Actions 从 `main` 构建。
 
-            直接下载：`xinggui.html`（单文件，双击即玩，也能发到手机上打开。
-            改自 Grok 工作区版本，游戏本体未做改动。）
+            单文件 `xinggui.html`：双击就能玩，也能发到手机上用浏览器打开。
+            更新内容见仓库里的 `CHANGELOG.md`。
           files: release/xinggui.html
           make_latest: true
           prerelease: false

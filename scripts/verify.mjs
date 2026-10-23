@@ -126,6 +126,18 @@ try {
   );
   results.push(
     await run(browser, {
+      name: "mobile-selected",
+      url: base,
+      viewport: { width: 390, height: 844 },
+      dpr: 3,
+      isMobile: true,
+      hasTouch: true,
+      interact: true,
+      expectSelected: "地球",
+    }),
+  );
+  results.push(
+    await run(browser, {
       name: "single-file",
       url: pathToFileURL(SINGLE).href,
       viewport: { width: 1280, height: 720 },

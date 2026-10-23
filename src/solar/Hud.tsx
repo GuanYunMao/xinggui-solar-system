@@ -49,6 +49,10 @@ export function Hud() {
         useSim.getState().toggleLabels();
       } else if (event.key === "o" || event.key === "O") {
         useSim.getState().toggleOrbits();
+      } else if (/^[1-9]$/.test(event.key)) {
+        // 1–9 直接跳到对应行星，比横着找芯片快
+        const body = CHIP_BODIES[Number(event.key) - 1];
+        if (body) useSim.getState().select(body.id);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -68,7 +72,7 @@ export function Hud() {
     <div className="pointer-events-none absolute inset-0 z-10 flex flex-col">
       <header className="flex items-end justify-between gap-4 px-4 pt-4 md:px-6 md:pt-6">
         <div className="sky-title">
-          <p className="eyebrow text-xs text-muted">太阳系轨道仪</p>
+          <p className="eyebrow text-xs text-muted">太阳系轨道仪 · v{__APP_VERSION__}</p>
           <h1 className="font-display text-3xl leading-none text-fg">星轨</h1>
         </div>
         <div className="sky-title text-right">
@@ -87,9 +91,7 @@ export function Hud() {
               id={`chip-${body.id}`}
               type="button"
               className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
-                active
-                  ? "border-accent bg-accent text-accent-fg"
-                  : "border-line bg-elevated text-fg"
+                active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
               }`}
               aria-pressed={active}
               onClick={() => select(body.id)}
@@ -102,15 +104,33 @@ export function Hud() {
       </div>
 
       <div className="relative min-h-0 flex-1">
+        {/*
+          手机端是底部抽屉（原来贴在顶部，选中行星时正好盖住星球）。
+          竖屏时镜头会把星球抬到上半屏，配合这里每屏最多 44% 高度。
+        */}
         {selected && (
           <article
             key={selected.id}
-            className="panel-in pointer-events-auto absolute inset-x-3 top-3 max-h-56 overflow-y-auto rounded-xl border border-line bg-elevated p-4 md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
+            className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 max-h-[44dvh] overflow-y-auto rounded-xl border border-line bg-elevated p-4 md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
           >
-            <p className="text-xs text-muted">{selected.kind}</p>
-            <h2 className="font-display mt-1 text-2xl leading-tight text-fg">{selected.name}</h2>
-            <p className="mt-3 text-sm leading-relaxed text-fg">{selected.blurb}</p>
-            <dl className="mt-4 grid grid-cols-2 gap-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs text-muted">{selected.kind}</p>
+                <h2 className="font-display mt-1 text-xl leading-tight text-fg md:text-2xl">
+                  {selected.name}
+                </h2>
+              </div>
+              <button
+                type="button"
+                className="hud-btn -mr-1 -mt-1 inline-flex size-9 shrink-0 items-center justify-center rounded-md text-subtle md:hidden"
+                aria-label="关闭详情"
+                onClick={requestReset}
+              >
+                ✕
+              </button>
+            </div>
+            <p className="mt-2 text-sm leading-relaxed text-fg">{selected.blurb}</p>
+            <dl className="mt-3 grid grid-cols-2 gap-2 md:gap-3">
               {selected.facts.map((fact) => (
                 <div key={fact.label} className="rounded-md bg-bg px-3 py-2">
                   <dt className="text-xs text-muted">{fact.label}</dt>
@@ -118,12 +138,12 @@ export function Hud() {
                 </div>
               ))}
             </dl>
-            <p className="mt-4 text-xs leading-relaxed text-subtle">
+            <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
               大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
             </p>
             <button
               type="button"
-              className="hud-btn mt-4 h-11 w-full rounded-md border border-line text-sm text-fg"
+              className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
               onClick={requestReset}
             >
               返回总览
@@ -198,7 +218,9 @@ export function Hud() {
             总览
           </button>
         </div>
-        <p className="mt-2 hidden text-xs text-subtle md:block">空格暂停 · Esc 返回总览 · L 名称 · O 轨道</p>
+        <p className="mt-2 hidden text-xs text-subtle md:block">
+          空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · 1–9 选行星
+        </p>
       </footer>
     </div>
   );

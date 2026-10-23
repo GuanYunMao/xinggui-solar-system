@@ -1,7 +1,7 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "星轨 — 可交互的三维太阳系轨道仪（独立版）",
   "scripts": {
@@ -11,7 +11,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/verify.mjs",
-    "check": "node scripts/check-single-file.mjs"
+    "check": "node scripts/check-single-file.mjs",
+    "shoot": "node scripts/shoot.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",
@@ -24,6 +25,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.0",
+    "@types/node": "^26.6.5",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.2.0",

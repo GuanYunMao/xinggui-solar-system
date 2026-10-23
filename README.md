@@ -53,6 +53,7 @@ npm run build      # 产出 release/
 npm run typecheck
 npm run verify     # 桌面 + 手机视口 + 单文件，真实浏览器验收
 npm run check -- <某个 html>   # 验证任意一份（比如从 GitHub 下载的）能不能跑
+npm run shoot      # 逐颗星聚焦截图到 screenshots/body-*.png，肉眼查贴图
 ```
 
 `npm run build` 会生成两份东西：
@@ -114,7 +115,8 @@ https://github.com/GuanYunMao/xinggui-solar-system/releases/latest/download/xing
 ```
 
 构建设在 `.github/workflows/build.yml`：push 到 `main` → `npm ci` → `npm run build` →
-把单文件挂到 `latest` 这个 release 的 `xinggui.html` 上。不需要本地打包再手动传。
+按 `package.json` 的版本号打 `v<版本>` 的 tag 并发布 `xinggui.html`。不需要本地打包再手动传。
+下载地址写作 `releases/latest/...`，所以**跨版本不变**。
 
 **本机推送需要走代理**（直连 GitHub 会 TLS 中断）。仓库的 local config 里已经写死了：
 
@@ -125,7 +127,18 @@ git push
 
 ---
 
-## 与原版的全部差异（都在壳层）
+## 版本规则
+
+第一位 **MAJOR**：跨越整个大代际 · 第二位 **MINOR**：普通改动 · 第三位 **PATCH**：修小 bug
+
+版本号只有一个源：`package.json` 的 `version`。界面左上角显示的版本、CI 打的 tag、
+release 名字都从它取。每次改动都写进 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 与原版的差异
+
+### 壳层（1.0.0 起）
 
 | # | 改动 | 位置 | 为什么 |
 | --- | --- | --- | --- |
@@ -135,8 +148,17 @@ git push
 | 4 | `h-dvh` → `h-screen` + `100dvh` 兜底 | `App.tsx` 1 行 | 老 iOS 不认 `dvh` 时不会变成 0 高度 |
 | 5 | 新增 manifest / 图标 / 单文件打包脚本 | `public/`、`scripts/` | 手机上能装到桌面 |
 
-`src/solar/` 六个文件的 SHA256 与原工程完全一致：
-天体数据、贴图算法、着色器、镜头逻辑、HUD 文案、键位、存档格式，**一个字都没动**。
+**1.0.0 时 `src/solar/` 六个文件与原工程 SHA256 逐个一致** —— 从 Grok 抽出来的那一步，
+游戏本体一个字没动。从 1.1.0 开始改的是贴图、镜头和 HUD，见 CHANGELOG。
+
+### 游戏本体（1.1.0 起）
+
+| 文件 | 改了什么 |
+| --- | --- |
+| `solar/textures.ts` | 重写：噪声格点周期修正、地球地貌、陨石坑、气态行星条带、冰壳裂缝 |
+| `solar/SolarCanvas.tsx` | 首次摆位与聚焦动画挪进帧循环；竖屏镜头抬升；云层独立着色器；拖动误触防护 |
+| `solar/Hud.tsx` | 手机端详情卡改底部抽屉；1–9 键选行星；显示版本号 |
+| `solar/data.ts` / `store.ts` / `clock.ts` | **未改动** |
 
 ---
 

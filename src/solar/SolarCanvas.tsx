@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
 import { Html, OrbitControls } from "@react-three/drei";
-import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, type RefObject } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { simClock } from "./clock";
@@ -28,6 +28,13 @@ function useRegistry() {
   if (!value) throw new Error("missing registry");
   return value;
 }
+
+/**
+ * 拖拽 / 点选的区分。触屏上转完视角松手会落一个 click 到星球上，
+ * 原来会顺手把镜头拽到那颗星 —— 位移超过阈值就当拖拽，不选。
+ */
+const dragGuard = { moved: false, x: 0, y: 0, active: false };
+const DRAG_THRESHOLD = 6;
 
 const PLANET_VERT = /* glsl */ `
   varying vec2 vUv;
@@ -57,6 +64,25 @@ const PLANET_FRAG = /* glsl */ `
     float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
     vec3 col = texel.rgb * shade + texel.rgb * rim * 0.16;
     gl_FragColor = vec4(col, texel.a);
+  }
+`;
+
+const CLOUD_FRAG = /* glsl */ `
+  uniform sampler2D uMap;
+  varying vec2 vUv;
+  varying vec3 vNormalW;
+  varying vec3 vWorld;
+  void main() {
+    vec4 texel = texture2D(uMap, vUv);
+    if (texel.a < 0.02) discard;
+    vec3 N = normalize(vNormalW);
+    vec3 L = normalize(-vWorld);
+    float ndl = dot(N, L);
+    // 云要用自己的一套明暗：套行星那套的话，背光侧半透明的白云会被压成灰黑脏斑。
+    // 夜侧直接淡出，露出地表，而不是糊一层灰。
+    float shade = clamp(ndl * 0.62 + 0.42, 0.28, 1.0);
+    float alpha = texel.a * 0.92 * smoothstep(-0.02, 0.3, ndl);
+    gl_FragColor = vec4(vec3(0.98, 0.99, 1.0) * shade, alpha);
   }
 `;
 
@@ -520,7 +546,7 @@ function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Po
       toneMapped: false,
       uniforms: { uMap: { value: cloudTexture() } },
       vertexShader: PLANET_VERT,
-      fragmentShader: PLANET_FRAG,
+      fragmentShader: CLOUD_FRAG,
     });
   }, [clouds]);
   useEffect(
@@ -578,6 +604,7 @@ function BodyNode({
   const labelOn = selected || (showLabels && (!isMoon(body) || selectedId === body.parent));
   const onPick = (event: ThreeEvent<PointerEvent>) => {
     event.stopPropagation();
+    if (dragGuard.moved) return;
     useSim.getState().select(body.id);
   };
   const labelY = body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
@@ -695,8 +722,9 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   const resetToken = useSim((state) => state.resetToken);
   const sizeRef = useRef(size);
   sizeRef.current = size;
-  const posed = useRef(false);
-  const skip = useRef(true);
+  // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
+  // 注意力放在 ref 上时聚焦 effect 的依赖永远不变，等于永不重跑（深链就白选了）。
+  const [posed, setPosed] = useState(false);
   const anim = useRef<{
     t: number;
     dur: number;
@@ -722,23 +750,37 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     [],
   );
 
+  // 首次摆位放在帧循环里做（见 useFrame）。放 layout effect 里不可靠：
+  // <OrbitControls> 排在 CameraRig 之后挂载，此时 ref 还是 null，
+  // 而尺寸之后不再变化的话这个 effect 也不会重跑 —— posed 永远是 false，
+  // 深链选中了却永远不聚焦，就是这么来的。
+
+  // 横竖屏切换时视野没重算：转屏后 fov 还停在竖屏的 56°，全景被裁掉一圈。
+  // 只在总览状态重排，跟随某颗行星时不动镜头（否则用户转个屏就被踢回全景）。
+  const portraitRef = useRef<boolean | null>(null);
   useLayoutEffect(() => {
-    if (posed.current || size.width < 2) return;
+    const portrait = size.height > size.width;
+    const prev = portraitRef.current;
+    portraitRef.current = portrait;
+    if (prev === null || prev === portrait) return;
     const controls = controlsRef.current;
-    if (!controls || !(camera instanceof THREE.PerspectiveCamera)) return;
-    posed.current = true;
+    if (!controls || anim.current || followId.current) return;
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
     applyHome(camera, size.width, size.height);
     controls.target.set(0, 0, 0);
     controls.update();
   }, [camera, controlsRef, size.height, size.width]);
 
-  useEffect(() => {
-    if (skip.current) {
-      skip.current = false;
-      return;
-    }
-    const controls = controlsRef.current;
-    if (!controls) return;
+  // 聚焦动画的触发点放进 useFrame，而不是 useEffect：
+  // r3f 首帧尺寸为 0，controls 和「相机摆好」的先后在 effect 里不可靠 —— 换个时序就
+  // 静默失效（深链选中了却不聚焦，就是这么来的）。每帧都能拿到最新 controls，稳。
+  const wantId = useRef<string | null>(selectedId);
+  wantId.current = selectedId;
+  const wantReset = useRef(resetToken);
+  wantReset.current = resetToken;
+  const appliedKey = useRef<string | null>(null);
+
+  const startFocus = (controls: OrbitControlsImpl, id: string | null) => {
     const reduced =
       typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const fromPos = camera.position.clone();
@@ -746,7 +788,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     const offset = fromPos.clone().sub(fromTarget);
     const fromDist = Math.max(offset.length(), 0.001);
     offset.multiplyScalar(1 / fromDist);
-    const body = selectedId ? BODY_BY_ID[selectedId] : undefined;
+    const body = id ? BODY_BY_ID[id] : undefined;
     anim.current = {
       t: 0,
       dur: reduced ? 0.01 : 0.95,
@@ -755,17 +797,34 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       dir: offset,
       fromDist,
       toDist: body?.focus ?? 1,
-      toId: selectedId,
-      home: !selectedId,
+      toId: id,
+      home: !id,
     };
     followId.current = null;
     controls.enableRotate = false;
     controls.enableZoom = false;
-  }, [camera, controlsRef, resetToken, selectedId]);
+  };
 
   useFrame((_, raw) => {
     const controls = controlsRef.current;
     if (!controls) return;
+
+    // 首次摆位：等控件和尺寸都就绪，在这里做才不会错过头
+    if (!posed && sizeRef.current.width >= 2 && camera instanceof THREE.PerspectiveCamera) {
+      applyHome(camera, sizeRef.current.width, sizeRef.current.height);
+      controls.target.set(0, 0, 0);
+      controls.update();
+      setPosed(true);
+    }
+
+    // 选中变化（点芯片 / 深链 / 返回总览）→ 起一次聚焦动画
+    const key = `${wantId.current ?? ""}|${wantReset.current}`;
+    if (posed && appliedKey.current !== key) {
+      const initial = appliedKey.current === null && wantId.current === null;
+      appliedKey.current = key;
+      if (!initial) startFocus(controls, wantId.current);
+    }
+
     const delta = Math.min(raw, 0.1);
     const current = anim.current;
     if (current) {
@@ -779,6 +838,12 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
         const obj = current.toId ? reg.groups.get(current.toId) : undefined;
         if (obj) obj.getWorldPosition(scratch.dest);
         else scratch.dest.set(0, 0, 0);
+        // 竖屏时详情卡是底部抽屉：把镜头目标下移，星球就被顶到上半屏
+        if (sizeRef.current.height > sizeRef.current.width) {
+          const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
+          const halfHeight = current.toDist * Math.tan((fov * Math.PI) / 360);
+          scratch.dest.y -= halfHeight * 0.55;
+        }
         scratch.target.lerpVectors(current.fromTarget, scratch.dest, u);
         const dist = THREE.MathUtils.lerp(current.fromDist, current.toDist, u);
         scratch.pos.copy(scratch.target).addScaledVector(current.dir, dist);
@@ -857,6 +922,21 @@ export function SolarCanvas() {
       dpr={[1, 1.6]}
       camera={{ position: [0, 40, 112], fov: 42, near: 0.06, far: 2400 }}
       gl={{ antialias: true, alpha: false, powerPreference: "high-performance" }}
+      onPointerDown={(event) => {
+        dragGuard.x = event.clientX;
+        dragGuard.y = event.clientY;
+        dragGuard.moved = false;
+        dragGuard.active = true;
+      }}
+      onPointerMove={(event) => {
+        if (!dragGuard.active || dragGuard.moved) return;
+        if (Math.hypot(event.clientX - dragGuard.x, event.clientY - dragGuard.y) > DRAG_THRESHOLD) {
+          dragGuard.moved = true;
+        }
+      }}
+      onPointerUp={() => {
+        dragGuard.active = false;
+      }}
       onCreated={({ gl }) => {
         gl.setClearColor("#07090e", 1);
       }}
