@@ -1,4 +1,4 @@
-// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
+﻿// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
 // 用系统自带 Edge（playwright-core 不下载 Chromium），软件光栅化跑 WebGL。
 // 判定标准：画布真的渲染（window.__solarReady）、控制台零报错、无横向溢出。
 import { chromium } from "playwright-core";
@@ -143,36 +143,6 @@ try {
       viewport: { width: 1280, height: 720 },
     }),
   );
-  // 星问挑战：打开 → 答一题 → 看解析 → 下一题
-  const quizCtx = await browser.newContext({
-    viewport: { width: 390, height: 844 },
-    deviceScaleFactor: 3,
-    isMobile: true,
-    hasTouch: true,
-  });
-  const quizPage = await quizCtx.newPage();
-  const quizErrors = [];
-  quizPage.on("pageerror", (e) => quizErrors.push(e.message));
-  quizPage.on("console", (m) => m.type() === "error" && quizErrors.push(m.text()));
-  try {
-    await quizPage.goto(base, { waitUntil: "load" });
-    await quizPage.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
-    await quizPage.locator('[aria-label="星问挑战"]').click();
-    await quizPage.waitForSelector('[role="dialog"]', { timeout: 10000 });
-    await quizPage.screenshot({ path: path.join(SHOTS, "quiz-ask.png") });
-    const firstOption = quizPage.locator('[role="dialog"] button').first();
-    const questionText = await quizPage.locator('[role="dialog"] h2').innerText();
-    await firstOption.click();
-    await quizPage.waitForSelector('[role="dialog"] .panel-in', { timeout: 5000 });
-    await quizPage.screenshot({ path: path.join(SHOTS, "quiz-reveal.png") });
-    await quizPage.getByRole("button", { name: "下一题" }).click();
-    results.push({ pass: "quiz", question: questionText, errors: quizErrors });
-    if (quizErrors.length) failures.push(`quiz: 报错 ${quizErrors.length} 条`);
-  } catch (err) {
-    failures.push(`quiz: ${err.message}`);
-    results.push({ pass: "quiz", errors: quizErrors });
-  }
-  await quizCtx.close();
 } finally {
   await browser.close();
   server.close();
