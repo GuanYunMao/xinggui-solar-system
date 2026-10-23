@@ -4,7 +4,7 @@ import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef,
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { simClock } from "./clock";
-import { BODY_BY_ID, EARTH_PERIOD, isMoon, type Body } from "./data";
+import { EARTH_PERIOD, isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { tightenClipPlanes } from "./systems";
@@ -60,14 +60,19 @@ const LEGACY_SHADER =
   typeof window !== "undefined" && new URLSearchParams(window.location.search).get("legacy") === "1";
 
 /**
- * 原型相机到地球的距离（米）。默认 1e7，这个距离下地球张角约 1195 px，
- * float32 的 16384 m 量化在本机 720p 上折合约 1.6 px —— 信噪比最高的测量点。
- * 允许用 ?dist= 覆盖，纯为了截图取景和极端距离回归。
+ * 原型相机到地球的距离（米）。默认 2.5e7。
+ *
+ * 这个默认值是从取景反推的，不是拍的：地球在 720p 上的投影半径
+ * = f·tan(asin(R/d))，f=937.8。d=1e7 时半径 776 px，而画面角方向只到
+ * 734 px（1280×720 的对角半径）—— 四个角全被地球吃掉，截图是一片洋面，
+ * 连"这是一颗球"都看不出来。d=2.5e7 时半径 247 px，四边留黑，整颗球在画面里。
+ *
+ * 抖动测量不用这个默认值，用 ?dist=1.2e7（圆盘左右缘刚好还在画面内，f/视距 最大）。
  */
 const PROTO_DIST = (() => {
   const raw = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dist");
   const n = raw ? Number(raw) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : 1e7;
+  return Number.isFinite(n) && n > 0 ? n : 2.5e7;
 })();
 
 /** ?still=1：相机完全钉死。用来量"测量本身的噪声底"，不参与正常断言。 */
@@ -619,7 +624,10 @@ function PlanetSurface({ body, onPick }: { body: Body; onPick: (e: ThreeEvent<Po
       }),
     [map],
   );
-  const clouds = body.texture === "earth";
+  // 实境原型里不挂云层：它是半径 1.02× 的半透明壳，片元按 alpha discard，轮廓是碎的。
+  // 像素回读找"背景→圆盘"边缘时会锁在云斑而不是球面轮廓上，
+  // 实测把现代路径的残余噪声从 0.1 px 抬到 0.6 px，正好盖住要测的东西。
+  const clouds = body.texture === "earth" && useSystem().spec.unit !== "meter";
   const cloudMat = useMemo(() => {
     if (!clouds) return null;
     return new THREE.ShaderMaterial({
@@ -912,6 +920,13 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   const reg = useRegistry();
   const selectedId = useSim((state) => state.selectedId);
   const resetToken = useSim((state) => state.resetToken);
+  /*
+   * 模式切换锁（store 层由 t12 立的 switching，1500ms 兜底）。
+   * 禁拖拽/缩放只能在渲染层做 —— controls 在这儿，HUD 那边碰不到。
+   * 释放点按 store 的契约走：finishSwitch() 由渲染层在相机动画结束时调用，
+   * 是 `switching` 的唯一释放点（超时兜底在 store 里，不归这里管）。
+   */
+  const switching = useSim((state) => state.switching);
   const sizeRef = useRef(size);
   sizeRef.current = size;
   // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
@@ -1000,6 +1015,23 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     controls.enableZoom = false;
   };
 
+  /*
+   * 切换结束（switching → null）时把控制权还回去。
+   * 有动画在跑的话不在这里抢：那种情况由动画结束处（u>=1 那一支）负责恢复，
+   * 两处都以 switching 为条件，谁先到都不会提前开锁。
+   */
+  useEffect(() => {
+    const c = controlsRef.current;
+    if (!c) return;
+    if (switching) {
+      c.enableRotate = false;
+      c.enableZoom = false;
+    } else if (!anim.current) {
+      c.enableRotate = true;
+      c.enableZoom = true;
+    }
+  }, [switching, controlsRef]);
+
   useFrame((_, raw) => {
     const controls = controlsRef.current;
     if (!controls) return;
@@ -1031,8 +1063,10 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
          * shade 仍有 0.25，整个轮廓都亮 —— 像素回读的遮罩才能量到真正的圆盘，
          * 而不是"受光的那一块"。
          *
-         * 运动改成径向呼吸（±3%），不是绕转：绕转会改变受光区域大小，
-         * 质心会跟着系统性漂移，把 1 px 级的抖动淹掉。
+         * 运动：绕「日向轴」滚转 ±10° 做慢摆，再叠 ±1% 的径向呼吸。
+         * 绕日向轴转的好处是与太阳的夹角恒定，受光区域一点不变；纯径向呼吸虽然
+         * 也不改受光，但误差几乎全落在视线方向上，投影上扫不出横向位移（实测对照
+         * 组只差 0.05 px），必须有横向的三维位移才能把 float32 量化扫出来。
          */
         scratch.sunDir.copy(scratch.dest).negate().normalize();
         scratch.camDir.copy(scratch.sunDir);
@@ -1085,6 +1119,16 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       camera.position.distanceTo(controls.target),
     );
 
+    /*
+     * 模式切换期间禁用拖拽/缩放。放在每帧最前面强制写一次，是因为 drei 的
+     * <OrbitControls> 会在自身重渲染时按 props 把开关刷回默认值，只在 useEffect
+     * 里设一次会被它盖掉。动画结束处的恢复也改成看 switching，两处不会互相提前开锁。
+     */
+    if (switching) {
+      controls.enableRotate = false;
+      controls.enableZoom = false;
+    }
+
     // 首次摆位：等控件和尺寸都就绪，在这里做才不会错过头
     if (!posed && sizeRef.current.width >= 2 && camera instanceof THREE.PerspectiveCamera) {
       applyHome(camera, sizeRef.current.width, sizeRef.current.height);
@@ -1128,8 +1172,16 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       camera.position.copy(scratch.pos);
       if (u >= 1) {
         anim.current = null;
-        controls.enableRotate = true;
-        controls.enableZoom = true;
+        /*
+         * 恢复控制权时看 switching：切换动画刚走完但 store 还没放锁的那一帧，
+         * 这里要是无脑写 true，就会出现"锁还没放、人已经能拖"的窗口。
+         * 顺带按 store 的契约在这里放锁 —— finishSwitch 是 switching 的唯一释放点，
+         * 超时兜底在 store 里（1500ms），不归这里。
+         */
+        const stillSwitching = useSim.getState().switching !== null;
+        controls.enableRotate = !stillSwitching;
+        controls.enableZoom = !stillSwitching;
+        if (stillSwitching) useSim.getState().finishSwitch();
         if (!current.home && current.toId) {
           followId.current = current.toId;
           const obj = reg.groups.get(current.toId);
@@ -1267,24 +1319,21 @@ function Probe() {
         }
         if (x0 < 0) return null;
         // 局部峰值当参考，阈值取半高：边缘亮度随贴图变化，绝对阈值会跟着漂
+        const a0 = fromLeft ? x0 : Math.max(0, x0 - 48);
+        const a1 = fromLeft ? Math.min(W - 1, x0 + 48) : x0;
         let peak = -1;
-        if (fromLeft) for (let x = x0; x < Math.min(W, x0 + 48); x++) peak = Math.max(peak, lum(x));
-        else for (let x = Math.max(0, x0 - 48); x <= x0; x++) peak = Math.max(peak, lum(x));
+        for (let x = a0; x <= a1; x++) peak = Math.max(peak, lum(x));
         if (peak < bg + 12) return null;
         const thr = bg + (peak - bg) * 0.5;
-        if (fromLeft) {
-          // 从里往外走，找第一次跌破阈值的位置，再线性插值到亚像素
-          for (let x = x0 + 12; x > x0 - 2 && x > 1; x--) {
-            const a = lum(x - 1);
-            const b = lum(x);
-            if (a >= thr && b < thr) return x - 1 + (a - thr) / (a - b);
-          }
-        } else {
-          for (let x = x0 - 12; x < x0 + 2 && x < W - 2; x++) {
-            const a = lum(x);
-            const b = lum(x + 1);
-            if (a >= thr && b < thr) return x + (a - thr) / (a - b);
-          }
+        // 左缘是「背景→圆盘」的上升沿，右缘是「圆盘→背景」的下降沿（内测在外侧），
+        // 两边方向相反，判据必须分开写
+        const lo = Math.max(1, x0 - 8);
+        const hi = Math.min(W - 2, x0 + 8);
+        for (let x = lo; x <= hi; x++) {
+          const a = lum(x);
+          const b = lum(x + 1);
+          if (fromLeft && a < thr && b >= thr) return x + (thr - a) / (b - a);
+          if (!fromLeft && a >= thr && b < thr) return x + (a - thr) / (a - b);
         }
         return null;
       };
@@ -1297,21 +1346,50 @@ function Probe() {
        */
       let sumC = 0;
       let rows = 0;
-      const used: number[] = [];
-      for (let k = -4; k <= 4; k++) {
-        const y = Math.round(H / 2 + (k * H) / 24);
-        if (y < 1 || y > H - 2) continue;
-        const l = edgeAt(y, true);
-        const r = edgeAt(y, false);
-        if (l === null || r === null || r - l < W * 0.1) continue;
-        // 记下来供诊断：半径可以和探针给的 radiusPx 对账
-        used.push(+(r - l).toFixed(2));
-        sumC += (l + r) / 2;
+      const radiusSamples: number[] = [];
+      /*
+       * 用「关于画面水平中线对称的两个行」取平均再求中点。
+       * 球面是按纬度环细分的，非中心行的弦中点落在球轴投影上，而球轴在画面里
+       * 会随相机滚转转动 —— 直接把 9 行中点一平均，会混进 0.4 px 的假抖动
+       * （实测：相机钉死 0.075 px，滚转起来 0.41 px，差值全来自这一阶）。
+       * 对称行对的球轴偏移大小相等方向相反，先配对平均就能把它消掉。
+       */
+      for (let k = 0; k <= 4; k++) {
+        const off = Math.round((k * H) / 24);
+        const ys = off === 0 ? [Math.round(H / 2)] : [Math.round(H / 2 - off), Math.round(H / 2 + off)];
+        const mids: number[] = [];
+        for (const y of ys) {
+          if (y < 1 || y > H - 2) continue;
+          const l = edgeAt(y, true);
+          const r = edgeAt(y, false);
+          if (l === null || r === null || r - l < W * 0.1) continue;
+          mids.push((l + r) / 2);
+          radiusSamples.push((r - l) / 2);
+        }
+        if (!mids.length) continue;
+        sumC += mids.reduce((a, b) => a + b, 0) / mids.length;
         rows++;
       }
-      if (!rows) return null;
+      if (!rows) {
+        // 诊断：一行都没量到时把中间行的亮度剖面吐出来，避免"静默返回 null"查不动
+        const yMid = Math.round(H / 2);
+        const probeRow: number[] = [];
+        for (let x = 0; x < W; x += Math.max(1, Math.floor(W / 32))) probeRow.push(+lumAt(x, yMid).toFixed(1));
+        return {
+          x: Number.NaN,
+          y: 0,
+          rows: 0,
+          width: W,
+          height: H,
+          bg: +bg.toFixed(2),
+          pixels: 0,
+          probeRow,
+        } as never;
+      }
       const centerX = sumC / rows;
-      const radiusPxMeasured = used.reduce((a, b) => a + b, 0) / used.length / 2;
+      const radiusPxMeasured = radiusSamples.length
+        ? radiusSamples.reduce((a, b) => a + b, 0) / radiusSamples.length
+        : 0;
 
       // 兜底的全画面质心（诊断用，不参与断言）
       let sx = 0;

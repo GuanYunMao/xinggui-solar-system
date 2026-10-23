@@ -1,5 +1,8 @@
 import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { useEffect } from "react";
+import { ModeBadge } from "./ModeBadge";
+import { OrbitGlyph } from "./BrandMark";
+import { APP_ERA_NAME, versionLabel } from "./brand";
 import { bindSettingsPersistence, loadSettings, useSim } from "./store";
 import { useSystem } from "./system-context";
 
@@ -43,6 +46,8 @@ export function Hud() {
 
   useEffect(() => {
     useSim.getState().hydrate(loadSettings());
+    // 进度独立一个键、独立一次读取：存储挂了只丢记忆，不丢「这次能不能进」。
+    useSim.getState().hydrateGate();
     return bindSettingsPersistence();
   }, []);
 
@@ -55,6 +60,8 @@ export function Hud() {
         event.preventDefault();
         useSim.getState().togglePaused();
       } else if (event.code === "Escape") {
+        // 浮层开着时 Esc 先关浮层（浮层自己的监听负责），别顺手把镜头拉回总览
+        if (document.querySelector('[data-overlay-open="true"]')) return;
         useSim.getState().requestReset();
       } else if (event.key === "l" || event.key === "L") {
         useSim.getState().toggleLabels();
@@ -83,14 +90,33 @@ export function Hud() {
 
   return (
     <div className="pointer-events-none absolute inset-0 z-10 flex flex-col">
-      <header className="flex items-end justify-between gap-4 px-4 pt-4 md:px-6 md:pt-6">
-        <div className="sky-title">
-          <p className="eyebrow text-xs text-muted">太阳系轨道仪 · v{__APP_VERSION__}</p>
-          <h1 className="font-display text-3xl leading-none text-fg">星轨</h1>
+      <header className="flex items-center justify-between gap-3 px-4 pt-4 md:px-6 md:pt-6">
+        {/*
+          左上 = 图标 + 代际名 + 版本号，**不放全名**：
+          「巡星·未至之境」7 字在 text-3xl 下约 210px，320 宽屏左栏只有 167px，物理放不下。
+          全名唯一的家是启动页（App.tsx），那里才有地方让它居中排开。
+        */}
+        <div className="sky-title flex min-w-0 items-center gap-2.5">
+          <h1 className="flex items-center gap-2">
+            <OrbitGlyph className="size-8 shrink-0 text-fg" />
+            <span className="text-base leading-none tracking-[0.2em] text-muted">{APP_ERA_NAME}</span>
+          </h1>
+          <span className="eyebrow text-[11px] text-subtle">{versionLabel(__APP_VERSION__)}</span>
         </div>
-        <div className="sky-title text-right">
-          <p className="text-xs text-muted">{paused ? "已暂停" : "模拟历"}</p>
-          <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
+        {/*
+          右侧改成单行（原来是两行 40px）：模式徽标 + 分隔线 + 模拟历。
+          徽标占的是「区划」的位置，绝不下放到底栏——底栏 grid-cols-5 已满，
+          而且底栏是玩具区（暂停/图层），区划和玩具混层会让人找不到它。
+        */}
+        <div className="pointer-events-auto flex shrink-0 items-center gap-2">
+          <ModeBadge />
+          <span className="h-4 w-px shrink-0 bg-line" aria-hidden />
+          <div className="sky-title flex items-baseline gap-1.5 whitespace-nowrap">
+            <span className="hidden text-xs text-muted sm:inline">
+              {paused ? "已暂停" : "模拟历"}
+            </span>
+            <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
+          </div>
         </div>
       </header>
 
