@@ -393,14 +393,15 @@ main[data-real-veil="1"] .real-controls {
     filter: none;
     opacity: 1;
   }
-  18% {
-    transform: scale(1.06);
-    filter: drop-shadow(0 0 10px rgb(231 237 245 / 0.85)) brightness(1.2);
+  16% {
+    transform: scale(1.08);
+    /* 两层 drop-shadow 近似一圈晕；brightness 让字本身也亮起来（不靠色相） */
+    filter: drop-shadow(0 0 3px rgb(255 255 255 / 0.95)) drop-shadow(0 0 10px rgb(231 237 245 / 0.8)) brightness(1.5);
     opacity: 1;
   }
-  62% {
-    transform: scale(1.01);
-    filter: drop-shadow(0 0 5px rgb(231 237 245 / 0.45)) brightness(1.08);
+  58% {
+    transform: scale(1.02);
+    filter: drop-shadow(0 0 2px rgb(255 255 255 / 0.7)) drop-shadow(0 0 6px rgb(231 237 245 / 0.45)) brightness(1.2);
     opacity: 1;
   }
   100% {
@@ -436,7 +437,7 @@ main[data-real-veil="1"] .real-controls {
   /* t54：不脉动，但提示仍在 —— 静止的高亮态，类名由计时器移除后回常态 */
   .gate-cta {
     animation: none;
-    filter: drop-shadow(0 0 6px rgb(231 237 245 / 0.9)) brightness(1.18);
+    filter: drop-shadow(0 0 3px rgb(255 255 255 / 0.95)) drop-shadow(0 0 8px rgb(231 237 245 / 0.85)) brightness(1.45);
   }
 
   .chrome-in,
