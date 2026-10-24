@@ -65,10 +65,10 @@ const COPY = {
   importVersion: "这个码来自别的版本。", // TODO(copy) gate.import.version（唯一"核对"解决不了的错，单独一句）
   saveWarn: "这次能进，下次未必记得住。", // gate.save.warn（writeGate 失败时）
   // —— t28：三条门从「摸过控件」改成「可判定的观察」——
-  // 面板只给方向，不给答案。答案在卡片里（见 Hud 的 CARD_CLUES）。
-  hintTime: "把时间拨快", // gate.hint.time
-  hintTarget: "比较两颗星", // gate.hint.target
-  hintLayer: "关掉名称与轨道，只看天体", // gate.hint.layer
+  // 提示必须和判定一一对应（玩家不能分不清"我做错了"和"功能没做"）；答案在卡片里。
+  hintTime: "让地球走完一年", // gate.hint.time（判定：daysOf(simSeconds) ≥ 365.25）
+  hintTarget: "找出跑得最快的那颗", // gate.hint.target（判定：最后选中水星）
+  hintLayer: "关掉名称和轨道", // gate.hint.layer（判定：两者同时为 false）
   celebrateLine: "你测出来了：越远的走得越慢。要不要去看看真的？", // gate.celebrate
   // —— 非文案：格式样例，不翻译、不进表 ——
   importPlaceholder: "XG1-ABCDE-FG",
@@ -279,6 +279,8 @@ export function ModeBadge() {
                         aria-hidden
                       />
                       <span>{hint.label}</span>
+                      {/* 一眼看出"做到没做到"：完成的行右对齐 ✓ 与「已完成」 */}
+                      <span className="ml-auto shrink-0 text-[10px]">{lit ? "✓ 已完成" : "未完成"}</span>
                     </li>
                   );
                 })}
