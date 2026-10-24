@@ -797,6 +797,190 @@ const pickerState = (page) =>
     pressedChips: document.querySelectorAll('#chip-row button[aria-pressed="true"]').length,
   }));
 
+// t16：大红斑断言（`jupiter-spot`）——聚焦档认得出、夜面必须认不出。
+//
+// 为什么要有它：`grep 大红斑` 曾经在 verify.mjs 里 0 命中，而 CHANGELOG 写着「【修复】木星的大红斑看不见」。
+// 已修复项零断言 = 同一个 bug 会再来一次。
+//
+// 取证手段（不换结论）：
+//  - 摆位用 `__solarPlace(id, dist, az, el, { faceU, faceV })`（需要 `?diag=1`）把**贴图坐标**上的
+//    大红斑转到正对相机。斑的 u/v 直接从 `textures.ts` 的 `spots[]` 读出来（u=0.63 / v=0.62），
+//    不靠扫方位角碰运气——t8 就是这么把它找出来的。
+//  - 冻结时间：先 Space 暂停，否则自转会把斑转走。
+//  - 盘半径从 `__solarPick.candidates()` 现读，但**轮询到连续两次一致**再用：
+//    t8 实测 `candidates()` 在 `__solarPlace` 之后有秒级不可信期（报盘心差 500px）。
+//  - 判据是 **luma 与 R/(R+G+B) 双门**，且带绝对 luma 下限。为什么必须有下限：
+//    夜面整盘 luma 只有个位数，比值门在"两边都黑"时毫无区分力——只卡比值的断言，
+//    一颗全黑的木星也能过（这正是 t16 要的负对照）。
+const SPOT_UV = { u: 0.63, v: 0.62 }; // 大红斑贴图坐标（textures.ts 的 jupiter spots[0]）
+const SPOT_LUMA_FLOOR = 20; // 绝对下限：定阈值时实测「受光斑区 72.0 / 夜面 5.2」，取 ~4× 夜面、~28% 受光值
+const SPOT_LUMA_RATIO_MAX = 0.8; // 斑区必须明显比同纬度参考带暗：定阈值时实测 72.0 / 100.7 ≈ 0.71
+const SPOT_E_MIN = 0.18; // R/(R+G+B) 门：t8/t21 实测斑的高对比块 E>0.22，这里留 0.04 余量
+const SPOT_REF_DX = 0.35; // 参考带取同 latitude、经度错开的点：盘面半径的 35% 处
+
+/** 采样一小块像素的 luma 与 R/(R+G+B) */
+async function samplePatch(page, cx, cy, half) {
+  return page.evaluate(
+    ({ cx, cy, half }) => {
+      const canvas = document.querySelector("canvas");
+      const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+      if (!gl) return { available: false, reason: "没有 WebGL 上下文" };
+      const attrs = gl.getContextAttributes?.() ?? {};
+      if (!attrs.preserveDrawingBuffer) return { available: false, reason: "preserveDrawingBuffer=false（?diag=1 没生效）" };
+      const dpr = canvas.width / canvas.clientWidth;
+      const x = Math.round(cx * dpr);
+      // WebGL 原点在左下，页面坐标原点在左上
+      const y = Math.round((canvas.clientHeight - cy) * dpr);
+      const size = Math.max(3, Math.round(half * 2 * dpr));
+      const px = new Uint8Array(size * size * 4);
+      gl.readPixels(
+        Math.max(0, Math.min(canvas.width - size, x - (size >> 1))),
+        Math.max(0, Math.min(canvas.height - size, y - (size >> 1))),
+        size,
+        size,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        px,
+      );
+      let r = 0,
+        g = 0,
+        b = 0,
+        n = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        r += px[i];
+        g += px[i + 1];
+        b += px[i + 2];
+        n++;
+      }
+      r /= n;
+      g /= n;
+      b /= n;
+      const sum = r + g + b;
+      return {
+        available: true,
+        luma: +(0.2126 * r + 0.7152 * g + 0.0722 * b).toFixed(2),
+        E: sum > 1e-6 ? +((r - g) / sum).toFixed(4) : null,
+        rgb: [+r.toFixed(1), +g.toFixed(1), +b.toFixed(1)],
+      };
+    },
+    { cx, cy, half },
+  );
+}
+
+/** 连续两次读数一致（r 抖动 <1%）才认，规避 __solarPlace 之后 candidates() 的不可信期 */
+async function stableJupiter(page, tries = 6) {
+  let prev = null;
+  for (let i = 0; i < tries; i++) {
+    const cur = await page.evaluate(() => {
+      const c = (window.__solarPick?.candidates?.() ?? []).find((x) => x.id === "jupiter");
+      return c ? { x: c.x, y: c.y, r: c.r ?? c.radiusPx } : null;
+    });
+    if (cur && prev && Math.abs(cur.r - prev.r) / cur.r < 0.01) return cur;
+    prev = cur;
+    await page.waitForTimeout(300);
+  }
+  return null;
+}
+
+async function runJupiterSpot(browser, base) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await ctx.newPage();
+  const out = {};
+  try {
+    // ?diag=1：__solarPlace 与 readPixels 都需要它
+    await page.goto(`${base}?diag=1`, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1500);
+    await page.keyboard.press("Space"); // 冻结自转，否则斑会转走
+    await page.waitForTimeout(300);
+
+    const measureAt = async (simTime) => {
+      if (simTime !== null) {
+        await page.evaluate((t) => window.__solarTime.set(t), simTime);
+        await page.waitForTimeout(200);
+      }
+      await page.evaluate(() => {
+        window.__solarPlace("jupiter", 12.5, 0, 0, { faceU: 0.63, faceV: 0.62 });
+      });
+      await page.waitForTimeout(700);
+      const disk = await stableJupiter(page);
+      if (!disk) return { error: "candidates() 两次读数不一致（摆位后不可信期）" };
+      const spot = await samplePatch(page, disk.x, disk.y, Math.max(4, disk.r * 0.12));
+      const ref = await samplePatch(page, disk.x + disk.r * 0.35, disk.y, Math.max(4, disk.r * 0.12));
+      return { disk, spot, ref };
+    };
+
+    // 扫一个木星轨道周期取**最亮**与**最暗**两帧：
+    //  - 第一版我用「当前相位」当受光样本，实测 luma 5.6 —— 那是夜面。相位不能靠运气，
+    //    而且写死某个时刻在别的相位上会变成白天（第一版搜夜面时也撞过这个）。
+    //  - 所以两个样本都从同一批采样里挑：最亮 = 受光面（正样本），最暗 = 夜面（负对照）。
+    //    这与 t8 的实测一致（受光斑区 72.0 / 夜面 5.2）。
+    const samples = [];
+    for (const t of [0, 6, 12, 18, 24, 30, 36, 42]) {
+      const m = await measureAt(t);
+      if (!m.error) samples.push({ t, ...m });
+    }
+    if (!samples.length) return { error: "扫一个轨道周期也没拿到可读样本" };
+    samples.sort((a, b) => a.spot.luma - b.spot.luma);
+    out.lit = samples.at(-1); // 最亮
+    out.night = samples[0]; // 最暗
+    out.samples = samples.map((s) => ({ t: s.t, luma: s.spot.luma, refLuma: s.ref.luma, E: s.spot.E }));
+    return out;
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeJupiterSpot(res) {
+  const name = "jupiter-spot";
+  const lit = res.lit;
+  if (!lit || lit.error) {
+    failures.push(`${name}: 受光样本取不到（${lit?.error ?? "未知"}）—— 这条断言失去守卫，必须红`);
+    return { available: false, reason: lit?.error ?? "未知" };
+  }
+  if (!lit.spot.available) {
+    failures.push(`${name}: 读不到像素（${lit.spot.reason}）—— 判据不成立`);
+    return { available: false, reason: lit.spot.reason };
+  }
+  const ratio = lit.ref.luma > 0 ? lit.spot.luma / lit.ref.luma : Infinity;
+  const detected =
+    lit.spot.luma >= SPOT_LUMA_FLOOR && ratio <= SPOT_LUMA_RATIO_MAX && lit.spot.E !== null && lit.spot.E >= SPOT_E_MIN;
+  if (!detected) {
+    failures.push(
+      `${name}: 聚焦档认不出大红斑 —— 斑区 luma ${lit.spot.luma}（下限 ${SPOT_LUMA_FLOOR}）/ 与参考带比 ${ratio.toFixed(2)}（上限 ${SPOT_LUMA_RATIO_MAX}）/ E=${lit.spot.E}（下限 ${SPOT_E_MIN}）。` +
+        `检查 textures.ts 的 jupiter spots[]、或 __solarPlace 的 faceU/faceV 反算。`,
+    );
+  }
+  // 负对照：夜面同一判据必须**不成立**
+  let nightOk = null;
+  if (res.night && !res.night.error && res.night.spot.available) {
+    const nRatio = res.night.ref.luma > 0 ? res.night.spot.luma / res.night.ref.luma : Infinity;
+    const nightDetected =
+      res.night.spot.luma >= SPOT_LUMA_FLOOR &&
+      nRatio <= SPOT_LUMA_RATIO_MAX &&
+      res.night.spot.E !== null &&
+      res.night.spot.E >= SPOT_E_MIN;
+    nightOk = !nightDetected;
+    if (nightDetected) {
+      failures.push(
+        `${name}: 负对照失败 —— 夜面（斑区 luma ${res.night.spot.luma}）也满足了判据。` +
+          `说明这条判据没有绝对亮度下限，一颗全黑的木星也能过。`,
+      );
+    }
+  }
+  return {
+    available: true,
+    lit: { spotLuma: lit.spot.luma, refLuma: lit.ref.luma, ratio: +ratio.toFixed(3), E: lit.spot.E, detected },
+    night: res.night && !res.night.error ? { spotLuma: res.night.spot.luma, refLuma: res.night.ref.luma, E: res.night.spot.E, rejectedByGates: nightOk } : null,
+    thresholds: {
+      lumaFloor: SPOT_LUMA_FLOOR,
+      ratioMax: SPOT_LUMA_RATIO_MAX,
+      EMin: SPOT_E_MIN,
+      origin: "定阈值时实测：受光斑区 luma 72.0 / 参考带 100.7（比 0.71）/ 斑块 E>0.22；夜面整盘 luma 5.2（比值门在两边都黑时无效，故加绝对下限）+ textures.ts spots[] 给出 u=0.63、v=0.62",
+    },
+  };
+}
+
 // ——— 轨道共面（沙盘）/ 不共面（实境）：`__solarOrbitPlanes()` 的三点求法向量 ————
 // 为什么要有这条：`t24` 让沙盘行星回到共面，而当时 19 条 pass **一条都不守它**——
 // `overlapping` 明令禁止加阈值、`meanLvl`/`meanLum` 是松判据。所以这条是唯一守卫。
@@ -1237,6 +1421,15 @@ try {
       results.push({ pass: "orbit-planes", 分类: "结构量", ...judgeOrbitPlanes(planes) });
     } catch (err) {
       failures.push(`orbit-planes: ${err.message}`);
+    }
+  }
+  // ——— 大红斑（聚焦档认得出、夜面认不出）———
+  if (want("jupiter-spot")) {
+    try {
+      const spot = await runJupiterSpot(browser, base);
+      results.push({ pass: "jupiter-spot", 分类: "结构量（像素统计 + 绝对下限）", ...judgeJupiterSpot(spot) });
+    } catch (err) {
+      failures.push(`jupiter-spot: ${err.message}`);
     }
   }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
