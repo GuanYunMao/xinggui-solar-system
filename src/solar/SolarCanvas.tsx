@@ -8,7 +8,7 @@ import { isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
-import { frameEarthMoon, tightenClipPlanes } from "./systems";
+import { frameEarthMoon, lookOf, tightenClipPlanes } from "./systems";
 import { acquireCloudTexture, acquirePlanetTexture, glowTexture, textureReport } from "./textures";
 
 declare global {
@@ -415,25 +415,25 @@ function Simulation() {
   const reg = useRegistry();
   // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
   const { bodies, spec } = useSystem();
+  // 观感/行为声明（R3）：这个系统要不要推进时间、要不要转，全看 look，不看 unit
+  const look = lookOf(spec);
   useFrame((_, raw) => {
     const delta = Math.min(raw, 0.1);
     /*
-     * 时间只有一处推进（R4）：这一行是**唯一**的生产端。
+     * 时间只有一处推进（R4）：这一行是**唯一**的生产端；`look.freezesTime` 决定要不要推进。
      *
-     * 实境的冻结发生在**这里**——米制系统（实境 / ?proto=1）根本不推进模拟钟。
-     * 改造前是 `const t = spec.unit === "meter" ? 0 : time.current`：消费端把时间读成 0、
-     * 生产端照跑，于是在实境待多久、回沙盘的模拟历就凭空跳过多久
-     * （实测在实境待 6.6 s → 模拟历 +174 日）。
+     * 改造前这件事写在消费端 —— 把米制系统的时间读成 0，生产端照跑，
+     * 于是在实境待多久、回沙盘的模拟历就凭空跳过多久（实测在实境待 6.6 s → 模拟历 +174 日）。
+     * 米制系统（实境 / ?proto=1）现在 freezesTime: true，时间就停在进入那一刻。
      */
-    if (spec.unit !== "meter") useSim.getState().advanceSim(delta);
+    if (!look.freezesTime) useSim.getState().advanceSim(delta);
     /*
      * 其它一切都从这一份时间派生：公转、自转、云层、小行星带、太阳 uTime（clock.ts 的
      * simTimeNow）、HUD 历法（advanceSim 里写回 days）。这里不保留任何累加器 ——
      * 保留一个 useRef 就等于又开了一份真值。
      *
-     * 米制下 t 是冻结值：天体停在原地、自转停在原角度（这也正是 proto 抖动测量要的：
-     * 圆盘形状与纹理都不动，屏幕上测到的位移只可能来自浮点）。改造前靠 `spinOn` 手工
-     * 跳过自转来达到同样效果；现在 t 冻结了，公式照算一遍结果一样，少一个分支。
+     * `look.spins` 管的是"这个系统的天体转不转"：冻结时间只让 t 不动（值停住），
+     * 而"不写旋转"是另一件事 —— 星图那种系统时间照跑但不该转，两个开关必须分开。
      */
     const t = useSim.getState().simSeconds;
     for (const body of bodies) {
@@ -444,6 +444,7 @@ function Simulation() {
         const lz = Math.sin(angle) * body.orbitRadius;
         group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
       }
+      if (!look.spins) continue;
       const spin = reg.spins.get(body.id);
       if (spin) {
         const rate = body.locked ? (Math.PI * 2) / body.period : body.spin;
@@ -452,7 +453,7 @@ function Simulation() {
       const clouds = reg.clouds.get(body.id);
       if (clouds) clouds.rotation.y = t * body.spin * 1.35;
     }
-    if (reg.belt) reg.belt.rotation.y = t * 0.015;
+    if (look.spins && reg.belt) reg.belt.rotation.y = t * 0.015;
     if (!window.__solarReady) window.__solarReady = true;
   }, -3);
   return null;
@@ -631,6 +632,9 @@ function PlanetSurface({ body }: { body: Body }) {
   const camera = useThree((state) => state.camera);
   const gl = useThree((state) => state.gl);
   const size = useThree((state) => state.size);
+  // 观感声明（R3）：云层壳、球面细分都由 look 决定，不再看 unit
+  const { spec } = useSystem();
+  const look = lookOf(spec);
   /*
    * 贴图不是 useMemo 里同步算出来的，而是一个有生命周期的句柄：
    * 拿到的第一张可能是 1×1 占位色（程序化贴图还没轮到）或摄影贴图，
@@ -651,7 +655,7 @@ function PlanetSurface({ body }: { body: Body }) {
   // 实境原型里不挂云层：它是半径 1.02× 的半透明壳，片元按 alpha discard，轮廓是碎的。
   // 像素回读找"背景→圆盘"边缘时会锁在云斑而不是球面轮廓上，
   // 实测把现代路径的残余噪声从 0.1 px 抬到 0.6 px，正好盖住要测的东西。
-  const clouds = body.texture === "earth" && useSystem().spec.unit !== "meter";
+  const clouds = body.texture === "earth" && look.clouds;
   const cloudMap = useMemo(() => (clouds ? acquireCloudTexture() : null), [clouds]);
   const cloudMat = useMemo(() => {
     if (!cloudMap) return null;
@@ -724,7 +728,7 @@ function PlanetSurface({ body }: { body: Body }) {
    * （同视距下 1.2 px）是同一个量级，会直接盖住信号。
    * 拉到 128 段后弦高降到 0.16 px，信噪比才够。
    */
-  const hiFi = useSystem().spec.unit === "meter";
+  const hiFi = look.refineGeometry;
   const seg = hiFi ? 128 : body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
   return (
     <>
@@ -830,6 +834,7 @@ function Labels() {
   const camera = useThree((state) => state.camera);
   const reg = useRegistry();
   const { bodies, spec } = useSystem();
+  const look = lookOf(spec);
   const showLabels = useSim((state) => state.showLabels);
   const selectedId = useSim((state) => state.selectedId);
 
@@ -865,7 +870,7 @@ function Labels() {
     const focal = h / 2 / Math.tan((persp.fov * Math.PI) / 360);
     const nodes = pool.current;
     // 沙盘里卫星不给标签（会叠成一团）；实境里只给选中的那个
-    const baseOn = showLabels && spec.unit !== "meter";
+    const baseOn = showLabels && look.labels;
 
     /*
      * 先回收这一帧不在系统里的旧节点。
@@ -1639,7 +1644,7 @@ function Probe() {
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
   const gl = useThree((state) => state.gl);
-  const { bodies } = useSystem();
+  const { bodies, spec } = useSystem();
 
   useEffect(() => {
     const v = new THREE.Vector3();
@@ -1716,6 +1721,17 @@ function Probe() {
       spin: (id: string) => reg.spins.get(id)?.rotation.y ?? null,
     };
     (window as unknown as { __solarTime?: typeof timeApi }).__solarTime = timeApi;
+
+    /*
+     * 观感声明探针（R3）：当前系统实际生效的 look，外加"真的挂上了没"的旁证
+     * （云层分组数量、小行星带在不在）。它是这一条重构的验收口径：
+     * 换系统时只改数据，这里读到的组合应当自动跟着变，不需要任何代码分支。
+     */
+    const lookApi = () => ({
+      ...lookOf(spec),
+      mounted: { clouds: reg.clouds.size, belt: Boolean(reg.belt) },
+    });
+    (window as unknown as { __solarLook?: typeof lookApi }).__solarLook = lookApi;
 
     /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
@@ -1898,6 +1914,7 @@ function Probe() {
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
+      delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;
     };
   }, [reg, camera, gl, bodies, size.height, size.width]);
 
@@ -2088,8 +2105,10 @@ function traceCam(mode: string, camera: THREE.Camera, target: THREE.Vector3 | nu
 function CamTrace({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
   const camera = useThree((state) => state.camera);
   const { spec } = useSystem();
+  // 轨迹里的 mode 标签就是相机型号（sandbox / meter），不另造一套判断
+  const cameraKind = lookOf(spec).camera;
   useFrame(() => {
-    traceCam(spec.unit === "meter" ? "meter" : "sandbox", camera, controlsRef.current?.target ?? null);
+    traceCam(cameraKind, camera, controlsRef.current?.target ?? null);
   }, -1);
   return null;
 }
@@ -2106,37 +2125,41 @@ function Scene() {
   });
   const controlsRef = useRef<OrbitControlsImpl>(null);
   const { byId, spec } = useSystem();
+  // 观感声明（R3）：装饰、轨道线、标签、用哪台相机，全部由系统的 look 决定
+  const look = lookOf(spec);
   const sun = byId.sun;
   if (!sun) return null;
   /*
-   * 实境原型（米）下不挂沙盘装饰：星空、小行星带、尾迹的几何体都建在
-   * 「离原点几十到几百」这个量级上，而原型里那个量级是"几十米"。
+   * 米制系统不挂沙盘装饰：星空、小行星带、尾迹的几何体都建在
+   * 「离原点几十到几百」这个量级上，而米制系统里那个量级是"几十米"。
    * 更麻烦的是尾迹——它记录的是世界坐标（~1.5e11 m）且 frustumCulled=false，
    * 在 float32 下大数相减会把它画到屏幕上任意位置，像素回读的亮斑质心
    * 会被它拖走 10~18 px（proto 与 legacy 同样漂移，就是这个东西干的）。
+   * 所以 REAL_PROTO 的 look.decor 是 false；这条判断不再看 unit。
    */
-  const decor = spec.unit !== "meter";
   return (
     <RegistryContext.Provider value={registry.current}>
-      {decor && <Stars />}
+      {look.decor && <Stars />}
       <Probe />
       <PickLayer />
       <Labels />
       <Simulation />
       <BodyNode
         body={sun}
-        showOrbits={showOrbits && decor}
-        showLabels={showLabels && decor}
+        showOrbits={showOrbits && look.orbitLines}
+        showLabels={showLabels && look.labels}
         selectedId={selectedId}
       />
-      {decor && <Asteroids />}
-      {decor && <Trails />}
+      {look.decor && <Asteroids />}
+      {look.decor && <Trails />}
       {/*
-        相机按「系统单位」二选一挂载，不是运行时 if：米制与沙盘是两套完全不同的相机，
+        相机由 look.camera 二选一挂载，不是运行时 if：米制与沙盘是两套完全不同的相机，
         同一时刻只有一台存在。这样切模式就等于「卸载一台 + 挂载另一台」，各自只在自己
         挂载时摆位 —— 不需要任何跨模式共享的状态，也就没有"谁该把 ref 补写成真话"。
+        为什么不用 unit 判断：相机型号是「这个系统怎么被看」的属性，不是长度单位；
+        2 代际的星图用世界单位，但它可能想要哪台相机是另一件事。
       */}
-      {spec.unit === "meter" ? (
+      {look.camera === "meter" ? (
         <MeterCamera controlsRef={controlsRef} />
       ) : (
         <SandboxCamera controlsRef={controlsRef} />

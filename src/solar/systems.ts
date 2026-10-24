@@ -10,11 +10,69 @@
 
 import type { Body } from "./data";
 
+/**
+ * 一个系统的**观感 / 行为声明**（R3）。
+ *
+ * 为什么要有它：改造前这些开关全是 `spec.unit === "meter"` —— `unit` 只表示"长度单位是米
+ * 还是世界单位"，却顺带管着七件事（冻结时间、自转、云层、细分、标签、装饰、相机）。
+ * 2 代际要加第三个系统（星图：世界单位，但不该有自转/云层），`unit` 表达不了那个组合，
+ * 漏一处就是"星图里行星在自转"这种荒谬 bug。现在每个开关只认这里的字段，`unit` 回到本职。
+ *
+ * **新增一个系统 = 只改数据**：写一份 SystemSpec（含 look），不碰渲染层的任何分支。
+ * 各项可以独立组合，所以用布尔对象而不是 profile 字符串。
+ */
+export type SystemLook = {
+  /** 天体自转、云层自转、小行星带转动（都挂在模拟时间轴上） */
+  spins: boolean;
+  /** 挂地球的云层壳（结构，不是旋转） */
+  clouds: boolean;
+  /** 天体名字标签 */
+  labels: boolean;
+  /** 装饰体：星空 / 小行星带 / 尾迹 */
+  decor: boolean;
+  /** 轨道线（还要叠 HUD 的 showOrbits 开关） */
+  orbitLines: boolean;
+  /** 冻结模拟时间推进（生产端不推进，见 SolarCanvas 的 Simulation） */
+  freezesTime: boolean;
+  /**
+   * 球面细分提到 128 段。是**测量**需求不是画质需求：弦高 = r·(1−cos(π/N))，
+   * N=56、r=530 px 时 0.83 px，会和要测的 float32 抖动（1.2 px）同量级。
+   */
+  refineGeometry: boolean;
+  /** 用哪台相机：沙盘（OrbitControls）/ 米制（frameEarthMoon 独占） */
+  camera: "sandbox" | "meter";
+};
+
+/**
+ * 沙盘那套观感 —— 也是 `look` 缺省值。
+ *
+ * 缺省给沙盘，是因为 `system-context.tsx` 里的 `SOL_SYSTEM`（不在本文件的领土里）也没写
+ * look；给它一个"看得见所有东西"的缺省，比给一个"什么都没有"的缺省安全。
+ * 将来谁给 SOL_SYSTEM 补 look，请在同一个提交里显式写上这组值（别靠缺省）。
+ */
+export const SANDBOX_LOOK: SystemLook = {
+  spins: true,
+  clouds: true,
+  labels: true,
+  decor: true,
+  orbitLines: true,
+  freezesTime: false,
+  refineGeometry: false,
+  camera: "sandbox",
+};
+
+/** 取一个系统实际生效的 look（没写就用沙盘的）。渲染层只该通过它读这些开关。 */
+export function lookOf(spec: SystemSpec): SystemLook {
+  return spec.look ?? SANDBOX_LOOK;
+}
+
 export type SystemSpec = {
   id: string;
   name: string;
-  /** 单位：沙盘是压缩世界单位，实境是米 */
+  /** 单位：沙盘是压缩世界单位，实境是米。**只表示单位**，不当功能开关用（见 SystemLook）。 */
   unit: "worldUnit" | "meter";
+  /** 观感/行为声明；省略 = 沙盘那套（SANDBOX_LOOK） */
+  look?: SystemLook;
   bodies: Body[];
 };
 
@@ -88,6 +146,27 @@ export const REAL_PROTO: SystemSpec = {
   id: "real-proto",
   name: "实境原型",
   unit: "meter",
+  /*
+   * 米制原型要的是"量得准"，不是"看得像"：每个 false 背后都有一条实测理由。
+   *  - spins: 自转/公转会把贴图暗区（深海）转进转出像素回读的遮罩，质心被拖走 10~18 px；
+   *  - clouds: 云层是 1.02× 半透明壳，轮廓会锁在云斑上（残余噪声 0.1 → 0.6 px）；
+   *  - labels: 实境 HUD 没有芯片行，标签层也不该有；
+   *  - decor / orbitLines: 几何体都建在"几十到几百"世界单位的量级，米制下量级不对；
+   *    尾迹尤其致命（记录世界坐标 ~1.5e11 m 且 frustumCulled=false，会被画到屏幕任意位置）；
+   *  - freezesTime: 时间是"进入那一刻"，推进发生在生产端（Simulation 不调 advanceSim）；
+   *  - refineGeometry: 128 段，弦高 0.16 px，圆盘轮廓才不是多面体；
+   *  - camera: 米制相机（frameEarthMoon 每帧独占，见 MeterCamera）。
+   */
+  look: {
+    spins: false,
+    clouds: false,
+    labels: false,
+    decor: false,
+    orbitLines: false,
+    freezesTime: true,
+    refineGeometry: true,
+    camera: "meter",
+  },
   bodies: REAL_PROTO_BODIES,
 };
 
