@@ -409,6 +409,68 @@ const CHECKS = [
       };
     },
   },
+  {
+    id: 7,
+    title: "压缩策略的四条比率（data.ts ↔ README 的「比例压缩是设计，不是欠账」）",
+    // 为什么要有这条：README 里写着「太阳/地球画成 5:1，真实 109:1」「月球/地球 0.263（真值 0.273）」
+    // 「月球角径只有太阳的 0.417，日面最多遮 17.4%」——这些是**叙事的一部分**，改一个数就是改故事。
+    // 但它们只活在散文里，谁动了 data.ts 的半径都不会红。这条把它们变成可判红的算式：
+    // 四个数全部从 data.ts 现算，与设计值比，偏差 >1% 就红。改了设计就同时改这里和 README——那正是重点。
+    // 占位：周期一致性（开普勒 T²∝a³ 在压缩比例下必然不成立）**不在这里判**，等行为断言那层。
+    expect:
+      "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%（各 ±1%）；周期一致性待行为断言",
+    run(loaded) {
+      const f = loaded.find((x) => x.file === "src/solar/data.ts");
+      if (!f) {
+        return { hits: [{ file: "src/solar/data.ts", line: 0, text: "读不到 data.ts，这条判不了" }], observed: "缺文件", ok: false, raw: 1 };
+      }
+      // classify() 把每行拆成 code/comment 两段，所以要先拼回文本再找常数
+      const text = f.lines.map((l) => `${l.code ?? ""}${l.comment ?? ""}`).join("\n");
+      const count = (id) => text.split(`id: "${id}"`).length - 1;
+      const grab = (id, field) => {
+        const at = text.indexOf(`id: "${id}"`);
+        if (at < 0) return null;
+        const seg = text.slice(at, at + 1500);
+        const m = new RegExp(`\\b${field}:\\s*([0-9.]+)`).exec(seg);
+        return m ? Number(m[1]) : null;
+      };
+      const sunR = grab("sun", "radius");
+      const earthR = grab("earth", "radius");
+      const moonR = grab("moon", "radius");
+      const earthOrbit = grab("earth", "orbitRadius");
+      const moonOrbit = grab("moon", "orbitRadius");
+      const dupes = ["sun", "earth", "moon"].filter((id) => count(id) > 1);
+
+      const rows = [];
+      const dev = [];
+      if (!sunR || !earthR || !moonR || !earthOrbit || !moonOrbit) {
+        return { hits: [{ file: "src/solar/data.ts", line: 0, text: "取不到 sun/earth/moon 的 radius 或 orbitRadius" }], observed: "缺数据", ok: false, raw: 1 };
+      }
+      const ratio = (label, got, want, unit = "×") => {
+        const off = Math.abs(got - want) / want;
+        const text = `${label} = ${got.toFixed(4)}${unit}（设计 ${want}${unit}，偏差 ${(off * 100).toFixed(2)}%）`;
+        rows.push({ file: "src/solar/data.ts", line: 0, text });
+        if (off > 0.01) dev.push(text);
+      };
+      const angMoon = Math.atan(moonR / moonOrbit);
+      const angSun = Math.atan(sunR / earthOrbit);
+      ratio("太阳/地球 半径比", sunR / earthR, 5.0);
+      ratio("月球/地球 半径比", moonR / earthR, 0.263);
+      ratio("月球÷太阳 角径比（从地球看）", angMoon / angSun, 0.417);
+      ratio("日面最大遮挡比例（角径比²）", (angMoon / angSun) ** 2, 0.174, "");
+      for (const id of dupes) {
+        dev.push(`data.ts 里 id: "${id}" 出现了 ${count(id)} 次 —— 同一个天体两份定义，比率会变成「取第一个」，必须删掉多余的`);
+      }
+      return {
+        hits: dev.length ? dev.map((text) => ({ file: "src/solar/data.ts", line: 0, text })) : rows,
+        observed: dev.length ? `${dev.length} 处偏离（四条比率 + 重复定义）` : "四条比率与设计一致（周期一致性未纳入，等行为断言那层）",
+        ok: dev.length === 0,
+        // raw 必须随「发现的东西」单调增长：selftest 用它证明「注入后真的被数到了」。
+        // 只写 dev.length 会让「4 条比率 → 1 处偏离」在数值上变小，selftest 判成没红。
+        raw: rows.length + dev.length + dupes.length,
+      };
+    },
+  },
 ];
 
 /** 清单漂移：src 下这一层出现的 .ts/.tsx 必须都在 SCAN_FILES 里，反之亦然 */
@@ -520,6 +582,13 @@ const SELFTEST_CASES = [
   },
   { id: 5, file: "src/solar/clock.ts", inject: "\nexport const simClock = () => 1;\n" },
   { id: 6, file: "src/solar/store.ts", inject: "\nexport const lookOf = () => null;\n" },
+  {
+    // 第 7 条的注入方式是「给地球加第二份定义」：既触发重复检测，又让四条比率变成「取第一个」。
+    // 这正好是这条判据要防的那类事故——故事里的数被悄悄改一份。
+    id: 7,
+    file: "src/solar/data.ts",
+    inject: '\n  { id: "earth", name: "地球二号", radius: 1.2, orbitRadius: 15.2, period: 18 },\n',
+  },
 ];
 
 function selftest() {
@@ -558,9 +627,11 @@ function selftest() {
     }
   }
   console.log("─".repeat(78));
+  // 分母从 CHECKS.length 现算：写死「6/6」在加判据那天就变成假话（这条自己踩过）。
+  const total = CHECKS.length;
   console.log(
     failures === 0
-      ? `selftest: 6/6 条判据注入后都会红 —— 护栏有效`
+      ? `selftest: ${total}/${total} 条判据注入后都会红 —— 护栏有效`
       : `selftest: ${failures} 条判据注入后没红 —— 这些护栏是假的，必须修`,
   );
   return failures;
