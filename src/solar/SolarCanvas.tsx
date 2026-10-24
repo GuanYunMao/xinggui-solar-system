@@ -2004,7 +2004,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
  * 差了 16 个数量级。验收量的必须是"用户遇到的那套判定"，所以它只能有一份数学。
  * 顺带拿到与拾取器一致的「相机背后剔除」——见下面 NaN 那一支。
  */
-function Probe() {
+function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
   const reg = useRegistry();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
@@ -2105,6 +2105,34 @@ function Probe() {
       mounted: { clouds: reg.clouds.size, belt: Boolean(reg.belt) },
     });
     (window as unknown as { __solarLook?: typeof lookApi }).__solarLook = lookApi;
+
+    /*
+     * 相机探针（t47）：只读，但给的东西比"一个距离"多 —— 相机到 target、最近天体是谁/多远、
+     * 相机自身位置与 fov。为什么必须加：`__solarClip` 只暴露 near/far，而用屏幕半径反推距离
+     * 在 R/d > 0.707 时会饱和（asin 里 clamp 到 0.999999），5.37 以内永远测不准 ——
+     * 验收"渐进逼近"时正是那一段。
+     */
+    const cameraApi = () => {
+      const persp = camera as THREE.PerspectiveCamera;
+      const target = controlsRef.current?.target ?? null;
+      const p = new THREE.Vector3();
+      let nearest: { id: string; dist: number } | null = null;
+      for (const b of bodies) {
+        const g = reg.groups.get(b.id);
+        if (!g) continue;
+        g.getWorldPosition(p);
+        const d = camera.position.distanceTo(p);
+        if (!nearest || d < nearest.dist) nearest = { id: b.id, dist: +d.toFixed(5) };
+      }
+      return {
+        target: target ? [+target.x.toFixed(4), +target.y.toFixed(4), +target.z.toFixed(4)] : null,
+        distTarget: target ? +camera.position.distanceTo(target).toFixed(5) : null,
+        nearest,
+        pos: [+camera.position.x.toFixed(4), +camera.position.y.toFixed(4), +camera.position.z.toFixed(4)],
+        fov: persp.fov,
+      };
+    };
+    (window as unknown as { __solarCamera?: typeof cameraApi }).__solarCamera = cameraApi;
 
     /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
@@ -2288,8 +2316,9 @@ function Probe() {
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
       delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;
+      delete (window as unknown as { __solarCamera?: typeof cameraApi }).__solarCamera;
     };
-  }, [reg, camera, gl, bodies, size.height, size.width]);
+  }, [reg, camera, gl, bodies, size.height, size.width, controlsRef]);
 
   return null;
 }
@@ -2522,14 +2551,14 @@ function pinnedBootStage(): number | null {
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
-  const selectedId = useSim((state) => state.selectedId);
-  const registry = useRef<Registry>({
+  const selectedId = useSim((state) => state.selectedId);  const registry = useRef<Registry>({
     groups: new Map(),
     spins: new Map(),
     clouds: new Map(),
     belt: null,
   });
   const controlsRef = useRef<OrbitControlsImpl>(null);
+  const camera = useThree((state) => state.camera);
   const { byId, spec } = useSystem();
   // 观感声明（R3）：装饰、轨道线、标签、用哪台相机，全部由系统的 look 决定
   const look = spec.look;
@@ -2545,6 +2574,54 @@ function Scene() {
     return () => cancelAnimationFrame(id);
   }, [pin, stage]);
   const sun = byId.sun;
+
+  /*
+   * `?diag=1` 专用：把相机摆到「某天体 + 距离 + 方位角」的机位（t47）。
+   *
+   * 为什么需要它：日食这类验收要一台"从晨昏线方向看日面"的机位，靠鼠标拖只能碰运气
+   * （上一轮就栽在相机落在夜面）。但**这条能力不能进发布物**：默认路径里没有它，
+   * 只有 `?diag=1` 才挂上，退出时删掉。摆位只改 camera.position 与 controls.target
+   * （OrbitControls 每帧从 target 重新推导），所以 __solarReady / 探针都不受影响。
+   *
+   * 参数：place(id, dist, azimuthDeg, elevationDeg?)。
+   *  - 方位角 0° = 从天体看向太阳的方向（相机站在天体朝日一侧，看得到受光面）；
+   *  - 90° = 垂直那个方向的晨昏线侧。
+   */
+  useEffect(() => {
+    if (!DIAG) return;
+    const place = (id: string, dist: number, azimuthDeg: number, elevationDeg = 12) => {
+      const g = registry.current.groups.get(id);
+      const body = byId[id];
+      const controls = controlsRef.current;
+      if (!g || !body || !controls) return null;
+      const center = new THREE.Vector3();
+      g.getWorldPosition(center);
+      // 天体 → 太阳 的方向（太阳在世界原点）
+      const toSun = new THREE.Vector3().sub(center);
+      if (toSun.lengthSq() < 1e-12) toSun.set(0, 0, 1);
+      toSun.normalize();
+      // 以 toSun 为 0° 方位，向上向量取世界 Y
+      const up = new THREE.Vector3(0, 1, 0);
+      const right = new THREE.Vector3().crossVectors(toSun, up).normalize();
+      if (right.lengthSq() < 1e-9) right.set(1, 0, 0);
+      const az = (azimuthDeg * Math.PI) / 180;
+      const el = (elevationDeg * Math.PI) / 180;
+      const dir = new THREE.Vector3()
+        .addScaledVector(toSun, Math.cos(az) * Math.cos(el))
+        .addScaledVector(right, Math.sin(az) * Math.cos(el))
+        .addScaledVector(up, Math.sin(el))
+        .normalize();
+      camera.position.copy(center).addScaledVector(dir, dist);
+      controls.target.copy(center);
+      camera.lookAt(center);
+      return { id, dist, azimuthDeg, elevationDeg, pos: camera.position.toArray().map((n) => +n.toFixed(3)) };
+    };
+    (window as unknown as { __solarPlace?: typeof place }).__solarPlace = place;
+    return () => {
+      delete (window as unknown as { __solarPlace?: typeof place }).__solarPlace;
+    };
+  }, [byId, camera]);
+
   if (!sun) return null;
   /*
    * 米制系统不挂沙盘装饰：星空、小行星带、尾迹的几何体都建在
@@ -2558,7 +2635,7 @@ function Scene() {
     <RegistryContext.Provider value={registry.current}>
       {/* 第 2 帧：星空 + 银河带（STAR / BAND 两个 program） */}
       {look.decor && stage >= 2 && <Stars />}
-      <Probe />
+      <Probe controlsRef={controlsRef} />
       <PickLayer />
       <Labels />
       {/* ready 只有到全量才置位：验收与首帧截图看到的必须是完整场景（钉住期数时按期数算） */}
