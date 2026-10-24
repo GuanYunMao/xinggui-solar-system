@@ -1004,6 +1004,31 @@ function PlanetSurface({ body }: { body: Body }) {
     map.plan(devicePx, cap);
     cloudMap?.plan(devicePx, cap);
   });
+  /*
+   * t38：选中即预判升档 —— 聚焦动画一开始就按**目标视距**的占幅排队。
+   *
+   * 旧路径只按"此刻屏幕占幅"plan，而占幅要等相机到位才够大 —— 升档被迫发生在
+   * 0.95s 动画结束之后，用户先看一段马赛克再突变。实测（headless 1280×720）：
+   * 点木星 901ms、土星 989ms、天王星 1047ms 才看到 512；而 512 的生成本身只要 ~400ms，
+   * 900+ 里有一半是"等动画到位"。
+   *
+   * 现在：selectedId 变成这颗星的那一帧，就按 startFocus 的目标视距（body.focus）
+   * 换算占幅、把大图直接排进队列 —— 0.95s 的动画正好盖住生成时间。
+   * 每帧一次 plan 是常数级（planSlot 里"已有更大的"直接 return），不新增 shader。
+   */
+  const selectedId = useSim((state) => state.selectedId);
+  useFrame(() => {
+    if (selectedId !== body.id) return;
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+    if (!(body.focus > body.radius)) return;
+    const focal = focalPx(size.height, camera.fov);
+    const rCss = focal * Math.tan(Math.asin(Math.min(0.999, body.radius / body.focus)));
+    const focusPx = Math.min(4096, 2 * rCss * gl.getPixelRatio());
+    if (!Number.isFinite(focusPx)) return;
+    const cap = texCap();
+    map.plan(focusPx, cap);
+    cloudMap?.plan(focusPx, cap);
+  });
   useEffect(
     () => () => {
       mat.dispose();
