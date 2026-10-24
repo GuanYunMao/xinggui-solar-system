@@ -1,4 +1,4 @@
-/*
+﻿/*
  * 解析遮挡（日食/月食）扫描夹具 —— `eclipse-hemisphere` pass 的取数工具。
  *
  * 为什么要有它：`sun-occlusion` 证明的是「太阳在木星背后时木星盘心不透光」，
@@ -127,16 +127,33 @@ const sample = async (id, t) => {
   await worldAt(t);
   const stable = await stableBody(id);
   if (!stable) return { available: false, reason: "candidates() 两次读数不一致（跳时刻后的不可信期）" };
+  /*
+   * 机位：**方位角固定 90°**（垂直于「天体→太阳」），只在仰角上找不穿模的那一档。
+   *
+   * 为什么不是"日向一侧（azimuth 0°）"：月食时太阳在地球背后，从月球朝太阳看那条线
+   * **穿过地球**——相机直接落进球体，`candidates()` 把月球剔除 → `zero`/`minus` 组 n=0。
+   * 而固定 90° 侧视的好处是：**跨相位的相角恒定**（始终是半明半暗），三组之间可直接比；
+   * 日食时那一半也进阴影，整盘平均照样掉下来。
+   */
   const placed = await page.evaluate(({ id, rPx, depth, fov }) => {
     const canvas = document.querySelector("canvas");
-    // 世界半径由投影关系反推：rPx = (rWorld / dist) * (H/2) / tan(fov/2)
     const H = canvas.clientHeight;
     const tanHalf = Math.tan((fov * Math.PI) / 360);
     const rWorld = (rPx * depth * tanHalf * 2) / H;
     if (!(rWorld > 0)) return null;
-    // 站在日向一侧（azimuth 0° = 朝太阳）：盘心即日下点
-    return window.__solarPlace(id, +(rWorld * 8.6).toFixed(5), 0, 8);
+    const dist = +(rWorld * 8.6).toFixed(5);
+    for (const el of [0, 25, -25, 45]) {
+      const r = window.__solarPlace(id, dist, 90, el);
+      if (!r) continue;
+      const cam = window.__solarCamera();
+      const n = cam?.nearest;
+      const inside = n && n.id !== id && n.dist < n.radius * 1.05;
+      if (!inside) return { ...r, elevationDeg: el, valid: true, nearest: n ?? null };
+    }
+    return { valid: false, reason: "绕月球摆一圈都落在别的天体里" };
   }, { id, rPx: stable.r, depth: stable.d, fov: stable.fov });
+  if (!placed) return { available: false, reason: "__solarPlace 返回 null（天体不在 registry 或相机未就绪）" };
+  if (!placed.valid) return { available: false, reason: placed.reason };
   if (!placed) return { available: false, reason: "__solarPlace 返回 null（天体不在 registry 或相机未就绪）" };
   await page.waitForTimeout(320);
   const stable2 = await stableBody(id, 4);
@@ -161,21 +178,17 @@ const sample = async (id, t) => {
     const inside = [];
     for (let y = 0; y < box; y++) for (let x = 0; x < box; x++) if (Math.hypot(x - cc, y - cc) <= rPx * 0.86) inside.push(y * box + x);
     const vals = inside.map((i) => lum[i]).sort((a, b) => a - b);
-    const cb = 12; // 日下点 24×24
+    // 整盘平均（不只是日下点窗口）：**月食是整盘变暗**，24×24 窗口看不见这种坏状态。
+    // 这也是 t48⑥ 被实测否掉的地方：小天体遮大天体时影子只压住窗口一小块。
     let sum = 0;
-    let n = 0;
-    for (let y = 0; y < box; y++)
-      for (let x = 0; x < box; x++)
-        if (Math.abs(x - cc) <= cb && Math.abs(y - cc) <= cb) {
-          sum += lum[y * box + x];
-          n++;
-        }
+    for (const i of inside) sum += lum[i];
+    const n = inside.length;
     const nearest = cam.nearest;
     return {
       available: true,
       diskPx: +rPx.toFixed(1),
       median: vals.length ? +vals[Math.floor(vals.length / 2)].toFixed(2) : null,
-      centerBox: +(sum / Math.max(1, n)).toFixed(2),
+      diskMean: +(sum / Math.max(1, n)).toFixed(2),
       insideOther: nearest && nearest.id !== targetId && nearest.dist < nearest.radius * 1.02 ? { id: nearest.id } : null,
     };
   }, id);
@@ -205,9 +218,9 @@ for (const [id, occ] of PAIRS) {
     const rows = [];
     for (const c of chosen) {
       const m = await sample(id, c.t);
-      if (m.available && !m.insideOther) rows.push({ t: c.t, dot: c.dot, centerBox: m.centerBox, median: m.median });
+      if (m.available && !m.insideOther) rows.push({ t: c.t, dot: c.dot, diskMean: m.diskMean, el: m.placed?.elevationDeg ?? null });
     }
-    const v = rows.map((r) => r.centerBox).sort((a, b) => a - b);
+    const v = rows.map((r) => r.diskMean).sort((a, b) => a - b);
     rec.groups[g] = {
       n: rows.length,
       min: v.length ? v[0] : null,
