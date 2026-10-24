@@ -1,10 +1,11 @@
-// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
+﻿// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
 // 用系统自带 Edge（playwright-core 不下载 Chromium），软件光栅化跑 WebGL。
 // 判定标准：画布真的渲染（window.__solarReady）、控制台零报错、无横向溢出。
 // 数值断言（帧时间 / 命中矩阵 / 跟随抖动）一律「相对本次运行的机器基线」判，不吃机器负载。
 // 怎么跑、每个 pass 验什么、红了先看哪一行：scripts/README.md。
 import { chromium } from "playwright-core";
 import { createServer } from "node:http";
+import { execFileSync } from "node:child_process";
 import { readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -1020,6 +1021,147 @@ function judgeJupiterSpot(res) {
   };
 }
 
+// ——— 滚轮在 HUD 上必须仍然缩放（`hud-wheel`）———
+//
+// 为什么要有它：滚轮曾经在指针悬停 HUD 时**完全无效**（监听挂在 gl.domElement 上，
+// 而 HUD 覆盖区的 wheel 事件到不了画布）。`zoom-budget` 的指针**永远在画布内**，
+// 结构上采不到"指针在 HUD 上"这一态——所以那个 bug 活过了 22 条 pass。
+//
+// 判据是**三段式**，缺一段就会假绿：
+//   ① `d0 ≈ 4.8`（≈ 地球的聚焦视距）——若芯片点击没生效，d0 会是总览视距 ~118.9，
+//      那时"4 格后离开 4.8"**无条件成立**，于是假绿；
+//   ② 指针**压在芯片上**滚 4 格（真 `page.mouse.wheel`，trusted 事件）；
+//   ③ `d1 ≠ 4.8 且 > 4.8`。
+// 并且 wheel **前后各读一次 `elementFromPoint`**：只读一次挡不住自动收起那个 2s 窗口——
+// 芯片被卸载后 wheel 其实落在画布上，单次留证若撞在卸载前同样是假绿。
+//
+// 阈值不写死 12.18：那是某一次运行的幅度（三次实测 12.18 / 12.21 / 11.83，吃加速窗口）。
+const HUD_WHEEL_FOCUS_DIST = 4.8; // 地球的聚焦视距（`data.ts` 的 earth.focus），不是实测抄来的
+const HUD_WHEEL_FOCUS_TOL = 0.01;
+const HUD_WHEEL_NOTCHES = 4;
+const HUD_WHEEL_NOTCH_GAP_MS = 100;
+
+const hudWheelProbe = (page, pt) =>
+  page.evaluate(({ x, y }) => {
+    const el = document.elementFromPoint(x, y);
+    return {
+      tag: el ? el.tagName : null,
+      id: el ? (el.closest?.("button")?.id ?? el.id ?? null) : null,
+      distTarget: window.__solarCamera?.().distTarget ?? null,
+    };
+  }, pt);
+
+async function runHudWheel(browser, base) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+  page.on("console", (m) => m.type() === "error" && errs.push(m.text()));
+  const out = { errors: errs };
+  try {
+    await page.goto(`${base}?diag=1`, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    out.probes = await page.evaluate(() => ({
+      place: typeof window.__solarPlace === "function",
+      camera: typeof window.__solarCamera === "function",
+    }));
+
+    // 唤醒 chrome（自动收起会在静置 2s 后把芯片行从 DOM 卸载）→ 点地球进入聚焦
+    await page.mouse.move(300, 40);
+    await page.waitForSelector("#chip-earth", { state: "visible", timeout: 5000 });
+    await page.locator("#chip-earth").click({ timeout: 8000, force: true });
+
+    // settle：`distTarget` 连续 ~700ms 不变才开滚。动画期间 camLocked 会把滚轮整个吞掉，
+    // 那 4 格会白滚，然后在 d0=4.8 上断言自然红——那是假红，不是产品问题。
+    const t0 = Date.now();
+    let prev = null;
+    let settled = false;
+    while (Date.now() - t0 < 6000) {
+      const d = await page.evaluate(() => window.__solarCamera?.().distTarget ?? null);
+      if (d !== null && prev !== null && Math.abs(d - prev) / Math.max(1e-6, d) < 0.001) {
+        await page.waitForTimeout(700); // 再多等一拍，确认不是"刚好路过"
+        const d2 = await page.evaluate(() => window.__solarCamera?.().distTarget ?? null);
+        settled = d2 !== null && Math.abs(d2 - d) / Math.max(1e-6, d) < 0.001;
+        prev = d2;
+        break;
+      }
+      prev = d;
+      await page.waitForTimeout(120);
+    }
+    out.settled = { settled, waitedMs: Date.now() - t0, distTarget: prev };
+
+    const chip = await page.locator("#chip-earth").boundingBox();
+    if (!chip) return { ...out, available: false, reason: "量不到 #chip-earth 的位置" };
+    const pt = { x: Math.round(chip.x + chip.width / 2), y: Math.round(chip.y + chip.height / 2) };
+    // 指针压到芯片中心，**不移开**
+    await page.mouse.move(pt.x, pt.y);
+    await page.waitForTimeout(120);
+    const before = await hudWheelProbe(page, pt); // ① 与 d0 成对读：中间不插等待
+    out.before = before;
+    out.chipBox = { x: +chip.x.toFixed(1), y: +chip.y.toFixed(1), w: +chip.width.toFixed(1), h: +chip.height.toFixed(1) };
+
+    // 方向：deltaY 为正 = 向后拉远（视距增大）。选这个方向是为了能和已有参考数（4 格 4.8→12.18）对齐；
+    // 向上滚是放大（视距减小），那会把"离开 4.8"判成反方向——这条 pass 只问"还缩不缩"，不判方向。
+    for (let i = 0; i < HUD_WHEEL_NOTCHES; i++) {
+      await page.mouse.wheel(0, 120);
+      await page.waitForTimeout(HUD_WHEEL_NOTCH_GAP_MS);
+    }
+    await page.waitForTimeout(400);
+    const after = await hudWheelProbe(page, pt); // ③ 与 d1 成对读
+    out.after = after;
+    out.notches = HUD_WHEEL_NOTCHES;
+    out.direction = "deltaY=+120（向后拉远，视距增大）";
+    return { ...out, available: true };
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeHudWheel(res) {
+  const name = "hud-wheel";
+  if (!res.available) {
+    failures.push(`${name}: 夹具不成立（${res.reason}）—— 没滚成就不许报绿`);
+    return res;
+  }
+  // 探针缺失 = 判不了 = 红（同 sun-occlusion 的口径）
+  if (!res.probes?.camera) {
+    failures.push(`${name}: __solarCamera 探针缺失 —— 读不到 distTarget，判据没有对象`);
+    return res;
+  }
+  const b = res.before;
+  const a = res.after;
+  // ① d0 必须是聚焦视距，否则"离开 4.8"无条件成立（假绿）
+  if (b.distTarget === null) {
+    failures.push(`${name}: 读不到 d0（distTarget=null）`);
+  } else if (Math.abs(b.distTarget - HUD_WHEEL_FOCUS_DIST) > HUD_WHEEL_FOCUS_TOL) {
+    failures.push(
+      `${name}: d0=${b.distTarget} 不是聚焦视距 ${HUD_WHEEL_FOCUS_DIST}±${HUD_WHEEL_FOCUS_TOL} —— ` +
+        `芯片点击没生效（或在总览视距上），此时"滚 4 格后离开 4.8"会自动成立，是假绿。`,
+    );
+  }
+  // ② 指针确实在芯片上（前后各一次，夹住自动收起的时间窗）
+  for (const [when, p] of [["滚动前", b], ["滚动后", a]]) {
+    if (p.tag !== "BUTTON" || p.id !== "chip-earth") {
+      failures.push(
+        `${name}: ${when} elementFromPoint 命中的是 ${p.tag}${p.id ? "#" + p.id : ""}，应为 BUTTON#chip-earth ` +
+          `—— 指针不在芯片上，这次"滚了 4 格"可能落在画布上，测不到 HUD 覆盖区这个状态。`,
+      );
+    }
+  }
+  // ③ 真的缩放了
+  if (a.distTarget === null) {
+    failures.push(`${name}: 读不到 d1（distTarget=null）`);
+  } else if (!(a.distTarget > HUD_WHEEL_FOCUS_DIST + HUD_WHEEL_FOCUS_TOL)) {
+    failures.push(
+      `${name}: 指针压在 #chip-earth 上滚了 ${res.notches} 格，distTarget 仍是 ${a.distTarget} ` +
+        `（d0=${b.distTarget}）—— 滚轮在 HUD 覆盖区失效了（监听又挂回 gl.domElement？）`,
+    );
+  }
+  if (res.errors?.length) failures.push(`${name}: 控制台/页面报错 ${res.errors.length} 条`);
+  return res;
+}
+
 // ——— 轨道共面（沙盘）/ 不共面（实境）：`__solarOrbitPlanes()` 的三点求法向量 ————
 // 为什么要有这条：`t24` 让沙盘行星回到共面，而当时 19 条 pass **一条都不守它**——
 // `overlapping` 明令禁止加阈值、`meanLvl`/`meanLum` 是松判据。所以这条是唯一守卫。
@@ -1373,6 +1515,55 @@ const want = (name) => ONLY.length === 0 || ONLY.includes(name);
 const startedAt = Date.now();
 const results = [];
 const hudHeaders = [];
+
+/*
+ * 环境读数：**只打印，不判红**。
+ *
+ * 用处只有一个：跑完发现数字不对时，一眼看出是不是"自己把机器拖慢了"。
+ * 为什么不判红：用户自己开着几十个 Edge 是正常状态，判红就是假红。
+ * 为什么要区分 headless：**非 headless 是用户的窗口**（Edge 多进程，一个窗口 20+ 进程很正常），
+ * 只有 headless 才可能是我们这些夹具留下的。
+ */
+function printEnvLine() {
+  try {
+    if (process.platform !== "win32") {
+      console.log(`环境：${process.platform}（跳过 Edge 计数）`);
+      return;
+    }
+
+    const q =
+      "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | ForEach-Object { " +
+      "if ($_.CommandLine -match 'headless') { 'H:' + $_.ParentProcessId } else { 'V' } }";
+    const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", q], {
+      encoding: "utf8",
+      timeout: 8000,
+    });
+    const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const headless = lines.filter((l) => l.startsWith("H:"));
+    const visible = lines.filter((l) => l === "V").length;
+    let parents = [];
+    if (headless.length) {
+      const pids = [...new Set(headless.map((l) => l.slice(2)))].slice(0, 3);
+      const qp = `Get-CimInstance Win32_Process | Where-Object { ${pids.map((p) => `$_.ProcessId -eq ${p}`).join(" -or ")} } | ForEach-Object { $_.ProcessId.ToString() + '=' + $_.Name }`;
+      try {
+        parents = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", qp], { encoding: "utf8", timeout: 8000 })
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      } catch {
+        parents = [];
+      }
+    }
+    console.log(
+      `环境：headless Edge ${headless.length} 个${parents.length ? `（父进程 ${parents.join(", ")}）` : ""}；` +
+        `非 headless ${visible} 个（用户的窗口，不判）。**这只是读数，不是闸。**`,
+    );
+  } catch {
+    console.log("环境：Edge 计数读不到（这不影响任何判据）");
+  }
+}
+printEnvLine();
+
 try {
   if (want("desktop")) {
     results.push(
@@ -1631,6 +1822,15 @@ function judgeHudAutoHide(res) {
       failures.push(`hud-autohide: ${err.message}`);
     }
   }
+  // ——— 滚轮在 HUD 上必须仍然缩放 ———
+  if (want("hud-wheel")) {
+    try {
+      const hw = await runHudWheel(browser, base);
+      results.push({ pass: "hud-wheel", 分类: "结构量（distTarget + elementFromPoint 留证）", ...judgeHudWheel(hw) });
+    } catch (err) {
+      failures.push(`hud-wheel: ${err.message}`);
+    }
+  }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
   // XG_ONLY 设了就不再往下跑：反向测试只关心某条 page pass 会不会红，数值段是最费时的部分。
   // 用带标签的块 + break，而不是整体包一层 if —— 后者要把下面几百行整体缩进一层，
@@ -1705,24 +1905,60 @@ function judgeHudAutoHide(res) {
 
     // A3 跟随抖动：选中地球后连采 90 帧，目标屏幕位置的峰峰值
     await numPage.locator("#chip-earth").click();
-    await numPage.waitForTimeout(1500);
-    const jitter = await numPage.evaluate(async () => {
-      const xs = [];
-      const ys = [];
-      for (let i = 0; i < 90; i++) {
-        await new Promise((r) => requestAnimationFrame(r));
-        const b = (window.__solarProbe?.() ?? []).find((x) => x.id === "earth");
-        if (b) {
-          xs.push(b.x);
-          ys.push(b.y);
+    /*
+     * ⑤ settled 前置：**相机没稳定就不采样**。
+     *
+     * 为什么必须加：一次全量里这条量到 **86.60px**（阈值 0.5px 的 173 倍），下一轮却是 **0px**，
+     * 单跑也绿——不是边缘抖动，是**采样窗口开在聚焦动画还没收敛的时候**（目标屏幕位置正在大幅移动）。
+     * 那种 flake 比没有判据更坏：红几次之后人就开始不看红了。
+     *
+     * 判据：连续两次读到的 `candidates().d`（跟随目标到相机距离）一致（相对差 < 0.1%），
+     * 才算 settled。不满足 → `settled:false`，**不判绿也不判红**，但必须出现在结果里。
+     */
+    const waitSettled = async (maxMs = 6000) => {
+      const t0 = Date.now();
+      let prev = null;
+      let reads = 0;
+      while (Date.now() - t0 < maxMs) {
+        const d = await numPage.evaluate(() => {
+          const c = window.__solarPick?.candidates?.().find((x) => x.id === "earth");
+          return c ? +c.depth.toFixed(5) : null;
+        });
+        reads++;
+        if (d !== null && prev !== null && Math.abs(d - prev) / Math.max(1e-6, d) < 0.001) {
+          return { settled: true, waitedMs: Date.now() - t0, reads, depth: d };
         }
+        prev = d;
+        await numPage.waitForTimeout(160);
       }
-      const span = (v) => Math.max(...v) - Math.min(...v);
-      return { samples: xs.length, px: +Math.max(span(xs), span(ys)).toFixed(4) };
-    });
-    results.push({ pass: "follow-jitter", ...jitter });
+      return { settled: false, waitedMs: Date.now() - t0, reads, depth: prev };
+    };
+    const settledInfo = await waitSettled();
+    let jitter = null;
+    if (!settledInfo.settled) {
+      // 不判绿也不判红：把"没测成"这件事写进结果，别让它长得像"通过"
+      console.error(`（注意）follow-jitter: 相机在 ${settledInfo.waitedMs}ms 内没稳定（${settledInfo.reads} 次读数）→ settled:false，本轮不判`);
+      results.push({ pass: "follow-jitter", settled: false, ...settledInfo, px: null, note: "相机未稳定，本轮不判（不是通过）" });
+    } else {
+      jitter = await numPage.evaluate(async () => {
+        const xs = [];
+        const ys = [];
+        for (let i = 0; i < 90; i++) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const b = (window.__solarProbe?.() ?? []).find((x) => x.id === "earth");
+          if (b) {
+            xs.push(b.x);
+            ys.push(b.y);
+          }
+        }
+        const span = (v) => Math.max(...v) - Math.min(...v);
+        return { samples: xs.length, px: +Math.max(span(xs), span(ys)).toFixed(4) };
+      });
+      results.push({ pass: "follow-jitter", settled: true, settledWaitedMs: settledInfo.waitedMs, ...jitter });
+    }
     // 沙盘里本来就该是亚百分之一像素；1:1 实境接入后这条才有咬合力（那时会到 2.5 px）
-    if (jitter.px >= 0.5) failures.push(`follow-jitter: 目标屏幕抖动 ${jitter.px}px ≥ 0.5px`);
+    // 只有 settled 的那一轮才有 px，所以判据挂在它后面——未稳定的轮次上面已经单独记成 settled:false
+    if (settledInfo.settled && jitter && jitter.px >= 0.5) failures.push(`follow-jitter: 目标屏幕抖动 ${jitter.px}px ≥ 0.5px`);
     if (numErrors.length) failures.push(`numeric: 控制台报错 ${numErrors.length} 条`);
   } catch (err) {
     failures.push(`numeric: ${err.message}`);
@@ -2100,6 +2336,21 @@ function judgeHudAutoHide(res) {
        */
       await page.evaluate((d) => window.__solarPlace?.("jupiter", d, 180, 0), 12.5);
       await page.waitForTimeout(700);
+      // ③ 探针缺失 = 判不了 = 红（同 `zoom-budget` 依赖 `__solarPick`）。
+      //    几何对齐的前提是这两个钩子在；它们没了，判据就没有对象——此时报绿就是撒谎。
+      const probes = await page.evaluate(() => ({
+        place: typeof window.__solarPlace === "function",
+        candidates: typeof window.__solarPick?.candidates === "function",
+        jupiter: Boolean(window.__solarPick?.candidates?.().find((c) => c.id === "jupiter")),
+        bodyCount: window.__solarPick?.candidates?.().length ?? 0,
+      }));
+      if (!probes.place || !probes.candidates || !probes.jupiter) {
+        failures.push(
+          `sun-occlusion: 探针缺失（__solarPlace=${probes.place}, candidates=${probes.candidates}, 木星=${probes.jupiter}, 候选数=${probes.bodyCount}）` +
+            ` —— 钩子没了就等于判不了，不许报绿。检查 ?diag=1 与 diag 探针是否被删。`,
+        );
+      }
+
       // 闭环把太阳拖到木星盘面中心（两轴分别自适应符号与步长）。
       // 拖动量由**实测屏幕坐标**算出来，所以换视口/换 dpr 仍然成立。
       const sign = { x: 1, y: 1 };
@@ -2165,6 +2416,17 @@ function judgeHudAutoHide(res) {
         // 对齐是怎么达成的、差多少，全部留痕：只看 aligned 一个布尔，下次它变回 false 时无从下手
         alignMethod: "__solarPlace(azimuth=180° = 背光侧) + 闭环微调",
         alignCriterion: "sunBehind 且 (deltaPx + 太阳屏半径) ≤ 木星屏半径（全遮挡）",
+        // ② 最近 5 次（含本次）的对齐率：单次未对齐现在直接红，但仍要把趋势记进结果，
+        //    否则"红一次修一次"永远看不出它是不是在反复坏。
+        alignedRate5: (() => {
+          try {
+            const hist = readIndex().slice(-4); // 前 4 次 + 本次 = 最近 5 次
+            const una = hist.filter((e) => Array.isArray(e.unaligned) && e.unaligned.includes("sun-occlusion")).length;
+            return +((4 - una) / 5).toFixed(2); // 本次已对齐 → 计入 1 次
+          } catch {
+            return null;
+          }
+        })(),
         sunRadiusPx: st.sun?.r ?? null,
         coverSlackPx: st.jupiter && st.sun ? +(st.jupiter.r - (Math.hypot(st.sun.x - st.jupiter.x, st.sun.y - st.jupiter.y) + st.sun.r)).toFixed(1) : null,
         sunDepth: st.sun?.d ?? null,
@@ -2178,28 +2440,49 @@ function judgeHudAutoHide(res) {
       if (lum === null) {
         failures.push("sun-occlusion: 拿不到木星候选，采不到中心亮度");
       } else if (!aligned) {
-        // 没对齐就不判：这条判据只在「太阳正被木星挡住」时有意义，
-        // 对齐失败时判红等于把夹具自己的收敛问题算成产品回归（记下来，别静默通过）。
-        //
-        // t16②：但「一直对不齐」= 这条 pass 永远绿而从未真正判断，正是本仓库最怕的那种失效。
-        // 所以数**连续未对齐次数**：本次 + 归档里最近两次（`runs/index.jsonl` 的 `unaligned` 字段，
-        // 由 verify-archive 写）。连续 3 次就判红——那时已经不是「偶尔失手」，是判据没了。
-        console.error(`（注意）sun-occlusion: 未对齐（Δ=${deltaPx}px, sunBehind=${sunBehind}），本轮不判红，中心亮度记录 ${lum}`);
-        let prevUnaligned = 0;
-        try {
-          const hist = readIndex();
-          const recent = hist.slice(-2); // 最近两次运行（不含本次：归档在本轮判定之后才写）
-          prevUnaligned = recent.filter((e) => Array.isArray(e.unaligned) && e.unaligned.includes("sun-occlusion")).length;
-          if (recent.length < 2) prevUnaligned = 0; // 历史不足就不判，别拿半截数据判红
-        } catch {
-          prevUnaligned = 0; // 归档目录不存在（第一次跑）→ 无从累计
-        }
-        if (prevUnaligned >= 2) {
+        /*
+         * ① 本轮未对齐 = **直接红**。
+         *
+         * 为什么不再"只记录"：`t44` 之后对齐是**几何摆位**（`__solarPlace` 到 180° 背光侧），
+         * 已经没有闭环搜索——它失败只可能是夹具/钩子坏了，不是"环境差异偶尔对不上"。
+         * 一条没在判的 pass 报绿，就是我们今晚一直在杀的那种假绿。
+         *
+         * 为什么不采用"连续 3 次/最近 5 次 <50% 才红"：真实历史（`runs/index.jsonl`）里
+         * 8 条只有 1 次未对齐，那一次恰好就是**闸门定义的那次运行**（22 pass 那次）。
+         * 按"连续 3 次"或"5 次里 <50%"都不会响——规则在它要防的案例上不触发。
+         */
+        const hist5 = (() => {
+          try {
+            return readIndex().slice(-4); // 前 4 次 + 本次 = 最近 5 次
+          } catch {
+            return [];
+          }
+        })();
+        const unaBefore = hist5.filter((e) => Array.isArray(e.unaligned) && e.unaligned.includes("sun-occlusion")).length;
+        const alignedRate5 = +((5 - (unaBefore + 1)) / 5).toFixed(2);
+        failures.push(
+          `sun-occlusion: 本轮**没在判**（未对齐 Δ=${deltaPx}px, sunBehind=${sunBehind}, 中心亮度 ${lum}）——` +
+            `这是**判据失效，不是产品回归**：几何摆位之后不存在"偶尔对不上"，先修夹具/探针。` +
+            `最近 5 次对齐率 ${(alignedRate5 * 100).toFixed(0)}%（${unaBefore + 1}/5 未对齐）` +
+            (alignedRate5 < 0.5 ? `——已经长期失效，不是单次失手。` : `。`),
+        );
+        if (alignedRate5 < 0.5) {
           failures.push(
-            `sun-occlusion: 连续 ${prevUnaligned + 1} 次运行都没对齐（本次 Δ=${deltaPx}px）——` +
-              `对齐失败按设计不判红，但连续 3 次就意味着这条 pass 已经永远绿、从未在判断。先修对齐（t10 接管 dolly 之后步进量级变了）。`,
+            `sun-occlusion: 最近 5 次对齐率 ${(alignedRate5 * 100).toFixed(0)}% < 50% —— 这条 pass 长期没在判断，` +
+              `别把它的绿当成"光晕没问题"。`,
           );
         }
+        // 这一轮仍然把数字记进结果（供归档查历史），但**判红**已经在上面的 failures.push 里发生。
+        results.push({
+          pass: "sun-occlusion",
+          aligned: false,
+          alignedRate5,
+          deltaPx,
+          sunBehind,
+          centerBoxLum: lum,
+          lumMax: OCCLUSION_LUM_MAX,
+          unalignedReason: "几何摆位后仍未对齐",
+        });
       } else if (lum > OCCLUSION_LUM_MAX) {
         failures.push(
           `sun-occlusion: 太阳被木星挡住时中心亮度 ${lum} > ${OCCLUSION_LUM_MAX}` +
