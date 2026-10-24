@@ -8,8 +8,7 @@
 
 | | |
 | --- | --- |
-| 线上正式版 | **1.1.6**（`releases/latest` 指向它） |
-| 开发中 | **1.2.0**（当前快照 `1.2.0-snap.14`，只出 Actions artifact，不占正式号） |
+| 线上正式版 | **1.2.1**（`releases/latest` 指向它，tag `v1.2.1`） |
 | 产物 | `release/巡星.html`（单文件）、`release/site/`（静态站点） |
 
 固定下载地址，跨版本不变：
@@ -128,7 +127,7 @@ scripts/             构建、打包、验收、截图（详见 scripts/README.m
 | --- | --- | --- |
 | 全名（启动页 / about / `<title>` / 描述 / 品牌物料） | **`巡星·未至之境`，中间不加空格** | `<title>巡星·未至之境</title>` |
 | 短名（HUD 占位、手机桌面标题、本地产物名） | `巡星` | `release/巡星.html` |
-| 发布名（GitHub release 标题） | 名字 + 版本 + ` · ` + 摘要 | `巡星 1.1.6 · 修复实境浮点` |
+| 发布名（GitHub release 标题） | 名字 + 版本 + ` · ` + 摘要 | `巡星 1.2.1 · 修观感` |
 | 技术标识（npm 包名 / 仓库名 / release asset） | ASCII，**永不翻译** | `xinggui` / `xinggui-solar-system` / `xinggui.html` |
 
 **` · ` 只出现在发布名里当分隔符**，用来隔开「名字」和「版本/摘要」；名字本身上下文中写 `巡星·未至之境`（无空格）。
