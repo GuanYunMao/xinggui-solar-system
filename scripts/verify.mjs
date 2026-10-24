@@ -352,6 +352,74 @@ function judgeCanvasPixels(name, px) {
   }
 }
 
+// ——— 缩放 / 星空采样（t33）————————————————————————————
+// 读太阳的「相机到中心距离」与屏幕半径。距离只有 `__solarPick.candidates()` 的 depth 能直接给：
+// `__solarClip()` 的 near 在贴近时被 nearMin(0.06) 夹住、far 恒为 983，反推不出距离；探针的 z 是 NDC，
+// 要靠 near/far 反解，同样被夹死。所以这里的可用性检查是硬条件——钩子没了就判不了，要红。
+async function readSunState(page) {
+  return page.evaluate(() => {
+    const api = window.__solarPick;
+    if (!api?.candidates) return { available: false, reason: "__solarPick.candidates 不存在" };
+    const list = api.candidates() ?? [];
+    const sun = list.find((c) => c.id === "sun");
+    if (!sun) return { available: false, reason: `候选里没有 sun（共 ${list.length} 条）` };
+    return { available: true, depth: sun.depth, radiusPx: sun.radiusPx };
+  });
+}
+
+// 星空亮度：取画布**边缘 12 块**（4×4 网格跳过中央 2×2），16×16 像素/块。
+// 为什么不是全画布：中间坐着太阳/行星，任何全屏统计都会被天体亮度主导；
+// 「星空有没有过曝」问的是背景区，所以避开中央。这也让这条与「画布不是全黑」互补 ——
+// 那条要的是全画布 meanLum ≥ 2（判"画出来没有"），这条要的是边缘 mean ≤ 4×背景（判"星星抢不抢戏"）。
+async function sampleSkyLuma(page, bgLuma, maxRatio) {
+  return page.evaluate(
+    async ({ bgLuma, maxRatio }) => {
+      const canvas = document.querySelector("canvas");
+      if (!canvas) return { available: false, reason: "没有 canvas" };
+      const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+      if (!gl) return { available: false, reason: "拿不到 WebGL 上下文" };
+      const attrs = gl.getContextAttributes?.() ?? {};
+      if (!attrs.preserveDrawingBuffer) {
+        return { available: false, reason: "preserveDrawingBuffer=false（读回来必是 0，不能当亮度）" };
+      }
+      const W = canvas.width;
+      const H = canvas.height;
+      const SIZE = 16;
+      if (W < SIZE * 2 || H < SIZE * 2) return { available: false, reason: "画布太小" };
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      const fracs = [0, 1 / 3, 2 / 3, 1];
+      const blocks = [];
+      for (let gy = 0; gy < 4; gy++) {
+        for (let gx = 0; gx < 4; gx++) {
+          if ((gx === 1 || gx === 2) && (gy === 1 || gy === 2)) continue; // 跳过中央 2×2
+          const x = Math.min(W - SIZE, Math.max(0, Math.round(fracs[gx] * (W - SIZE))));
+          const y = Math.min(H - SIZE, Math.max(0, Math.round(fracs[gy] * (H - SIZE))));
+          const buf = new Uint8Array(SIZE * SIZE * 4);
+          gl.readPixels(x, y, SIZE, SIZE, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i += 4) {
+            sum += 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2];
+          }
+          blocks.push(sum / (SIZE * SIZE));
+        }
+      }
+      const mean = blocks.reduce((a, b) => a + b, 0) / blocks.length;
+      const sorted = [...blocks].sort((a, b) => a - b);
+      return {
+        available: true,
+        blocks: blocks.length,
+        mean: +mean.toFixed(2),
+        median: +sorted[Math.floor(sorted.length / 2)].toFixed(2),
+        max: +Math.max(...blocks).toFixed(2),
+        bgLuma: +bgLuma.toFixed(2),
+        cap: +(bgLuma * maxRatio).toFixed(2),
+        ratioOverBg: +(mean / bgLuma).toFixed(2),
+      };
+    },
+    { bgLuma, maxRatio },
+  );
+}
+
 async function run(browser, spec) {
   const context = await browser.newContext({
     viewport: spec.viewport,
@@ -707,6 +775,134 @@ try {
     failures.push(`proto-jitter: ${err.message}`);
   }
   await jitterCtx.close();
+
+  // ——— 缩放预算 + 禁止穿模 + 星空亮度上限（t33）———
+  //
+  // 三个量分属两类判据，别混：
+  //  · 缩放格数 = **归一化观测量**，可以判红：它问的是「从 A 视距到 B 视距要几次输入」，
+  //    与机器性能无关（不读帧时间、不读像素）。但**依赖输入节奏**：产品的加速窗口是
+  //    ZOOM_ACCEL_WINDOW_MS=400ms，夹具用 20ms 连发，这个节奏由夹具控制而不是机器状态。
+  //    所以这里额外记录 maxGapMs：万一机器卡到单次间隔 >300ms（加速会被重置），
+  //    按「环境抖动」处理成不判红，免得把负载误判成产品回归。
+  //  · 禁止穿模 = **结构量**，判红：相机必须留在太阳球体之外，与性能/时间无关。
+  //  · 星空亮度 = **归一化观测量**，判红：设计口径是「星空像素平均亮度 ≤ 背景色亮度 4 倍」，
+  //    阈值来自设计（4×），不是来自观察（「现在测出 12 所以定 20」）。背景色亮度由
+  //    #07090e 的三个通道现算，不抄实测数字。
+  //
+  // 与「画布不是全黑」那条的关系：那条在全画布取 25 块、meanLum ≥ 2（判「画出来没有」）；
+  // 这条取**边缘 12 块**（跳过中央 2×2，避开天体）、判「星星有没有过曝」。
+  // 区域与统计目的都不同，所以 14.12（边缘均值）与 23.56（全画布均值）不是一个量，互不迁就。
+  const SUN_RADIUS_WORLD = 3.8; // src/solar/data.ts 的 sun.radius（TEAM.md:16：天体数值改动须 captain 批）
+  const ZOOM_TARGET_RATIO = 3; // 「太阳占画面约一半」的设计目标：视距 = 3R
+  const ZOOM_STEP_BUDGET = 15; // 设计预算：≤15 次 wheel 必须到位（改前约 80 格 / 改后实测 11 格）
+  const NO_CLIP_RATIO = 1.2; // 相机到太阳中心 ≥ 1.2R 才算没穿模
+  const ZOOM_MAX_STEPS = 20; // 预算之外再给几步，够判定「超预算」即可
+  const ZOOM_GAP_MS = 20; // 夹具的连发节奏（< 产品加速窗口 400ms，才会触发加速）
+  const ZOOM_GAP_SUSPECT_MS = 300; // 单次间隔超过它，就认为本跑的加速可能被重置（环境抖动）
+  const SKY_MAX_RATIO = 4; // 设计口径：星空平均亮度 ≤ 背景色 4 倍
+  const SKY_BG_LUMA = 0.2126 * 7 + 0.7152 * 9 + 0.0722 * 14; // #07090e 的相对亮度 ≈ 8.94
+
+  const zbCtx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const zbPage = await zbCtx.newPage();
+  const zbErrors = [];
+  zbPage.on("pageerror", (e) => zbErrors.push(e.message));
+  zbPage.on("console", (m) => m.type() === "error" && zbErrors.push(m.text()));
+  try {
+    await zbPage.goto(withDiag(base), { waitUntil: "load" });
+    await zbPage.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await zbPage.waitForTimeout(1800); // 等贴图与镜头稳定
+
+    // ① 星空亮度（必须在放大之前测：放大后整屏是太阳）
+    const sky = await sampleSkyLuma(zbPage, SKY_BG_LUMA, SKY_MAX_RATIO);
+
+    // ② 缩放格数：从 home 起连发 wheel（向上 = 放大），数到 depth ≤ 3R 为止
+    const home = await readSunState(zbPage);
+    let stepsToTarget = null;
+    let last = home;
+    const gaps = [];
+    if (home.available) {
+      await zbPage.mouse.move(640, 360);
+      for (let i = 1; i <= ZOOM_MAX_STEPS; i++) {
+        const t0 = performance.now();
+        await zbPage.mouse.wheel(0, -120);
+        await zbPage.waitForTimeout(ZOOM_GAP_MS);
+        gaps.push(performance.now() - t0);
+        last = await readSunState(zbPage);
+        if (!last.available) break;
+        if (last.depth <= SUN_RADIUS_WORLD * ZOOM_TARGET_RATIO) {
+          stepsToTarget = i;
+          break;
+        }
+      }
+    }
+
+    // ③ 禁止穿模：再连发到 30 次总输入，读最终视距
+    let deepest = last;
+    if (home.available) {
+      for (let i = 0; i < 30; i++) {
+        await zbPage.mouse.wheel(0, -120);
+        await zbPage.waitForTimeout(ZOOM_GAP_MS);
+      }
+      deepest = await readSunState(zbPage);
+    }
+
+    const maxGapMs = gaps.length ? Math.max(...gaps) : 0;
+    const timingSuspect = maxGapMs > ZOOM_GAP_SUSPECT_MS;
+    const depthOverR = deepest.available ? deepest.depth / SUN_RADIUS_WORLD : null;
+    results.push({
+      pass: "zoom-budget",
+      sky,
+      home: home.available ? { depth: +home.depth.toFixed(3), radiusPx: +home.radiusPx.toFixed(2) } : home,
+      stepsToTarget,
+      budget: ZOOM_STEP_BUDGET,
+      targetDepth: +(SUN_RADIUS_WORLD * ZOOM_TARGET_RATIO).toFixed(2),
+      deepest: deepest.available ? { depth: +deepest.depth.toFixed(3), radiusPx: +deepest.radiusPx.toFixed(2) } : deepest,
+      depthOverR: depthOverR === null ? null : +depthOverR.toFixed(3),
+      noClipFloor: +(SUN_RADIUS_WORLD * NO_CLIP_RATIO).toFixed(2),
+      maxGapMs: +maxGapMs.toFixed(1),
+      timingSuspect,
+      errors: zbErrors,
+    });
+
+    if (!home.available) {
+      failures.push(`zoom-budget: 读不到太阳视距（${home.reason}）—— __solarPick.candidates 是判定依据，钩子没了就等于判不了`);
+    } else {
+      if (stepsToTarget === null) {
+        failures.push(
+          `zoom-budget: ${ZOOM_MAX_STEPS} 次 wheel 后仍未缩到 ${(SUN_RADIUS_WORLD * ZOOM_TARGET_RATIO).toFixed(2)}（当前 ${last.depth?.toFixed(2)}）`,
+        );
+      } else if (stepsToTarget > ZOOM_STEP_BUDGET) {
+        // 环境抖动（连发间隔被打断、加速被重置）时不判红：那是把负载当回归
+        const msg = `zoom-budget: 缩到 3R 用了 ${stepsToTarget} 次 wheel > 预算 ${ZOOM_STEP_BUDGET}`;
+        if (timingSuspect) console.error(`（注意）${msg}，但本轮 maxGapMs=${maxGapMs.toFixed(0)}ms > ${ZOOM_GAP_SUSPECT_MS}ms，按环境抖动不判红`);
+        else failures.push(msg);
+      }
+      if (!deepest.available) {
+        failures.push(`zoom-budget: 最终视距读不到（${deepest.reason}）`);
+      } else if (!Number.isFinite(deepest.depth) || deepest.depth === 0) {
+        failures.push(`zoom-budget: 最终视距是 ${deepest.depth}（0/NaN 说明相机被夹到中心了）`);
+      } else if (deepest.depth < SUN_RADIUS_WORLD * NO_CLIP_RATIO * 0.995) {
+        // 0.5% 容差：产品的 minDistance 恰好压在 1.2R 上（实测 4.56 = 1.2×3.8），
+        // 断言不带容差会因浮点误差偶发误红；真正要守的是「没进到球体里」。
+        failures.push(
+          `zoom-budget: 相机穿到太阳里了：视距 ${deepest.depth.toFixed(3)} < 1.2R = ${(SUN_RADIUS_WORLD * NO_CLIP_RATIO).toFixed(2)}`,
+        );
+      }
+    }
+    if (sky.available) {
+      if (sky.mean > sky.cap) {
+        failures.push(
+          `zoom-budget: 星空过曝：边缘区平均亮度 ${sky.mean} > 背景 ${sky.bgLuma} × ${SKY_MAX_RATIO} = ${sky.cap}`,
+        );
+      }
+    } else {
+      console.error(`（注意）星空亮度测不了：${sky.reason}`);
+    }
+    if (zbErrors.length) failures.push(`zoom-budget: 控制台/页面报错 ${zbErrors.length} 条`);
+  } catch (err) {
+    failures.push(`zoom-budget: ${err.message}`);
+  }
+  await zbCtx.close();
 } finally {
   await browser.close();
   server.close();

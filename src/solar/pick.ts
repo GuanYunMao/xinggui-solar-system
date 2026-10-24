@@ -43,9 +43,30 @@ export type PickCandidate = {
   depth: number;
 };
 
+/**
+ * fov 约定的**唯一编码点**：tan(垂直半视角)。
+ *
+ * 为什么单独立这一行：全仓有四个地方要用这条约定 —— 拾取器算焦距、渲染器算贴图 LOD、
+ * 标签层算投影、竖屏取景算"距离 d 处的半高"。它们以前各写一份 `Math.tan((fov*PI)/360)`，
+ * 谁改约定（比如从竖直 fov 换成水平 fov）都得记得改四处；现在只在这里改。
+ * `scripts/check-shape.mjs` 第 1 条就是拦"SolarCanvas 里再长出一份"的。
+ */
+const tanHalfFov = (fovDeg: number) => Math.tan((fovDeg * Math.PI) / 360);
+
 /** 透视相机的像素焦距：视口高一半 ÷ tan(vfov/2)。 */
 export function focalPx(height: number, fovDeg: number) {
-  return height / 2 / Math.tan((fovDeg * Math.PI) / 360);
+  return height / 2 / tanHalfFov(fovDeg);
+}
+
+/**
+ * 距离 `dist` 处、竖直方向一屏覆盖的半高（世界单位）—— 就是 focalPx 的反解。
+ *
+ * 消费者：竖屏取景时把镜头目标下移 `0.55 × 半高`（让星球被顶到上半屏、别被底部详情卡压住）。
+ * 它不是"算焦距"，但换的是同一条约定，所以必须和 focalPx 同源 —— 否则改 fov 约定时
+ * 这里会安静地算错一个取景偏移（不崩、只是星球位置不对），比报错更难查。
+ */
+export function halfSpanAt(dist: number, fovDeg: number) {
+  return dist * tanHalfFov(fovDeg);
 }
 
 const _v = new THREE.Vector3();

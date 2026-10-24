@@ -7,7 +7,7 @@ import { simTimeNow } from "./clock";
 import { isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
-import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
+import { HOT_RADIUS_CSS, focalPx, halfSpanAt, projectCandidates, resolvePick, type PickBody } from "./pick";
 import { farFloorFor, frameEarthMoon, tightenClipPlanes, type VisibleBody } from "./systems";
 import {
   BAND_FRAG,
@@ -704,7 +704,8 @@ function PlanetSurface({ body }: { body: Body }) {
     const dist = camera.position.distanceTo(planPos);
     // 相机进到球体内部时这颗星本来就画不出来（正面被剔除），不必为它生成大图
     if (dist <= body.radius * 1.001) return;
-    const focal = size.height / 2 / Math.tan((camera.fov * Math.PI) / 360);
+    // 焦距与拾取器同源（pick.ts 的 focalPx）：贴图档位和点击热区必须按同一份投影算
+    const focal = focalPx(size.height, camera.fov);
     const radiusCss = focal * Math.tan(Math.asin(Math.min(0.999, body.radius / dist)));
     // 贴图预算按**设备**像素算：视网膜屏上同一颗球有更多物理像素要糊
     const devicePx = Math.min(4096, 2 * radiusCss * gl.getPixelRatio());
@@ -868,7 +869,8 @@ function Labels() {
     const w = el.clientWidth;
     const h = el.clientHeight;
     if (w < 2 || h < 2) return;
-    const focal = h / 2 / Math.tan((persp.fov * Math.PI) / 360);
+    // 标签投影的焦距与拾取器同源（pick.ts 的 focalPx）——以前这里自己写了一份
+    const focal = focalPx(h, persp.fov);
     const nodes = pool.current;
     // 沙盘里卫星不给标签（会叠成一团）；实境里只给选中的那个
     const baseOn = showLabels && look.labels;
@@ -1602,7 +1604,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         // 竖屏时详情卡是底部抽屉：把镜头目标下移，星球就被顶到上半屏
         if (sizeRef.current.height > sizeRef.current.width) {
           const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
-          const halfHeight = current.toDist * Math.tan((fov * Math.PI) / 360);
+          // 半高 = focalPx 的反解，和拾取器/标签用同一条 fov 约定（pick.ts 的 halfSpanAt）
+          const halfHeight = halfSpanAt(current.toDist, fov);
           scratch.dest.y -= halfHeight * 0.55;
         }
         scratch.target.lerpVectors(current.fromTarget, scratch.dest, u);

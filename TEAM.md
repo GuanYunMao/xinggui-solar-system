@@ -32,7 +32,9 @@
 
 ## 三、改代码只走编辑工具
 
-**禁止用 shell 做源码文本手术**（PowerShell `-replace`、`sed`、批量脚本改源码）。
+**禁止用 shell 做源码文本手术**（PowerShell `-replace`、`Set-Content`、`sed`、批量脚本改源码）。
+
+这条已经违规三次：`package.json` 的中文描述变乱码、`store.ts` 整文件 mojibake、`starfield.ts` 的注释整片乱码。**不是建议，是硬禁止**——写源码只用 edit/write 工具；`Set-Content` 默认按系统编码写盘，中文注释必坏。
 
 已经发生两次：一次把 `package.json` 的中文描述改成乱码，一次把 `store.ts` 整个搞成 mojibake 加语法崩。两次都是"图快"。
 
