@@ -123,37 +123,68 @@ const stableBody = async (id, tries = 8) => {
   return null;
 };
 
-const sample = async (id, t) => {
-  await worldAt(t);
+const norm = (v) => {
+  const n = Math.hypot(v[0], v[1], v[2]);
+  return n > 1e-9 ? [v[0] / n, v[1] / n, v[2] / n] : null;
+};
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+/**
+ * 机位方向：**垂直于日向、且背离地球** —— `C = −(E − (E·S)S)`。
+ *
+ * 为什么不是"日向一侧"：月食那天从月球朝太阳看，那条线**穿过地球**，相机落进球体、
+ * 月球被 `candidates()` 剔除 → 该组 n=0。
+ * 为什么不是"固定方位 90°"：`dot≈0` 时地球**恰在方位 90°**，相机照样撞地球，
+ * 于是 fallback 抬到 el=25，**同一组混进两种相角**——组内差 2.6 倍（el0 55.5 / el25 145），
+ * 差点让我把"反侧 0.988（好）"读成"0.38（坏）"。
+ * 这个方向同时满足两件事：**相角恒定 90°（跨组可比）** 与 **永远背离地球（不撞）**。
+ */
+function cameraDir(pos, id, occId) {
+  const S = norm(sub(pos.sun ?? pos.sol, pos[id]));
+  const E = norm(sub(pos[occId], pos[id]));
+  if (!S || !E) return null;
+  const k = dot3(E, S);
+  const perp = [E[0] - k * S[0], E[1] - k * S[1], E[2] - k * S[2]];
+  let C = norm([-perp[0], -perp[1], -perp[2]]);
+  /*
+   * 退化情况必须显式处理：`|dot|` 接近 1 时地球几乎与日向共线，`perp≈0`，
+   * "背离地球"这个方向**在数值上不稳定**——实测同一组里 az 在 +90/−90 之间乱跳，
+   * 于是同一组混进两种观察侧，亮度差 43 vs 25。这时两个垂直方向都远离地球，
+   * 直接取固定 +90（`right`），相角仍是 90°，跨组可比。
+   */
+  if (Math.abs(k) > 0.9 || !C) C = norm(cross(S, [0, 1, 0])) ?? null;
+  if (!C) return null;
+  // place() 的角度约定：azimuth 以「指向太阳」为 0°，right = S × up(0,1,0)，elevation 沿世界 Y
+  const up = [0, 1, 0];
+  const right = norm(cross(S, up)) ?? [1, 0, 0];
+  const az = (Math.atan2(dot3(C, right), dot3(C, S)) * 180) / Math.PI;
+  const el = (Math.asin(Math.max(-1, Math.min(1, C[1]))) * 180) / Math.PI;
+  return { az: +az.toFixed(2), el: +el.toFixed(2), dot: +dot3(S, E).toFixed(3) };
+}
+
+const sample = async (id, t, occId) => {
+  const pos = await worldAt(t);
+  const dirInfo = cameraDir(pos, id, occId);
+  if (!dirInfo) return { available: false, reason: "几何算不出机位方向（位置缺失）" };
   const stable = await stableBody(id);
   if (!stable) return { available: false, reason: "candidates() 两次读数不一致（跳时刻后的不可信期）" };
-  /*
-   * 机位：**方位角固定 90°**（垂直于「天体→太阳」），只在仰角上找不穿模的那一档。
-   *
-   * 为什么不是"日向一侧（azimuth 0°）"：月食时太阳在地球背后，从月球朝太阳看那条线
-   * **穿过地球**——相机直接落进球体，`candidates()` 把月球剔除 → `zero`/`minus` 组 n=0。
-   * 而固定 90° 侧视的好处是：**跨相位的相角恒定**（始终是半明半暗），三组之间可直接比；
-   * 日食时那一半也进阴影，整盘平均照样掉下来。
-   */
-  const placed = await page.evaluate(({ id, rPx, depth, fov }) => {
+  const placed = await page.evaluate(({ id, rPx, depth, fov, az, el }) => {
     const canvas = document.querySelector("canvas");
     const H = canvas.clientHeight;
     const tanHalf = Math.tan((fov * Math.PI) / 360);
     const rWorld = (rPx * depth * tanHalf * 2) / H;
     if (!(rWorld > 0)) return null;
     const dist = +(rWorld * 8.6).toFixed(5);
-    for (const el of [0, 25, -25, 45]) {
-      const r = window.__solarPlace(id, dist, 90, el);
-      if (!r) continue;
-      const cam = window.__solarCamera();
-      const n = cam?.nearest;
-      const inside = n && n.id !== id && n.dist < n.radius * 1.05;
-      if (!inside) return { ...r, elevationDeg: el, valid: true, nearest: n ?? null };
-    }
-    return { valid: false, reason: "绕月球摆一圈都落在别的天体里" };
-  }, { id, rPx: stable.r, depth: stable.d, fov: stable.fov });
+    const r = window.__solarPlace(id, dist, az, el);
+    if (!r) return null;
+    const n = window.__solarCamera()?.nearest;
+    const inside = n && n.id !== id && n.dist < n.radius * 1.05;
+    return { ...r, elevationDeg: el, azimuthDeg: az, insideOther: inside ? { id: n.id, dist: n.dist, radius: n.radius } : null };
+  }, { id, rPx: stable.r, depth: stable.d, fov: stable.fov, az: dirInfo.az, el: dirInfo.el });
   if (!placed) return { available: false, reason: "__solarPlace 返回 null（天体不在 registry 或相机未就绪）" };
-  if (!placed.valid) return { available: false, reason: placed.reason };
+  if (placed.insideOther) return { available: false, reason: `相机落在 ${placed.insideOther.id} 里`, ...placed };
   if (!placed) return { available: false, reason: "__solarPlace 返回 null（天体不在 registry 或相机未就绪）" };
   await page.waitForTimeout(320);
   const stable2 = await stableBody(id, 4);
@@ -216,9 +247,11 @@ for (const [id, occ] of PAIRS) {
   for (const g of ["plus", "zero", "minus"]) {
     const chosen = pick(buckets[g]);
     const rows = [];
+    const fails = [];
     for (const c of chosen) {
-      const m = await sample(id, c.t);
-      if (m.available && !m.insideOther) rows.push({ t: c.t, dot: c.dot, diskMean: m.diskMean, el: m.placed?.elevationDeg ?? null });
+      const m = await sample(id, c.t, occ);
+      if (!m.available) fails.push({ t: c.t, reason: m.reason || "unknown" });
+      if (m.available) rows.push({ t: c.t, dot: c.dot, diskMean: m.diskMean, el: m.placed?.elevationDeg ?? null, az: m.placed?.azimuthDeg ?? null });
     }
     const v = rows.map((r) => r.diskMean).sort((a, b) => a - b);
     rec.groups[g] = {
@@ -227,6 +260,7 @@ for (const [id, occ] of PAIRS) {
       max: v.length ? v[v.length - 1] : null,
       median: v.length ? v[Math.floor(v.length / 2)] : null,
       rows,
+      failures: fails,
     };
   }
   const zeroMed = rec.groups.zero.median;
