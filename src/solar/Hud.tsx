@@ -417,8 +417,15 @@ function RealInstruments() {
   const distance = useSim((state) => state.realDistanceM);
   const focus = useSim((state) => state.realFocus);
   const setFocus = useSim((state) => state.setRealFocus);
-  // 三个取景：wide（地月同框，默认）/ earth / moon。两个按钮，再点当前目标回落 wide。
-  const targetName = focus === "moon" ? "月球" : focus === "earth" ? "地球" : "地月";
+  /*
+   * 三个取景：wide（地月同框，默认）/ earth / moon。两个按钮，再点当前目标回落 wide。
+   *
+   * **标签必须写明自己是"取景目标"**（t22 修）：卡片跟的是 `selectedId`（选中的天体），
+   * 距离跟的是 `realFocus`（取景目标）—— 两个数据源本身没错，错的是标签不说自己是哪个源。
+   * 切到月球时卡片可能还写着「地球」，所以距离行只写「距月球 / 距地球 / 距地月中点」，
+   * 不写「到月球」这种会被读成"你正在看的那颗"的措辞。
+   */
+  const targetName = focus === "moon" ? "月球" : focus === "earth" ? "地球" : "地月中点";
   const option = (value: "earth" | "moon", label: string) => (
     <button
       key={value}
@@ -434,14 +441,18 @@ function RealInstruments() {
     </button>
   );
   return (
-    <div className="real-controls pointer-events-auto mt-1 flex items-center justify-between gap-2 px-4 md:mt-2 md:px-6">
+    <div
+      className="real-controls pointer-events-auto mt-1 flex items-center justify-between gap-2 px-4 md:mt-2 md:px-6"
+      data-real-focus={focus}
+    >
       <p className="flex min-w-0 items-baseline gap-2 text-xs text-muted">
-        <span className="shrink-0">距离</span>
+        {/* 窄屏省掉「距离」二字（320 下这一行要和两个取景按钮并排，见 t5 的宽度预算） */}
+        <span className="hidden shrink-0 sm:inline">距离</span>
         {/* null 时显示「—」：0 会被读成「贴脸了」，那是谎言 */}
-        <span data-real-distance={formatDistanceMeters(distance)} className="text-sm tabular-nums text-fg">
+        <span data-real-distance={formatDistanceMeters(distance)} className="shrink-0 text-sm tabular-nums text-fg">
           {formatDistanceMeters(distance)}
         </span>
-        <span className="truncate text-subtle">到{targetName}</span>
+        <span className="min-w-0 truncate text-subtle">距{targetName}</span>
       </p>
       <div className="flex shrink-0 items-center gap-1.5" role="group" aria-label="取景目标">
         {option("earth", "地球")}
@@ -759,11 +770,15 @@ function CardShell({
   );
 }
 
-function CardHead({ body, close }: { body: Body; close: ReactNode }) {
+function CardHead({ body, close, note }: { body: Body; close: ReactNode; note?: string }) {
   return (
     <div className="flex items-start justify-between gap-3">
       <div>
-        <p className="text-xs text-muted">{body.kind}</p>
+        <p className="text-xs text-muted">
+          {body.kind}
+          {/* 实境用：明确这张卡说的是「选中的天体」，不是「你正在看的那颗」 */}
+          {note && <span className="ml-2 text-[10px] tracking-wider text-subtle">· {note}</span>}
+        </p>
         <h2 className="font-display mt-1 text-xl leading-tight text-fg md:text-2xl">{body.name}</h2>
       </div>
       {close}
@@ -1062,7 +1077,8 @@ function RealCard() {
   return (
     <CardShell id={selected.id}>
       {/* 实境没有「总览」这个去处（相机被钉在地球上），所以 ✕ 在桌面端也必须常显 */}
-      <CardHead body={selected} close={<CloseButton />} />
+      {/* t22 修：这张卡跟的是「选中的天体」，距离行跟的是「取景目标」——两个源，标签各说各的 */}
+      <CardHead body={selected} close={<CloseButton />} note="选中的天体" />
       <CardBody body={selected} />
     </CardShell>
   );
