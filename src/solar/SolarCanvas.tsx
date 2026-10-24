@@ -2875,12 +2875,21 @@ function PickLayer() {
       const rect = el.getBoundingClientRect();
       const px = ev.clientX - rect.left;
       const py = ev.clientY - rect.top;
-      const nearHover = Math.hypot(px - hoverX, py - hoverY) <= 2;
+      /*
+       * t18 收尾：按下当场重算一次（一次投影，微秒级），**不吃缓存的 hoverId**。
+       *
+       * 为什么必须重算：手型只在 pointermove 时更新。指针静止几秒、行星已经漂走时，
+       * 缓存的 hoverId 会把"已经不在指针下的那颗"记成点击目标 —— 实测改前：
+       * 按下前 `__solarPick.at()` 已经是 null，点完却选中了漂走的地球。
+       * 重算保证"按下那一刻"是准的；触摸没有 hover，本来也只能在这里算。
+       */
       pressed = true;
-      pressedId =
-        ev.pointerType === "mouse" && nearHover ? hoverId : resolvePick(candidates(), px, py);
+      pressedId = resolvePick(candidates(), px, py);
       hoverX = px;
       hoverY = py;
+      hoverId = pressedId;
+      if (pressedId) markPointer();
+      else clearPointer();
     };
 
     const onUp = (ev: PointerEvent) => {
@@ -2939,6 +2948,8 @@ function PickLayer() {
     let hoverY = 0;
     let hoverRaf = 0;
     let hoverId: string | null = null;
+    let pointerInside = false;
+    let lastMoveAt = 0;
 
     const runHover = () => {
       hoverRaf = 0;
@@ -2957,6 +2968,8 @@ function PickLayer() {
       const rect = el.getBoundingClientRect();
       hoverX = ev.clientX - rect.left;
       hoverY = ev.clientY - rect.top;
+      pointerInside = true;
+      lastMoveAt = performance.now();
       if (dragGuard.active && dragGuard.moved) {
         if (hoverRaf) {
           cancelAnimationFrame(hoverRaf);
@@ -2970,6 +2983,7 @@ function PickLayer() {
     };
 
     const onLeave = () => {
+      pointerInside = false;
       if (hoverRaf) {
         cancelAnimationFrame(hoverRaf);
         hoverRaf = 0;
@@ -2980,6 +2994,22 @@ function PickLayer() {
 
     el.addEventListener("pointermove", onMove);
     el.addEventListener("pointerleave", onLeave);
+
+    /*
+     * t18 收尾：指针静止时的手型 —— 天体在动，手型也得跟上。
+     *
+     * 12Hz（83ms）节流，不是每帧：一次投影 15 个天体是微秒级，但没必要 ×60。
+     * 最近 120ms 内动过就交给 pointermove 的 rAF（不然两边重复算）；
+     * 拖拽中不介入（那是转视角，不是在瞄准）。
+     * 为什么必须有：手型不出现只是表面问题 —— 更严重的是点击目标读到的 hoverId
+     * 会过期（见 onDown 的注释：改前会选中已经漂走的那颗）。
+     */
+    const idleHover = window.setInterval(() => {
+      if (!pointerInside) return;
+      if (dragGuard.active && dragGuard.moved) return;
+      if (performance.now() - lastMoveAt < 120) return;
+      runHover();
+    }, 83);
 
     // 验收钩子：坐标 → 命中 id、全量候选、热区半径
     const api = {
@@ -2996,6 +3026,7 @@ function PickLayer() {
       el.removeEventListener("pointerleave", onLeave);
       window.removeEventListener("pointerup", onAnyUp);
       if (hoverRaf) cancelAnimationFrame(hoverRaf);
+      window.clearInterval(idleHover);
       delete (window as unknown as { __solarPick?: typeof api }).__solarPick;
     };
   }, [camera, gl, reg, bodies]);
