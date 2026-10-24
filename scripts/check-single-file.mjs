@@ -10,7 +10,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright-core";
 
-const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+// 浏览器可执行文件。默认用系统 Edge（不下载 Chromium）；CI 或别的机器上用
+// XG_EDGE 指过去，比如 XG_EDGE=/usr/bin/chromium —— 和 verify.mjs:24 同一套读法。
+// （2026-10 之前这里写死 Windows 路径，导致这个脚本在 Linux 上根本跑不起来：
+//   `chromium.launch` 拿不到可执行文件会抛未捕获异常，退出码 1。）
+const EDGE =
+  process.env.XG_EDGE || "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
 const DEFAULT_TARGET = path.join(import.meta.dirname, "..", "release", "巡星.html");
 const explicit = Boolean(process.argv[2]);
 const target = process.argv[2] ?? DEFAULT_TARGET;

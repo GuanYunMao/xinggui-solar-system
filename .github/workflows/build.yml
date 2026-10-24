@@ -49,6 +49,54 @@ jobs:
           test -s "release/巡星.html"
           ls -lh release/
 
+      # ——— 静态闸：零依赖纯 node、秒级，红了就该拦（不许加 `|| true` 软处理）———
+      # 这里刻意没有 `npm run check`。它 = `check-single-file.mjs && check-shape.mjs`，
+      # 而 check-single-file.mjs 会 `chromium.launch` 一个**真实浏览器**。ubuntu-latest 上没有
+      # 浏览器 → `browserType.launch: executable doesn't exist` → 未捕获异常 → exit 1，
+      # 每次 push/tag 都**假红**：拦的理由变成「CI 没浏览器」，不是产物有问题。
+      # 原话实测见 scripts/README.md「CI 与本地差异」。
+      # ⚠ 已知下一步（不是口头遗愿，谁接谁把这段删掉）：给 runner 装一个 chromium 并设
+      #   `XG_EDGE=/usr/bin/chromium`，届时这里加一行 `npm run check` 即可 —— 脚本侧已经支持
+      #   `XG_EDGE`（check-single-file.mjs 与 verify.mjs 同一套读法），剩下的只是「装不装浏览器」
+      #   这个决定。它真正的价值不在单文件检查，而在让 13 条行为验收（verify）进 CI。
+      # 为什么放在「构建」之后：这两条闸现在只读 src/，其实先跑也能红（而且失败更早、更省时间）；
+      # 放在 build 后面是因为将来真接上单文件检查后，它需要 `release/巡星.html` 已经存在。
+      # 真正不能动的是**先后关系**：这两条必须先于「准备发布用文件名 / 上传 / 发布」，
+      # 否则 tag 仍然是拿「构建成功」换来的，不是「验收通过」换来的。
+      - name: 闸 1/2 · 形状判据 check:shape
+        run: |
+          # 显式声明 pipefail：`| tee` 会把 npm 的退出码换成 tee 的 0，等于隐式 `|| true`。
+          set -o pipefail
+          npm run check:shape 2>&1 | tee shape.log
+
+      - name: 闸 1 的结论 → GITHUB_STEP_SUMMARY（VACUOUS 必须可见，但不判红）
+        # always()：闸 1 红了也要把结论贴进 summary，否则失败时只有一份「红」没有上下文。
+        if: always()
+        run: |
+          [ -f shape.log ] || exit 0
+          {
+            echo '### 形状判据 check:shape'
+            echo ''
+            echo '```'
+            grep -E '^\[[0-9]+\] |^    命中=|^(状态|结论):' shape.log || true
+            echo '```'
+            echo ''
+            vac=$(grep -c '| VACUOUS$' shape.log || true)
+            if [ "$vac" -gt 0 ]; then
+              echo "> ⚠ **$vac 条 VACUOUS 不是通过**：命中 0 = 判据在当前代码上已失去区分力。"
+              echo '> 它们的牙齿由下一步 `check:shape --selftest` 证明（临时副本注入第二真相 → 断言必须变红）。'
+            else
+              echo '> 六条判据全部有实际命中，本产物上无 VACUOUS。'
+            fi
+            echo ''
+            echo "> runner=\`$RUNNER_OS\` · node $(node -v) · 判据定义在 \`scripts/check-shape.mjs\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 闸 2/2 · 形状判据自检（证明六条护栏都会红）
+        # 4 条 VACUOUS 在 CI 里等于「绿灯但没验」，这条闸补的是它们的牙齿：
+        # 在临时副本里注入第二真相，六条判据必须各自变 FAIL，否则 exit 1。
+        run: npm run check:shape:selftest
+
       - name: 准备发布用文件名（避开 URL 里的中文）
         # 本地中间产物叫「巡星.html」，这里 cp 成 xinggui.html 再发。
         # 手机上的固定下载地址是 releases/latest/download/xinggui.html —— 这个名字不许动。

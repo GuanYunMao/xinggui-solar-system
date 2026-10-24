@@ -6,8 +6,8 @@
 
 ```bash
 npm run build          # 先出 release/（verify 验的是构建产物，不是 dev server）
-npm run verify         # = node scripts/verify.mjs（行为验收，跑真浏览器，9 条 pass）
-npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒级，不跑浏览器）
+npm run verify         # = node scripts/verify.mjs（行为验收，跑真浏览器，13 条 pass：4 条页面 spec + 9 条数值断言）
+npm run check          # = 单文件冒烟（起真浏览器，要 Edge）+ 形状判据；前一半 CI 不跑，见「CI 与本地差异」
 ```
 
 `verify.mjs` 起一个临时静态服务器指向 `release/site`，用系统 Edge（不下载 Chromium）开真浏览器，
@@ -19,6 +19,8 @@ npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒�
 端口默认 4178，被占用会自动往后找（4179、4180…），并打印一行提示。
 浏览器路径默认 `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`，
 换机器用环境变量 `XG_EDGE` 指过去（`XG_EDGE=/usr/bin/chromium node scripts/verify.mjs`）。
+`verify.mjs` / `check-single-file.mjs` / `texture-report.mjs` 读的是**同一个** `XG_EDGE`：一处设，
+三处生效，别让某个脚本再长出自己那份硬编码路径（`check-single-file.mjs` 曾经就是，Linux 上直接跑不起来）。
 产物目录默认 `release/`，用 `XG_RELEASE` 可以指到一份冻结快照（结构要一致：`site/` + `巡星.html`），
 见下节「别和别人的构建撞车」。
 
@@ -119,7 +121,7 @@ npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒�
 
 | # | 守什么 | 期望 | 现在（2026-10-24） |
 | --- | --- | --- | --- |
-| 1 | 焦距公式 `Math.tan(...fov)` | 只在 `pick.ts` 的 `focalPx` | **FAIL：4 处**（pick.ts 1 + SolarCanvas 3） |
+| 1 | 焦距公式 `Math.tan(...fov)` | 只在 `pick.ts` 的 `tanHalfFov`（`focalPx` / `halfSpanAt` 的唯一 fov 约定点） | PASS（1 处，`pick.ts:54`） |
 | 2 | `camera.near/far` 写入 | 只在 `systems.ts` 的 `tightenClipPlanes` 内 | PASS（2 处，都在函数体内） |
 | 3 | `spec.unit ===` 在 `SolarCanvas.tsx` | ≤2（R3 后应为 0） | VACUOUS（0） |
 | 4 | `inReal` 在 `Hud.tsx` | ≤1 | VACUOUS（0） |
@@ -145,7 +147,7 @@ npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒�
 
 ### 扫描范围：显式清单，不是递归 glob
 
-`SCAN_FILES` 手写 18 个文件。`src/copy/**`、`dist/`、`release/` 里的字符串会污染计数，
+`SCAN_FILES` 手写 19 个文件。`src/copy/**`、`dist/`、`release/` 里的字符串会污染计数，
 第一次跑就会有人把脚本关掉。**新增 src 文件必须加进清单**——`[清单]` 那条 meta 判据会红并告诉你加哪个，
 它防的是「新文件悄悄逃出扫描范围」（写这条判据的当天它就抓到了 `starfield.ts`）。
 
@@ -457,11 +459,35 @@ p95 的 `2.5 × 分母` 和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms <
 
 ## CI 与本地差异
 
-**先说清楚：CI 现在不跑 verify。** `.github/workflows/build.yml` 只做 `npm run build`
-+ 确认 `release/巡星.html` 产出 + 上传/发布。所以验收目前是「本机 / 发版前手动」的动作。
-（要让 CI 接 verify，得给 runner 装 Edge 或用 `XG_EDGE` 指向 chromium，并接受它比本地慢一档。）
+**CI 跑两道静态闸，不跑 verify。** `.github/workflows/build.yml` 在 `npm run build` 之后、
+上传/发布之前依次跑这两条：
 
-真接进来时要知道的四件事：
+| 闸 | 命令 | 什么时候红 |
+| --- | --- | --- |
+| 1/2 | `npm run check:shape` | 六条「同一个概念不许有第二份真相」有一条 FAIL，或 `[清单]` 与 `src/` 对不上 |
+| 2/2 | `npm run check:shape:selftest` | 注入第二真相后，哪条判据没变红就红——它证明闸 1 的牙齿还在 |
+
+两条都是零依赖纯 node、秒级，**没有 `|| true`：红了就拦**。闸 1 的输出会整段进
+`GITHUB_STEP_SUMMARY`，其中包括那 4 条 **VACUOUS**——它不是通过，是判据失效，CI 里必须让这句话
+可见（但不因为它判红，判红会让这条命令永远红在同一个地方，红到最后没人看）。
+
+**CI 为什么不跑 `npm run check`：** 它 = `check-single-file.mjs && check-shape.mjs`，
+而 `check-single-file.mjs` 会 `chromium.launch` 一个**真实浏览器**。ubuntu-latest 上没有浏览器，
+`browserType.launch` 抛未捕获异常 → 退出码 1，**每次 push 都假红**（实测：把 `XG_EDGE` 指到
+`/nonexistent/msedge`，输出 `Failed to launch chromium because executable doesn't exist`，退出码 1）。
+脚本侧已经支持 `XG_EDGE`，所以接它只差「给 runner 一个 chromium」这一个决定。
+
+**CI 为什么不跑 verify：** 13 条行为验收要 **真实浏览器 + 软光栅（swiftshader/llvmpipe）+
+本机帧时间基线**。前两个是安装问题，第三个不是：`frame-time` 的阈值绑在本机实测基线
+（`modern.pp < 0.35` 那组数）上，换机器不重测基线，红绿都不可信。
+
+**将来接 verify 需要的两个前置条件**（缺一不可）：
+
+1. **runner 上有 chromium**，并让脚本用 `XG_EDGE` 指过去（`verify.mjs` 已读这个变量）；
+2. **一份 CI 自己的帧时间基线**：在 runner 上采一次 `?proto=1&still=1` 与默认场景的基线，
+   把阈值绑到「CI 基线 / 本地基线」的**比值**上，而不是任何一方的绝对值。
+
+接 verify 时还要知道这四件事：
 
 - **都是软件光栅**：CI runner 没独显，WebGL 走 llvmpipe/swiftshader；本地 Edge 也被强制
   `--use-angle=swiftshader`。两边同一类渲染路径，这是「基线比值」能跨机器迁移的前提。
@@ -513,7 +539,7 @@ rm -rf .tmp-release-snap
 | --- | --- |
 | `verify.mjs` | 本文件说的那套验收 |
 | `texture-report.mjs` | 贴图预算 + 探针体检：打印 `__solarTextures()` 的像素/排队数与 `__solarProbe()` 的 NaN 哨兵条数（`node scripts/texture-report.mjs "?proto=1"`） |
-| `check-single-file.mjs` | 单文件版自检：资源是否真的内联、没有残留外链。**不带参数时默认验 `release/巡星.html`**（以前不带参数只打印用法就退出，等于空跑）；`npm run check -- <文件>` 可指定 |
+| `check-single-file.mjs` | 单文件版自检：**起真浏览器**（Edge，或 `XG_EDGE`）打开产物，断言画布渲染成功、控制台 0 报错。**不带参数时默认验 `release/巡星.html`**（以前不带参数只打印用法就退出，等于空跑）；`npm run check -- <文件>` 可指定。CI 里不跑，理由见「CI 与本地差异」 |
 | `check-shape.mjs` | 形状判据：六条「同一个概念不许有第二份真相」+ 清单完整性；`--selftest` 证明每条护栏会红，`--dump` / `--dump-fn` 是维护开关 |
 | `bake-textures.mjs` | 预烘行星贴图到 `.texture-src/`（生成物，目录已 ignore） |
 | `make-icons.mjs` | 生成 PWA 图标（`public/icon-*.png`） |
