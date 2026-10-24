@@ -21,7 +21,7 @@
 | | |
 | --- | --- |
 | 线上正式版 | **1.2.1**（`releases/latest` 指向它，tag `v1.2.1`） |
-| 开发中 | **1.3.0-snap.1**（快照：只出 Actions artifact，不建 release、不动 latest；7 天内合并或删除） |
+| 开发中 | **1.3.0-snap.1**（快照，7 天内合并或删除） |
 | 产物 | `release/巡星.html`（单文件）、`release/site/`（静态站点） |
 
 固定下载地址，跨版本不变：
