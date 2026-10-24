@@ -1632,26 +1632,13 @@ function Trails() {
 }
 
 /**
- * 控制权恢复的唯一入口。
+ * 控制权恢复（t34）：只开 `camLocked` —— 由 switching effect 与动画结束处直接维护。
  *
- * 调用点只有两个，都是「切换/动画刚结束」：
- *   1) 沙盘聚焦动画走到 u>=1（此时 store 可能已放锁，也可能自己顺手放）；
- *   2) switching 变成 null 那一下，而当前没有动画在跑（SandboxCamera 里的 effect）。
- *
- * 第 2 条就是 R9 要求显式化的那条不变式。旧代码把它隐含成「回沙盘必然伴随一次
- * resetToken 动画」—— 只要这个前提被打破（动画没起来、目标天体已不在系统里、
- * 回调被别的切换打断），controls.enabled 就再也没人打开，从实境回来视角永久拖不动。
- * store 的 armSwitchTimeout(1500ms) 保证 switching 一定回到 null，所以第 2 条一定可达。
+ * 旧实现的 `releaseControls(controls)` 会写 `controls.enabled = true`；t34 起 OrbitControls
+ * 永久停用（enabled=false），因为它的 update() 每帧按球坐标重推相机 —— 那正是
+ * "target 有两个主人、旋转速度被它带跑"的根。store 的 armSwitchTimeout(1500ms)
+ * 保证 switching 一定回到 null，所以恢复路径一定可达。
  */
-function releaseControls(controls: OrbitControlsImpl) {
-  controls.enableRotate = true;
-  /*
-   * 不要在这里打开 enableZoom：缩放已经由 SandboxCamera 的 wheel/捏合接管（t10）。
-   * 打开它 = OrbitControls 的 wheel 监听复活，同一个滚轮会被我们积分一次、再被它乘一次 scale。
-   */
-  controls.enableZoom = false;
-  controls.enabled = true;
-}
 
 /** 「从实境切回沙盘」时占住 appliedKey 的哨兵：真实 key 永远是 `${id}|${token}`，撞不上。 */
 const RETURNING_KEY = "←from-real";
@@ -1912,12 +1899,19 @@ const MIN_DISTANCE_BASE = 1.15;
 /** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
 const MIN_DISTANCE_RADIUS_FACTOR = 1.2;
 
-/** 拖拽基准速度（OrbitControls 的 rotateSpeed 默认 1，这里 0.55 = 全速的一半）。 */
+/** 拖拽基准速度（与原 OrbitControls rotateSpeed 语义一致：2π·dx/height × speed）。 */
 const ROTATE_SPEED_BASE = 0.55;
-/** 「视距 / 天体半径」到这个比例就不再压速；越小越慢，下限 ROTATE_MIN_FACTOR。 */
-const ROTATE_FULL_RATIO = 12;
-/** 贴到球面时仍保留的拖拽比例（再小就拖不动了）。 */
-const ROTATE_MIN_FACTOR = 0.18;
+/**
+ * t34：旋转速度只随**视距**弱依赖，不再看"离 target 最近的天体半径"。
+ * gain = BASE × clamp(0.6 + dist/300, 0.6, 1.0)：总览(dist≈118) 0.55、贴脸(dist≈1.7) ≈0.33，
+ * 同样 200px 拖动的角度比 ≈1.65（旧实现靠最近天体半径，实测 5.5 倍差）。
+ */
+const ROTATE_DIST_GAIN = 1 / 300;
+const ROTATE_DIST_MIN = 0.6;
+/** 松手后的惯性：每帧 ×0.91（与 OrbitControls dampingFactor 0.09 同量级，滑行 ≈10 帧）。 */
+const ORBIT_DAMPING = 0.91;
+/** 视距上限（原 OrbitControls 的 maxDistance）。 */
+const MAX_DISTANCE = 280;
 
 /**
  * `?diag=1` 的摆位开关：`__solarPlace(id, dist, az, el, { ignoreMinDistance })` 打开后，
@@ -1994,9 +1988,20 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
    */
   /** 1/s，正 = 拉远（deltaY > 0）。 */
   const zoomVelocity = useRef(0);
-  /** 指针 NDC（朝指针缩放用）；active = 至少收到过一次指针位置。 */
+  /** 指针 NDC（朝指针缩放用）；active = 至少收到过一次指针位置。t34 起 dolly 不再读它。 */
   const zoomPointer = useRef({ x: 0, y: 0, active: false });
   const zoomLastWheelAt = useRef(-1e9);
+  /**
+   * t34：相机锁（代替原来借 OrbitControls 的 `controls.enabled`）。
+   * true = 动画/切换期间，用户拖拽和滚轮都不接。
+   */
+  const camLocked = useRef(false);
+  /** t34：松手后的角速度（rad/帧），每帧 ×0.91。 */
+  const orbitVel = useRef({ yaw: 0, pitch: 0 });
+  /** t34：当前拖拽的比例尺（rad / CSS px），由视距决定，见 ROTATE_DIST_GAIN。 */
+  const orbitGain = useRef(ROTATE_SPEED_BASE);
+  /** t34：当前是否在拖拽旋转（拖拽期间不叠惯性，避免"移动 + 上一帧速度"双算）。 */
+  const orbitDragging = useRef(false);
   /** 触摸捏合：两指 pointerId → 位置；两指都在时 active。 */
   const pinch = useRef({ active: false, dist: 0, pointers: new Map<number, { x: number; y: number }>() });
   const gl = useThree((state) => state.gl);
@@ -2013,8 +2018,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      */
     const onWheel = (ev: WheelEvent) => {
       const controls = controlsRef.current;
-      // 聚焦动画（controls.enabled=false）/ 模式切换期间不接滚轮：别给动画攒动量
-      if (!controls || !controls.enabled || useSim.getState().switching !== null) return;
+      // t34：输入锁看 camLocked（OrbitControls 已停用，不能再借它的 enabled）
+      if (!controls || camLocked.current || useSim.getState().switching !== null) return;
       const now = performance.now();
       const gap = now - zoomLastWheelAt.current;
       zoomLastWheelAt.current = now;
@@ -2058,12 +2063,10 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         pinch.current.dist = pinchDistance();
         pointerFromPinch();
         /*
-         * 两指都在时必须关掉旋转：OrbitControls 的 enableZoom/enablePan 都关着，
-         * 它两指落下时直接 return、状态还停在一指的 TOUCH_ROTATE —— 不关旋转的话，
-         * 捏合的**中指漂移**会被当成转视角，第一下还可能因为 rotateStart 过期而跳一下。
+         * 两指都在时把旋转停掉（t34 起旋转是我们自己的，见 applyOrbit）：
+         * 捏合的**中指漂移**不能被当成转视角。
          */
-        const controls = controlsRef.current;
-        if (controls) controls.enableRotate = false;
+        if (pinch.current.pointers.size === 2) orbitDragging.current = false;
       }
     };
     const onPinchMove = (ev: PointerEvent) => {
@@ -2083,13 +2086,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const onPinchEnd = (ev: PointerEvent) => {
       pinch.current.pointers.delete(ev.pointerId);
       if (pinch.current.pointers.size < 2) pinch.current.active = false;
-      // 全部抬起才把旋转还回去：留一指时状态还是过期的 TOUCH_ROTATE，开旋转会跳
-      if (pinch.current.pointers.size === 0) {
-        const controls = controlsRef.current;
-        if (controls && controls.enabled && useSim.getState().switching === null) {
-          controls.enableRotate = true;
-        }
-      }
+      // t34：旋转状态由 orbitDragging 自己管，这里不用再开关 enableRotate
     };
     el.addEventListener("pointerdown", onPinchDown);
     // move/up 挂 window：手指可能在画布外抬起（OrbitControls 自己也是挂 ownerDocument 的）
@@ -2104,6 +2101,99 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       window.removeEventListener("pointercancel", onPinchEnd);
     };
   }, [gl]);
+
+  /*
+   * t34：旋转接管 —— 从 OrbitControls 手里完全拿过来。
+   *
+   * 为什么必须自己拿：OrbitControls 的 update() 每帧从球坐标重推相机，且内部把极角
+   * 夹在 (0, π) 附近；`minPolarAngle/maxPolarAngle` 只是外面那层，删了也还是会被它自己夹住。
+   * 我们要的是「连续上下拖，越过极点继续翻、自然滚过去」，那就只能按四元数积分：
+   *  - 横向：绕相机**本地 up** 轴转；
+   *  - 纵向：绕相机**本地 right** 轴转；
+   * 位置 = target + (0,0,1)·q × 视距（target 是唯一主人，旋转不改写它）。
+   * 越过极点时本地轴跟着翻，没有夹取、没有停住。
+   *
+   * 比例尺：2π·dx / height × orbitGain（与旧 rotateSpeed 同一语义），gain 只随**视距**变
+   * （见 ROTATE_DIST_GAIN），不再看"离 target 最近的那颗天体半径"。
+   */
+  const applyOrbit = (yawRad: number, pitchRad: number) => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const q = camera.quaternion;
+    // 纵向：绕本地 right
+    scratch.delta.set(1, 0, 0).applyQuaternion(q);
+    scratch.q.setFromAxisAngle(scratch.delta, pitchRad);
+    q.premultiply(scratch.q);
+    // 横向：绕本地 up（取转完 pitch 之后的 up —— 逐帧小量，误差可忽略，顺序固定）
+    scratch.delta.set(0, 1, 0).applyQuaternion(q);
+    scratch.q.setFromAxisAngle(scratch.delta, yawRad);
+    q.premultiply(scratch.q);
+    const dist = camera.position.distanceTo(controls.target);
+    scratch.pos.set(0, 0, 1).applyQuaternion(q).multiplyScalar(dist).add(controls.target);
+    camera.position.copy(scratch.pos);
+  };
+
+  useEffect(() => {
+    const el = gl.domElement;
+    const drag = { active: false, id: -1, x: 0, y: 0 };
+    const onDown = (ev: PointerEvent) => {
+      if (ev.button !== 0) return;
+      if (camLocked.current || useSim.getState().switching !== null) return;
+      // 两指已经在捏合：不进入旋转
+      if (pinch.current.pointers.size > 1) return;
+      drag.active = true;
+      drag.id = ev.pointerId;
+      drag.x = ev.clientX;
+      drag.y = ev.clientY;
+      orbitDragging.current = true;
+      orbitVel.current.yaw = 0;
+      orbitVel.current.pitch = 0;
+      try {
+        el.setPointerCapture(ev.pointerId);
+      } catch {
+        /* file:// 或已释放：忽略 */
+      }
+    };
+    const onMove = (ev: PointerEvent) => {
+      if (!drag.active || ev.pointerId !== drag.id) return;
+      // 第二根手指落下 = 改成捏合：立刻退出旋转
+      if (pinch.current.pointers.size > 1) {
+        drag.active = false;
+        orbitDragging.current = false;
+        return;
+      }
+      const rect = el.getBoundingClientRect();
+      if (rect.height <= 0) return;
+      const dx = ev.clientX - drag.x;
+      const dy = ev.clientY - drag.y;
+      if (dx === 0 && dy === 0) return;
+      drag.x = ev.clientX;
+      drag.y = ev.clientY;
+      const k = ((Math.PI * 2) / rect.height) * orbitGain.current;
+      const yaw = -dx * k;
+      const pitch = -dy * k;
+      applyOrbit(yaw, pitch);
+      // 惯性取最后一次位移 ×0.75：实测滑行/拖拽比 ≈0.66，与旧 dampingFactor 0.09 的手感对齐（±20% 判据）
+      orbitVel.current.yaw = yaw * 0.75;
+      orbitVel.current.pitch = pitch * 0.75;
+    };
+    const onUp = (ev: PointerEvent) => {
+      if (ev.pointerId === drag.id) {
+        drag.active = false;
+        orbitDragging.current = false;
+      }
+    };
+    el.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      el.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [gl, camera, controlsRef]);
 
   /*
    * 这里原本有一个 `dip()`：命令式 append 一层黑 div，再等一个 rAF 才把 opacity 设成 1。
@@ -2175,7 +2265,6 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     if (!(camera instanceof THREE.PerspectiveCamera)) return;
     applyHome(camera, size.width, size.height);
     controls.target.set(0, 0, 0);
-    controls.update();
   }, [camera, controlsRef, size.height, size.width]);
 
   // 聚焦动画的触发点放进 useFrame，而不是 useEffect：
@@ -2215,16 +2304,11 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       home: !id,
     };
     followId.current = null;
-    controls.enableRotate = false;
-    controls.enableZoom = false;
     /*
-     * 动画期间必须连 `enabled` 一起关。
-     * OrbitControls 有距离夹取（`minDistance` 从 1.15 起、按目标天体半径抬到 1.2×，`maxDistance=280`）：
-     * 相机一旦被动画带到 1e11 量级（实地机位），它的 update() 每帧都会把相机拽回 280 单位，
-     * 和动画互相拉扯，最后停在半路。关掉 enabled 等于整套控件静音 —— 米制相机和沙盘相机
-     * 都这么做（两套组件各自管自己的动画）；代价是切回来之后必须记得还原，否则视角永久拖不动。
+     * t34：动画期间用我们自己的 `camLocked` 静音输入（旋转/滚轮都看它）。
+     * OrbitControls 已整体停用（enabled=false 常驻），这里不再借它的开关。
      */
-    controls.enabled = false;
+    camLocked.current = true;
   };
 
   /*
@@ -2235,15 +2319,9 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
    * 两处都以 switching 为条件，谁先到都不会提前开锁。
    */
   useEffect(() => {
-    const c = controlsRef.current;
-    if (!c) return;
-    if (switching) {
-      c.enableRotate = false;
-      c.enableZoom = false;
-    } else if (!anim.current) {
-      releaseControls(c);
-    }
-  }, [switching, controlsRef]);
+    if (switching) camLocked.current = true;
+    else if (!anim.current) camLocked.current = false;
+  }, [switching]);
 
   /** 这里原本有一个 `startSwitchPose`…已删除（见 MeterCamera 的注释）。 */
 
@@ -2280,8 +2358,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
       );
       const dist = camera.position.distanceTo(controls.target);
-      // 动画/切换期间 controls.enabled=false：不接动量，攒下来的也清零
-      let v = controls.enabled && switching === null ? zoomVelocity.current : 0;
+      // 动画/切换期间不接动量，攒下来的也清零
+      let v = !camLocked.current && switching === null ? zoomVelocity.current : 0;
       if (Math.abs(v) > ZOOM_VELOCITY_EPS) {
         const bypass = DIAG_PLACE.ignoreMinDistance;
         const gap = Math.max(0, dist - hardMin);
@@ -2290,7 +2368,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
           : Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
         // 只在"往里缩"时踩底线；往外拉永远不受下限影响（否则已经在里面时会被弹一下）
         const floor = v < 0 ? (bypass ? 0 : hardMin) : 0;
-        const ceiling = controls.maxDistance;
+        const ceiling = MAX_DISTANCE;
         const next = THREE.MathUtils.clamp(dist * Math.exp(v * resistance * dt), floor, ceiling);
         // 顶到底线/远平面就把速度清掉：别"顶着墙攒动量"，松手后突然弹开
         zoomVelocity.current =
@@ -2298,39 +2376,46 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
             ? 0
             : v * Math.exp(-ZOOM_DECAY * dt);
         if (next !== dist) {
-          // 旧视轴要在移动相机之前取；移动后 target 沿它放到 next 处
+          /*
+           * t34：缩放**不得改写 target**（它是相机的唯一主人：选中天体 / 总览原点）。
+           * 旧写法沿"相机→指针"的射线推相机，再把 target 放回旧视轴 —— 连续缩放后
+           * target 落在鼠标最后停的地方，旋转速度也随它漂。现在相机只沿视轴走，
+           * 朝向不变，目标始终在画面中心；target 一个字节都不动。
+           * （代价：t10 的"朝指针缩放"不做了 —— 那个交互和"中心点固定"互斥。）
+           */
           scratch.zoomFwd.copy(controls.target).sub(camera.position).normalize();
-          if (zoomPointer.current.active) {
-            // 朝指针缩放：相机沿"相机→指针"的射线走，target 再放回视轴
-            scratch.zoomDir
-              .set(zoomPointer.current.x, zoomPointer.current.y, 1)
-              .unproject(camera)
-              .sub(camera.position)
-              .normalize();
-          } else {
-            scratch.zoomDir.copy(scratch.zoomFwd);
-          }
-          camera.position.addScaledVector(scratch.zoomDir, dist - next);
-          controls.target.copy(camera.position).addScaledVector(scratch.zoomFwd, next);
+          camera.position.addScaledVector(scratch.zoomFwd, dist - next);
         }
       } else {
         zoomVelocity.current = 0;
       }
-      // 底线同时写给控件：OrbitControls 的 update() 每帧还会再夹一次（跟随被拖进球里时靠它兜底）
-      controls.minDistance = DIAG_PLACE.ignoreMinDistance ? 0 : hardMin;
     }
     /*
-     * 拖拽速度随视距自适应（t55 B4）。
-     *
-     * 根因：`rotateSpeed` 原本是常量，同样 200px 的拖动，总览和贴脸转过的**屏幕角度**差不多，
-     * 但贴脸时那是扫过大半个星球 —— 观感就是"甩视角"。
-     * 用无量纲的「视距 / 最近天体半径」缩放：贴着球（ratio ≈ 2~3）压到 0.18，
-     * 轨道外（ratio ≥ 12）保持全速。实测同一 200px 拖动：总览 53.79°、地球特写 19.06°。
+     * t34：旋转速度的比例尺只随**视距**变（target 是唯一主人，不再拿"最近天体半径"当参照）。
+     * 同一 200px 拖动：总览 ≈0.55（全速）、贴脸 ≈0.33 → 角度比 ≈1.65（旧实现 5.5 倍差）。
      */
     {
-      const nearestR = Math.max(nearestBodyRadius(reg, bodies, controls.target), 0.05);
-      const ratio = camera.position.distanceTo(controls.target) / nearestR;
-      controls.rotateSpeed = Math.min(1, Math.max(ROTATE_MIN_FACTOR, ratio / ROTATE_FULL_RATIO)) * ROTATE_SPEED_BASE;
+      const distNow = camera.position.distanceTo(controls.target);
+      orbitGain.current =
+        ROTATE_SPEED_BASE * Math.min(1, Math.max(ROTATE_DIST_MIN, ROTATE_DIST_MIN + distNow * ROTATE_DIST_GAIN));
+    }
+
+    /*
+     * t34：松手后的惯性按帧走完（拖拽期间不叠，避免双算）。
+     * 速度是 rad/帧，衰减 ×0.91/帧 —— 与旧 OrbitControls dampingFactor 0.09 的滑行量同量级。
+     */
+    {
+      const dt = Math.min(raw, 0.1);
+      const v = orbitVel.current;
+      if (!camLocked.current && !orbitDragging.current && (Math.abs(v.yaw) > 1e-4 || Math.abs(v.pitch) > 1e-4)) {
+        applyOrbit(v.yaw, v.pitch);
+        const decay = Math.pow(ORBIT_DAMPING, Math.max(1, dt * 60));
+        v.yaw *= decay;
+        v.pitch *= decay;
+      } else if (camLocked.current) {
+        v.yaw = 0;
+        v.pitch = 0;
+      }
     }
 
     /*
@@ -2359,29 +2444,22 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     }
 
     /*
-     * 模式切换期间禁用拖拽/缩放。放在每帧最前面强制写一次，是因为 drei 的
-     * <OrbitControls> 会在自身重渲染时按 props 把开关刷回默认值，只在 useEffect
-     * 里设一次会被它盖掉。
+     * t34：模式切换期间输入静音。OrbitControls 已停用（enabled=false 常驻），
+     * 这里只需要把 camLocked 跟 switching 对齐；每帧写一次是幂等的。
      */
-    if (switching) {
-      controls.enableRotate = false;
-      controls.enableZoom = false;
-    }
+    if (switching) camLocked.current = true;
 
     /*
-     * 不变式（R9，只在 ?diag=1 下检查）：不在切换里、也没有动画在跑时，控制权必须是开的。
-     * 它把旧代码里"回沙盘必然伴随一次 resetToken 动画，所以动画结束处一定能把 enabled
-     * 打开"这个隐含前提变成可观测的：谁把恢复路径弄断了，下一帧就会在控制台看到这行。
+     * 不变式（R9，只在 ?diag=1 下检查）：不在切换里、也没有动画在跑时，输入必须是开的。
      */
-    if (DIAG && switching === null && !anim.current && !controls.enabled) {
-      console.warn("[cam] 控制权没恢复：无切换、无动画，但 controls.enabled=false");
+    if (DIAG && switching === null && !anim.current && camLocked.current) {
+      console.warn("[cam] 控制权没恢复：无切换、无动画，但 camLocked=true");
     }
 
     // 首次摆位：等控件和尺寸都就绪，在这里做才不会错过头
     if (!posed && sizeRef.current.width >= 2 && camera instanceof THREE.PerspectiveCamera) {
       applyHome(camera, sizeRef.current.width, sizeRef.current.height);
       controls.target.set(0, 0, 0);
-      controls.update();
       setPosed(true);
     }
 
@@ -2511,12 +2589,10 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         const stillSwitching = useSim.getState().switching !== null;
         if (stillSwitching) {
           // 动画先于放锁结束：保持静音，放锁后由 switching effect 的无动画分支恢复。
-          controls.enableRotate = false;
-          controls.enableZoom = false;
-          controls.enabled = false;
+          camLocked.current = true;
           useSim.getState().finishSwitch();
         } else {
-          releaseControls(controls);
+          camLocked.current = false;
         }
         if (!current.home && current.toId) {
           followId.current = current.toId;
@@ -2547,6 +2623,13 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      * 跟随逻辑只做平移，不避让，所以这里补一次最小距离钳制。
      */
     clampOutsideParent(id);
+    /*
+     * t34：跟随期间不再有 OrbitControls.update() 替我们每帧重瞄 target（它的那行 lookAt）。
+     * 钳制会把相机单独推出去（target 不动），不重瞄的话朝向就停在动画结束那一刻 ——
+     * camera-clearance 实测地球的 depth 会整段变 null（相机在"看着别处"）。
+     * 这里每帧重新对准 target：与旧 OrbitControls 的行为等价，位置/朝向同一个主人。
+     */
+    camera.lookAt(controls.target);
   }, -2);
 
   /**
@@ -3574,22 +3657,18 @@ function Scene() {
       <CamTrace controlsRef={controlsRef} />
       <OrbitControls
         ref={controlsRef}
-        enablePan={false}
-        enableDamping
-        dampingFactor={0.09}
-        rotateSpeed={0.55}
         /*
-         * 缩放由 SandboxCamera 自己接管（t10）：wheel/捏合 → 速度冲量 → 每帧积分。
-         * 这里必须关掉 enableZoom，否则 OrbitControls 会在自己的 wheel 监听里再乘一次
-         * scale（同一格被算两遍，而且又变回"一格一跳"）。
-         * 代价是它的双指 pinch 也一起关了 —— SandboxCamera 里用同一套速度模型补回来了。
-         * minDistance 仍由 SandboxCamera 每帧重写（跟着目标天体半径走），这里只是首帧起点。
+         * t34：整体停用。它现在只是 target 的**存储**（__solarCamera 探针读它），
+         * 不再碰相机：每帧 update() 会按球坐标重推相机、夹极角、把 rotateSpeed 当输入——
+         * 那三条正是"中心点随意 / 无限翻转 / 5.5 倍速差"的来源。
+         * 旋转、dolly、聚焦/跟随/回总览全部由 SandboxCamera 独占。
          */
+        enabled={false}
+        enablePan={false}
+        enableDamping={false}
         enableZoom={false}
         minDistance={MIN_DISTANCE_BASE}
-        maxDistance={280}
-        minPolarAngle={0.02}
-        maxPolarAngle={Math.PI - 0.02}
+        maxDistance={MAX_DISTANCE}
       />
     </RegistryContext.Provider>
   );
