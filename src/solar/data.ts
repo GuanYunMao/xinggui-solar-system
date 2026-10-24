@@ -17,6 +17,15 @@ export type Body = {
   locked?: boolean;
   parent?: string;
   /**
+   * 卫星绕行的**参考面**（t31）。只对 `parent` 非空的卫星有意义：
+   *  - `"equatorial"`：母行星赤道面（规则卫星：木卫一~四、土卫六）；
+   *  - `"ecliptic"`：黄道面（月球 —— 它的 5.145° 是相对黄道，不是地球赤道）。
+   * 渲染层按这个字段决定把卫星挂在母天体倾角层的里面还是外面；
+   * **不要用"母天体倾角是否大于某个值"来猜**，那会把一件真实事实变成一条隐式规则。
+   * 缺省按 `"ecliptic"`（t31 之前所有卫星都在这一层）。
+   */
+  orbitFrame?: "ecliptic" | "equatorial";
+  /**
    * 六根数（t14，可选）。**只有实境的天体带它**：沙盘仍然是"正圆 + 示意图简化"（t24）。
    * 有 `elements` 时，位置由 `kepler.ts` 的开普勒解开，`orbitRadius/phase/period` 的
    * 正圆公式不再参与；`period` 仍然要在数据层填（由 `periodSeconds` 派生），
@@ -179,6 +188,8 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "earth",
+    /* 月球的 5.145° 是相对**黄道**的：它必须留在母天体倾角层外面，不跟地球赤道斜。 */
+    orbitFrame: "ecliptic",
     focus: 1.7,
     swatch: "#c5c1b8",
     texture: "moon",
@@ -251,6 +262,7 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "jupiter",
+    orbitFrame: "equatorial",
     focus: 1.45,
     swatch: "#e2c15a",
     texture: "io",
@@ -275,6 +287,7 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "jupiter",
+    orbitFrame: "equatorial",
     focus: 1.35,
     swatch: "#d5ddd8",
     texture: "europa",
@@ -299,6 +312,7 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "jupiter",
+    orbitFrame: "equatorial",
     focus: 1.6,
     swatch: "#9a8b78",
     texture: "ganymede",
@@ -323,6 +337,7 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "jupiter",
+    orbitFrame: "equatorial",
     focus: 1.55,
     swatch: "#6e675f",
     texture: "callisto",
@@ -372,6 +387,7 @@ export const BODIES: Body[] = [
     spin: 0,
     locked: true,
     parent: "saturn",
+    orbitFrame: "equatorial",
     focus: 1.7,
     swatch: "#e0b56a",
     texture: "titan",

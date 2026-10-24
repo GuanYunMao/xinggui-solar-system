@@ -1141,6 +1141,26 @@ function BodyNode({
   const { byParent } = useSystem();
   const kids = byParent.get(body.id) ?? [];
   const selected = selectedId === body.id;
+  /*
+   * t31：卫星按声明的**参考面**分两层挂。
+   *
+   *  - `equatorial`（木卫一~四、土卫六）挂在母天体的 `obliquity` 层**里面** ——
+   *    位置由 Simulation 写成"母天体赤道系"的局部坐标，整层再被母天体倾角转过去，
+   *    于是轨道与光环共面。土卫六 5.35 的轨道半径在 26.7° 下曾甩出环面 ±2.40（比土星半径 1.9 还大）。
+   *  - `ecliptic`（月球）留在倾角层**外面** —— 地球倾角 23.4° 是自转轴，月球的 5.145°
+   *    是相对黄道；跟着赤道斜就错了。
+   *
+   * 为什么不用"母天体倾角 > 某值"来猜：那会把一条真实事实（参考面）换成隐式启发式，
+   * 下一个天体就会猜错。参考面是数据，就应该由数据声明。
+   */
+  const equatorialKids = kids.filter((kid) => kid.orbitFrame === "equatorial");
+  const eclipticKids = kids.filter((kid) => kid.orbitFrame !== "equatorial");
+  const renderKid = (kid: Body) => (
+    <group key={kid.id}>
+      {showOrbits && <OrbitPath body={kid} selected={selectedId === kid.id} />}
+      <BodyNode body={kid} showOrbits={showOrbits} showLabels={showLabels} selectedId={selectedId} />
+    </group>
+  );
   // 卫星标签只在被选中时出现：全显示的话木星四颗卫星的名字会叠成一团。
   // 卫星靠 HUD 里的卫星芯片行来选择/辨认。
   return (
@@ -1160,6 +1180,8 @@ function BodyNode({
           {body.texture === "sun" ? <SunSurface body={body} /> : <PlanetSurface body={body} />}
         </group>
         <Rings body={body} />
+        {/* t31：赤道面卫星在倾角层里面（轨道随母天体赤道斜） */}
+        {equatorialKids.map(renderKid)}
       </group>
       {/* 热区已经挪到屏幕空间（见 pick.ts）：这里不再画那个世界空间的透明球壳 */}
       {body.texture !== "sun" && <Atmosphere body={body} />}
@@ -1168,12 +1190,8 @@ function BodyNode({
        * **这不是天体本体**，是星图软件式的标记：固定 6px、不随距离缩放、不吃深度。
        */}
       {body.marker && <NucleusMarker size={body.marker.size} color={body.marker.color} />}
-      {kids.map((kid) => (
-        <group key={kid.id}>
-          {showOrbits && <OrbitPath body={kid} selected={selectedId === kid.id} />}
-          <BodyNode body={kid} showOrbits={showOrbits} showLabels={showLabels} selectedId={selectedId} />
-        </group>
-      ))}
+      {/* t31：黄道面卫星在倾角层外面（月球保持绕黄道） */}
+      {eclipticKids.map(renderKid)}
     </group>
   );
 }
@@ -2548,6 +2566,49 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
     (window as unknown as { __solarClip?: typeof clip }).__solarClip = clip;
 
     /*
+     * t31 结构探针：每颗卫星的轨道位置（相对母天体、**按声明的参考面表达**）。
+     *
+     * 为什么返回 local 而不是 world：参考面是**数据声明**。赤道面卫星要先把母天体倾角
+     * 反旋回去（Rz(-obliquity)），再交给验收算法向量。一条断言因此同时测两件事：
+     * 数据里的声明，和渲染层真的把卫星挂在了那个参考面里（挂错会算出倾斜的法向量）。
+     * 黄道面卫星不反旋（沙盘的世界 XZ 平面就是黄道面）。
+     */
+    const orbitFrames = () => {
+      const rows: {
+        id: string;
+        parent: string;
+        frame: string;
+        inclinationDeg: number;
+        parentObliquityDeg: number;
+        local: [number, number, number];
+      }[] = [];
+      const wp = new THREE.Vector3();
+      const pp = new THREE.Vector3();
+      const rel = new THREE.Vector3();
+      for (const body of bodies) {
+        if (!body.parent) continue;
+        const parent = bodies.find((b) => b.id === body.parent);
+        const g = reg.groups.get(body.id);
+        const pg = reg.groups.get(body.parent);
+        if (!parent || !g || !pg) continue;
+        g.getWorldPosition(wp);
+        pg.getWorldPosition(pp);
+        rel.copy(wp).sub(pp);
+        if (body.orbitFrame === "equatorial") rel.applyAxisAngle(new THREE.Vector3(0, 0, 1), -parent.obliquity);
+        rows.push({
+          id: body.id,
+          parent: body.parent,
+          frame: body.orbitFrame ?? "ecliptic",
+          inclinationDeg: (body.inclination * 180) / Math.PI,
+          parentObliquityDeg: (parent.obliquity * 180) / Math.PI,
+          local: [rel.x, rel.y, rel.z],
+        });
+      }
+      return rows;
+    };
+    (window as unknown as { __solarOrbitFrames?: typeof orbitFrames }).__solarOrbitFrames = orbitFrames;
+
+    /*
      * 贴图预算探针：启动时每张程序化贴图多大、总像素多少、还有几个任务在排队。
      * 它要证明的是两件事 ——「启动期只付总览档的钱」和「放大后真的升了档」，
      * 不是"每个像素都对"（那要截图）。摄影贴图（地球/月球）不参与预算，不在报告里。
@@ -2835,6 +2896,7 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
       delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
       delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
+      delete (window as unknown as { __solarOrbitFrames?: typeof orbitFrames }).__solarOrbitFrames;
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
       delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;
