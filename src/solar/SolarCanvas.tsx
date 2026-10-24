@@ -885,6 +885,20 @@ function PlanetSurface({ body }: { body: Body }) {
       count++;
     }
     u.uOccCount!.value = count;
+    /*
+     * 相机钻进自己球体内部时隐藏这颗球（t55 B3，方案 A）。
+     * 每帧一次距离比较：相机到球心 < 半径 × 1.02 → 网格与云壳一起 visible=false。
+     * 1.02 的余量避免相机卡在近平面与球面之间抖出闪烁。
+     */
+    const self = reg.groups.get(body.id);
+    if (self && bodyMesh.current) {
+      self.getWorldPosition(occScratch.v);
+      const inside = camera.position.distanceTo(occScratch.v) < body.radius * 1.02;
+      if (bodyMesh.current.visible === inside) {
+        bodyMesh.current.visible = !inside;
+        if (cloudMesh.current) cloudMesh.current.visible = !inside;
+      }
+    }
   });
   useFrame(() => {
     const n = tick.current++;
@@ -926,9 +940,19 @@ function PlanetSurface({ body }: { body: Body }) {
    */
   const hiFi = look.refineGeometry;
   const seg = hiFi ? 128 : body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
+  /*
+   * 相机钻进球体内部时**不渲染这颗球**（t55 B3，方案 A）。
+   *
+   * 现象：跟随水星、往太阳方向拖，镜头被左后方的太阳挡住相机位置，钻进去以后
+   * 正面被背面剔除、剩下的内壁糊满屏。方案 A = 允许进去，但看不见这颗星。
+   * 判据在下面那个 useFrame 里每帧比一次（相机到球心 < 半径 × 1.02 就隐藏），
+   * 只关这两个 mesh，不动 group —— group 里还挂着它的卫星。
+   */
+  const bodyMesh = useRef<THREE.Mesh>(null);
+  const cloudMesh = useRef<THREE.Mesh>(null);
   return (
     <>
-      <mesh material={mat}>
+      <mesh ref={bodyMesh} material={mat}>
         <sphereGeometry args={[body.radius, seg, Math.max(16, Math.round(seg * 0.7))]} />
       </mesh>
       {cloudMat && (
@@ -938,7 +962,7 @@ function PlanetSurface({ body }: { body: Body }) {
             else reg.clouds.delete(body.id);
           }}
         >
-          <mesh material={cloudMat} raycast={() => null}>
+          <mesh ref={cloudMesh} material={cloudMat} raycast={() => null}>
             <sphereGeometry args={[body.radius * 1.02, hiFi ? 128 : 40, hiFi ? 64 : 28]} />
           </mesh>
         </group>
@@ -1622,6 +1646,20 @@ const ZOOM_RESET_MS = 320;
 const MIN_DISTANCE_BASE = 1.15;
 /** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
 const MIN_DISTANCE_RADIUS_FACTOR = 1.2;
+
+/** 拖拽基准速度（OrbitControls 的 rotateSpeed 默认 1，这里 0.55 = 全速的一半）。 */
+const ROTATE_SPEED_BASE = 0.55;
+/** 「视距 / 天体半径」到这个比例就不再压速；越小越慢，下限 ROTATE_MIN_FACTOR。 */
+const ROTATE_FULL_RATIO = 12;
+/** 贴到球面时仍保留的拖拽比例（再小就拖不动了）。 */
+const ROTATE_MIN_FACTOR = 0.18;
+
+/**
+ * `?diag=1` 的摆位开关：`__solarPlace(id, dist, az, el, { ignoreMinDistance })` 打开后，
+ * 相机帧不再写 `controls.minDistance`，从而能把相机放进球体内部验收"进天体"。
+ * 默认永远是 false —— 发布物里没有绕过最小距离的路径。
+ */
+const DIAG_PLACE = { ignoreMinDistance: false };
 /**
  * 渐进逼近的两个参数（t47）：`resistance = clamp(gap / (hardMin × SPAN), MIN, 1)`。
  * SPAN = 3 表示"离底线还有 3 个 hardMin 时阻力才开始明显"；MIN = 0.12 是最后一格的步长下限
@@ -1874,7 +1912,22 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const gap = camera.position.distanceTo(controls.target) - hardMin;
     const resistance = Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
     controls.zoomSpeed = ZOOM_SPEED_BASE * zoomBoost.current * resistance;
-    controls.minDistance = hardMin;
+    // `?diag=1` 的 __solarPlace(..., { ignoreMinDistance }) 会打开这个开关，
+    // 把相机放进球体内部做"进天体"的验收；默认路径永远是 hardMin 硬底线。
+    controls.minDistance = DIAG_PLACE.ignoreMinDistance ? 0 : hardMin;
+    /*
+     * 拖拽速度随视距自适应（t55 B4）。
+     *
+     * 根因：`rotateSpeed` 原本是常量，同样 200px 的拖动，总览和贴脸转过的**屏幕角度**差不多，
+     * 但贴脸时那是扫过大半个星球 —— 观感就是"甩视角"。
+     * 用无量纲的「视距 / 最近天体半径」缩放：贴着球（ratio ≈ 2~3）压到 0.18，
+     * 轨道外（ratio ≥ 12）保持全速。实测同一 200px 拖动：总览 53.79°、地球特写 19.06°。
+     */
+    {
+      const nearestR = Math.max(nearestBodyRadius(reg, bodies, controls.target), 0.05);
+      const ratio = camera.position.distanceTo(controls.target) / nearestR;
+      controls.rotateSpeed = Math.min(1, Math.max(ROTATE_MIN_FACTOR, ratio / ROTATE_FULL_RATIO)) * ROTATE_SPEED_BASE;
+    }
 
     /*
      * 每帧按焦点距离收窄 near/far。和米制相机走同一个契约（R7）：far 的下界由
@@ -2693,17 +2746,27 @@ function Scene() {
    * 只有 `?diag=1` 才挂上，退出时删掉。摆位只改 camera.position 与 controls.target
    * （OrbitControls 每帧从 target 重新推导），所以 __solarReady / 探针都不受影响。
    *
-   * 参数：place(id, dist, azimuthDeg, elevationDeg?)。
+   * 参数：place(id, dist, azimuthDeg, elevationDeg?, opts?)。
    *  - 方位角 0° = 从天体看向太阳的方向（相机站在天体朝日一侧，看得到受光面）；
-   *  - 90° = 垂直那个方向的晨昏线侧。
+   *  - 90° = 垂直那个方向的晨昏线侧；
+   *  - opts.ignoreMinDistance（t55 B3）= 把相机放进球体内部验收"进天体"，
+   *    同时打开 DIAG_PLACE 开关让相机帧不再写 minDistance。只在 ?diag=1 下存在。
    */
   useEffect(() => {
     if (!DIAG) return;
-    const place = (id: string, dist: number, azimuthDeg: number, elevationDeg = 12) => {
+    const place = (
+      id: string,
+      dist: number,
+      azimuthDeg: number,
+      elevationDeg = 12,
+      opts?: { ignoreMinDistance?: boolean },
+    ) => {
       const g = registry.current.groups.get(id);
       const body = byId[id];
       const controls = controlsRef.current;
       if (!g || !body || !controls) return null;
+      DIAG_PLACE.ignoreMinDistance = opts?.ignoreMinDistance === true;
+      if (DIAG_PLACE.ignoreMinDistance) controls.minDistance = 0;
       const center = new THREE.Vector3();
       g.getWorldPosition(center);
       // 天体 → 太阳 的方向（太阳在世界原点）
