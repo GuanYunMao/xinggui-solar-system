@@ -1049,6 +1049,19 @@ function SandboxCard({ compact }: { compact: boolean }) {
       <CardHead body={selected} close={<CloseButton className="md:hidden" />} />
       {/* 全屏档把事实改成单列：这是"全屏"真正做的事，不然它只是和半屏一样高 */}
       <CardBody body={selected} stackFacts={compact && stop === "full"} />
+      {/*
+        t55：时间压缩那一行 —— 逐天体现算，不写全局系数（两条律：公转 0.04–37.8、自转 13–174）。
+        取不到就整行不渲染（太阳只有自转；实境样本不在参考表里）。
+        时间尺度从 store 取，原样传进纯函数；brand.ts 保持运行时零 import，Node 能直接单测。
+
+        **位置：紧跟在事实表后面，不是卡片最底部。** 实测 1280 下卡片内容已比可视区高 110px，
+        放最底部（免责声明之后）时它落在折叠线下方、不滚动就看不见 —— 标注看不见就白标。
+      */}
+      {compression && (
+        <p data-compression={compression} className="mt-2 text-[11px] leading-snug text-subtle">
+          {compression}
+        </p>
+      )}
       {/* t28：未解锁时给一句观察线索；解锁后整段不渲染（它的作用是点火，不是常驻文案） */}
       {!unlocked && (
         <p
@@ -1062,16 +1075,6 @@ function SandboxCard({ compact }: { compact: boolean }) {
       <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
         大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
       </p>
-      {/*
-        t55：时间压缩那一行 —— 逐天体现算，不写全局系数（两条律：公转 0.04–37.8、自转 13–174）。
-        取不到就整行不渲染（太阳只有自转；实境样本不在参考表里）。
-        时间尺度从 store 取，原样传进纯函数；brand.ts 保持运行时零 import，Node 能直接单测。
-      */}
-      {compression && (
-        <p data-compression={compression} className="mt-2 text-[11px] leading-snug text-subtle">
-          {compression}
-        </p>
-      )}
       <button
         type="button"
         className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
