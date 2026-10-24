@@ -168,9 +168,46 @@ function perpAxis(dir: THREE.Vector3) {
 
 const PLANET_FRAG = /* glsl */ `
   uniform sampler2D uMap;
+  uniform vec3 uSunCenter;   // 观察空间里的太阳中心
+  uniform float uSunRadius;
+  uniform vec3 uOcc[4];      // 近亲遮挡体（母天体 / 自己的卫星），观察空间
+  uniform float uOccR[4];
+  uniform int uOccCount;
   varying vec2 vUv;
   varying vec3 vN;
   varying vec3 vPos;
+
+  /*
+   * 日食/月食的**解析遮挡**（t47）。逐片元问一句：从这个点射向太阳的射线，有没有被球体挡住？
+   *
+   * 为什么不用 shadow map：参与者全是球体对球体，解析解没有分辨率、没有 biasing、
+   * 也不需要一张额外的深度图；代价是一次无分支的小循环。
+   *
+   * 为什么不用 asin/acos：那是每片元 2 次反三角 × 4 个遮挡体。这里全部换成小角近似
+   *   - 角半径 ≈ R / d（太阳 3.8/15 ≈ 0.25 rad，误差 ~2%；月球 0.2/1.95 ≈ 0.1 rad，误差 <0.2%）
+   *   - 两方向的夹角 ≈ |cross(u, v)|（= sin 角度）
+   * 覆盖率 = 遮挡圆盘与太阳圆盘的重叠比例，用线性近似 (aOcc + aSun − sep) / (2·aSun)：
+   * sep ≥ aOcc+aSun 无遮挡、sep ≤ aOcc−aSun 全食，中间线性过渡 = 半影。
+   */
+  float eclipseCoverage(vec3 P) {
+    vec3 toSun = uSunCenter - P;
+    float dSun = length(toSun);
+    if (dSun < 1e-4) return 0.0;
+    vec3 sunDir = toSun / dSun;
+    float aSun = max(uSunRadius / dSun, 1e-5);
+    float cover = 0.0;
+    for (int i = 0; i < 4; i++) {
+      if (i >= uOccCount) break;
+      vec3 toOcc = uOcc[i] - P;
+      float dOcc = length(toOcc);
+      if (dOcc < uOccR[i] + 1e-4) continue; // 点在遮挡体内部：交给相机钳制，不算食
+      float aOcc = uOccR[i] / dOcc;
+      float sep = length(cross(sunDir, toOcc / dOcc));
+      cover = max(cover, clamp((aOcc + aSun - sep) / (2.0 * aSun), 0.0, 1.0));
+    }
+    return cover;
+  }
+
   void main() {
     vec4 texel = texture2D(uMap, vUv);
     if (texel.a < 0.05) discard;
@@ -178,10 +215,12 @@ const PLANET_FRAG = /* glsl */ `
     // 太阳在世界原点，投到观察空间再算方向（同样避开大数相减）
     vec3 sunView = (viewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
     vec3 L = normalize(sunView - vPos);
-    float shade = clamp(dot(N, L) * 0.62 + 0.38, 0.08, 1.0);
+    // 本影里直射光归零，只留一点环境光；半影按覆盖率线性衰减
+    float direct = 1.0 - eclipseCoverage(vPos);
+    float shade = clamp(dot(N, L) * 0.62 * direct + 0.38 * (0.22 + 0.78 * direct), 0.06, 1.0);
     vec3 V = normalize(-vPos);
     float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    vec3 col = texel.rgb * shade + texel.rgb * rim * 0.16;
+    vec3 col = texel.rgb * shade + texel.rgb * rim * 0.16 * direct;
     gl_FragColor = vec4(col, texel.a);
   }
 `;
@@ -655,11 +694,38 @@ function PlanetSurface({ body }: { body: Body }) {
    * 预算与分帧的取舍写在 textures.ts 的 textureBudget / pump 注释里。
    */
   const map = useMemo(() => acquirePlanetTexture(body), [body]);
+  /*
+   * 解析遮挡的候选（t47）：**母天体 + 自己的卫星**。
+   * 沙盘里会真的互相挡光的只有这几对（地球↔月球、木星↔四颗伽利略卫星、土星↔土卫六）；
+   * 行星之间在压缩比例下几乎不可能挡上，所以不把 15 个天体全塞进 uniform ——
+   * 每多一个候选就是每片元多一轮距离/cross 运算，SwiftShader 上那是实打实的填充成本。
+   */
+  const { byId, bodies } = useSystem();
+  const occluders = useMemo(() => {
+    const list: Body[] = [];
+    const parent = body.parent ? byId[body.parent] : undefined;
+    if (parent) list.push(parent);
+    for (const b of bodies) if (b.parent === body.id) list.push(b);
+    /*
+     * ⚠ 太阳**不能**当遮挡体：每颗行星的 parent 都是太阳，而"太阳挡住太阳自己"
+     * 在公式里会算出 cover = 1（两个圆盘同心）—— 第一次接上时整片行星全黑、
+     * proto-real 的均值从 12.1 掉到 8.26、proto-jitter 直接采不到样本。
+     * 恒星是光源，不是遮挡物，这里按 texture 标记排除（两个系统都标 "sun"）。
+     */
+    return list.filter((b) => b.id !== body.id && b.texture !== "sun").slice(0, 4);
+  }, [body, byId, bodies]);
   const mat = useMemo(
     () =>
       new THREE.ShaderMaterial({
         toneMapped: false,
-        uniforms: { uMap: { value: map.texture } },
+        uniforms: {
+          uMap: { value: map.texture },
+          uSunCenter: { value: new THREE.Vector3() },
+          uSunRadius: { value: 3.8 },
+          uOcc: { value: [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()] },
+          uOccR: { value: [0, 0, 0, 0] as number[] },
+          uOccCount: { value: 0 },
+        },
         vertexShader: PLANET_VERT,
         fragmentShader: PLANET_FRAG,
       }),
@@ -706,6 +772,30 @@ function PlanetSurface({ body }: { body: Body }) {
    */
   const tick = useRef(0);
   const planPos = useMemo(() => new THREE.Vector3(), []);
+  /*
+   * 每帧把遮挡体搬进**观察空间**（t47）：和 vPos 同一套坐标，片元里就不用做大数相减 ——
+   * 实境（1e11 m）下这一步是必须的，否则 float32 会把遮挡体抖到别处去。
+   */
+  const occScratch = useMemo(() => ({ v: new THREE.Vector3(), sun: new THREE.Vector3() }), []);
+  useFrame(() => {
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+    const u = mat.uniforms;
+    const inv = camera.matrixWorldInverse;
+    // 太阳中心 = 世界原点
+    u.uSunCenter!.value.copy(occScratch.sun.set(0, 0, 0)).applyMatrix4(inv);
+    u.uSunRadius!.value = byId.sun?.radius ?? 3.8;
+    let count = 0;
+    for (const occ of occluders) {
+      const g = reg.groups.get(occ.id);
+      if (!g) continue;
+      g.getWorldPosition(occScratch.v);
+      occScratch.v.applyMatrix4(inv);
+      (u.uOcc!.value as THREE.Vector3[])[count]!.copy(occScratch.v);
+      (u.uOccR!.value as number[])[count] = occ.radius;
+      count++;
+    }
+    u.uOccCount!.value = count;
+  });
   useFrame(() => {
     const n = tick.current++;
     if (n !== 0 && n % 10 !== 0) return;
@@ -1442,6 +1532,13 @@ const ZOOM_RESET_MS = 320;
 const MIN_DISTANCE_BASE = 1.15;
 /** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
 const MIN_DISTANCE_RADIUS_FACTOR = 1.2;
+/**
+ * 渐进逼近的两个参数（t47）：`resistance = clamp(gap / (hardMin × SPAN), MIN, 1)`。
+ * SPAN = 3 表示"离底线还有 3 个 hardMin 时阻力才开始明显"；MIN = 0.12 是最后一格的步长下限
+ * （14% × 0.12 ≈ 1.7%/格，≈0.08 世界单位）。两个数都是手感值，不是物理量。
+ */
+const SOFT_APPROACH_SPAN = 3;
+const SOFT_APPROACH_MIN = 0.12;
 
 /**
  * 距 `controls.target` 最近的那颗天体的半径。
@@ -1662,11 +1759,26 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      *    而 0.2 半径的小卫星下限仍是 1.15、它 1.7 的聚焦距离进得去。
      */
     if (performance.now() - lastWheelAt.current > ZOOM_RESET_MS) zoomBoost.current = 1;
-    controls.zoomSpeed = ZOOM_SPEED_BASE * zoomBoost.current;
-    controls.minDistance = Math.max(
+    /*
+     * 渐进逼近（t47）：越靠近天体，每一格的**步长**越小。
+     *
+     * 先说失败过的一版：把 `minDistance` 写成 `hardMin + gap×0.75` 想让钳制面跟着距离收缩。
+     * 实测无效 —— OrbitControls 的 dolly 是"半径 ×= scale 再 clamp 到 minDistance"，
+     * 一旦被 clamp 就正好落在 minDistance 上，下一帧 gap 归零，还是硬墙（实测最后 12 格距离
+     * 一点没变，全停在 5.374）。
+     *
+     * 现在改从**倍率**下手：靠近时把 zoomSpeed 线性压到 15%，步长随距离一起衰减，
+     * 于是画面越来越近、越来越慢，最后一格只走 0.09 个单位然后停住 —— 没有一下"跳开"。
+     * `minDistance` 仍然是硬底线（1.2×半径），它只负责"不许穿进去"，不再负责手感。
+     */
+    const hardMin = Math.max(
       MIN_DISTANCE_BASE,
       nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
     );
+    const gap = camera.position.distanceTo(controls.target) - hardMin;
+    const resistance = Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
+    controls.zoomSpeed = ZOOM_SPEED_BASE * zoomBoost.current * resistance;
+    controls.minDistance = hardMin;
 
     /*
      * 每帧按焦点距离收窄 near/far。和米制相机走同一个契约（R7）：far 的下界由
@@ -1848,8 +1960,14 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   }, -2);
 
   /**
-   * 把相机从母天体的球体里推出来。只推相机不动 target：
-   * OrbitControls 每帧会把朝向重新对准 target，推出去的视角变化是平滑的。
+   * 把相机从母天体的球体里**滑**出来（t47 改了连续性）。
+   *
+   * 旧实现：一帧之内 `position = 母天体中心 + 方向 × minDist` —— 位置瞬移，而且推的方向是
+   * 径向的，相机从球心哪一侧进去就从哪一侧弹出来，看起来像镜头被顶了一下。
+   *
+   * 现在：目标点仍是「球面上最近的那个点」（那就是"投影到球面"），但每帧只朝它走 35%：
+   * 连续几帧内相机沿球面滑出去，不瞬移。取值 0.35 ≈ 3 帧走完 97%，
+   * 在跟随卫星（相机每帧被母天体带着平移）时既跟得上，又不会跳。
    */
   function clampOutsideParent(id: string) {
     const parentId = byId[id]?.parent;
@@ -1858,13 +1976,17 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const pb = byId[parentId];
     if (!pg || !pb) return;
     pg.getWorldPosition(scratch.pos);
+    // 余量 1.35×半径：贴到球面上，但别让近平面切进去
     const minDist = pb.radius * 1.35;
     scratch.delta.copy(camera.position).sub(scratch.pos);
     const len = scratch.delta.length();
     if (len >= minDist) return;
     if (len < 1e-6) scratch.delta.set(0, 1, 0);
     else scratch.delta.multiplyScalar(1 / len);
-    camera.position.copy(scratch.pos).addScaledVector(scratch.delta, minDist);
+    // 球面目标点（径向投影 = 球面上离相机最近的点）
+    scratch.pos.addScaledVector(scratch.delta, minDist);
+    // 每帧只走剩余距离的 35%：连续滑出，不瞬移
+    camera.position.lerp(scratch.pos, 0.35);
   }
 
   return null;

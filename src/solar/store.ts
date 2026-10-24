@@ -60,8 +60,15 @@ export const SECONDS_PER_DAY = 86400;
  * 代价是"日"不再是整数：内部一律保留小数（`simSeconds` 本来就是浮点），
  * **取整只发生在显示层**：年 = floor(days / DAYS_PER_YEAR)，日 = floor(days % DAYS_PER_YEAR) + 1。
  * 显示层（Hud）以前各写了一遍 365，现在应该只 import 这一个常量 —— 见 `daysPerYear()` 的注释。
+ *
+ * ⚠ 取整要带 epsilon（t49 实测踩到）：连按四次「+1 年」后 `days % 365.25 = 98.9999999999998`，
+ * 直接 floor 得 98、显示成「第 99 日」，比实际少一天。显示层用 `EPS = 1e-6`（≈0.086 模拟秒）
+ * 再 floor；store 这边如果将来导出 splitEpoch 之类的取整函数，也必须带上同一个 EPS。
  */
 export const DAYS_PER_YEAR = 365.25;
+
+/** 显示层取整用的 epsilon（天）：先加它再 floor，别让浮点误差偷走一天。 */
+export const DAYS_EPSILON = 1e-6;
 
 /** 一个模拟秒等于多少模拟日（= 1 / SECONDS_PER_SIM_SECOND 的倒数关系见下）。 */
 export const DAYS_PER_SIM_SECOND = DAYS_PER_YEAR / EARTH_PERIOD;
