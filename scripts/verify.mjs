@@ -1,4 +1,4 @@
-// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
+﻿// 真实浏览器验收：桌面 + 手机两个视口 + 交互 + 单文件版本。
 // 用系统自带 Edge（playwright-core 不下载 Chromium），软件光栅化跑 WebGL。
 // 判定标准：画布真的渲染（window.__solarReady）、控制台零报错、无横向溢出。
 // 数值断言（帧时间 / 命中矩阵 / 跟随抖动）一律「相对本次运行的机器基线」判，不吃机器负载。
@@ -9,7 +9,7 @@ import { readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 // 运行归档：把每次的 results + 环境指纹落盘，让失败证据活过终端（详见该文件头部注释）
-import { archiveVerifyRun } from "./verify-archive.mjs";
+import { archiveVerifyRun, readIndex } from "./verify-archive.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // 产物的根目录。默认 release/。想验一份**冻结快照**时用 XG_RELEASE 指过去
@@ -943,11 +943,26 @@ function judgeJupiterSpot(res) {
     return { available: false, reason: lit.spot.reason };
   }
   const ratio = lit.ref.luma > 0 ? lit.spot.luma / lit.ref.luma : Infinity;
-  const detected =
-    lit.spot.luma >= SPOT_LUMA_FLOOR && ratio <= SPOT_LUMA_RATIO_MAX && lit.spot.E !== null && lit.spot.E >= SPOT_E_MIN;
+  /*
+   * ⚠ **比值门已降级为「只记录」，不是判据** —— 这是实测推翻了设计，不是放宽。
+   *
+   * 扫一个轨道周期（8 个相位）实测：
+   *   受光帧（斑区 luma ≥ 下限）的比值跨度 **0.429–0.948**；
+   *   夜面帧（luma < 下限）的比值跨度 **0.250–0.608**。
+   * 两个分布**重叠**（0.43–0.61），所以「斑区 ÷ 同纬度参考带」根本没有区分力：
+   * 参考带自己的亮度随光照几何摆动（t=0 时斑 45.94 / 参考 48.45 → 比值 0.948）。
+   * 按本仓库的规矩：**没有区分力的量只能记录**；阈值取「最差受光帧 × 1.15」会得到 1.09，
+   * 那条门恒真——留着比删掉更坏，因为它看起来像在判断。
+   *
+   * 剩下的两个门有干净的间隔：
+   *   · 绝对 luma 下限：受光 44.6–88.03 / 夜面 5.58–11.7（≥3.8× 间隔）；
+   *   · E=(R−G)/(R+G+B)：斑在时恒定 0.277–0.280，斑被抹掉/改色后掉到 0.045（反向验证实测）。
+   */
+  const detected = lit.spot.luma >= SPOT_LUMA_FLOOR && lit.spot.E !== null && lit.spot.E >= SPOT_E_MIN;
   if (!detected) {
     failures.push(
-      `${name}: 聚焦档认不出大红斑 —— 斑区 luma ${lit.spot.luma}（下限 ${SPOT_LUMA_FLOOR}）/ 与参考带比 ${ratio.toFixed(2)}（上限 ${SPOT_LUMA_RATIO_MAX}）/ E=${lit.spot.E}（下限 ${SPOT_E_MIN}）。` +
+      `${name}: 聚焦档认不出大红斑 —— 斑区 luma ${lit.spot.luma}（下限 ${SPOT_LUMA_FLOOR}）/ E=${lit.spot.E}（下限 ${SPOT_E_MIN}）。` +
+        `（比值 ${ratio.toFixed(2)} 只记录：它与夜面分布重叠，无区分力）` +
         `检查 textures.ts 的 jupiter spots[]、或 __solarPlace 的 faceU/faceV 反算。`,
     );
   }
@@ -972,6 +987,23 @@ function judgeJupiterSpot(res) {
     available: true,
     lit: { spotLuma: lit.spot.luma, refLuma: lit.ref.luma, ratio: +ratio.toFixed(3), E: lit.spot.E, detected },
     night: res.night && !res.night.error ? { spotLuma: res.night.spot.luma, refLuma: res.night.ref.luma, E: res.night.spot.E, rejectedByGates: nightOk } : null,
+    // 逐相位样本必须留在结果里：阈值只报一个数就等着失效，**要连同分布一起报**。
+    // 受光帧 = 斑区 luma ≥ 绝对下限的那些，它们的比值跨度才是这条门的真实工作区间。
+    samples: (res.samples ?? []).map((s) => ({
+      t: s.t,
+      luma: s.luma,
+      refLuma: s.refLuma,
+      ratio: s.refLuma > 0 ? +(s.luma / s.refLuma).toFixed(3) : null,
+      E: s.E,
+    })),
+    litRatioSpan: (() => {
+      const rs = (res.samples ?? []).filter((s) => s.luma >= SPOT_LUMA_FLOOR && s.refLuma > 0).map((s) => s.luma / s.refLuma);
+      return rs.length ? { n: rs.length, min: +Math.min(...rs).toFixed(3), max: +Math.max(...rs).toFixed(3) } : null;
+    })(),
+    darkRatioSpan: (() => {
+      const rs = (res.samples ?? []).filter((s) => s.luma < SPOT_LUMA_FLOOR && s.refLuma > 0).map((s) => s.luma / s.refLuma);
+      return rs.length ? { n: rs.length, min: +Math.min(...rs).toFixed(3), max: +Math.max(...rs).toFixed(3) } : null;
+    })(),
     thresholds: {
       lumaFloor: SPOT_LUMA_FLOOR,
       ratioMax: SPOT_LUMA_RATIO_MAX,
@@ -1423,13 +1455,173 @@ try {
       failures.push(`orbit-planes: ${err.message}`);
     }
   }
-  // ——— 大红斑（聚焦档认得出、夜面认不出）———
+  // ——— 自动收起（t12）：默认配置下收起/展开/浮层抑制，以及「收起的 chrome 不许吃点击」———
+// 为什么要有它：`hudAutoHide` 默认 true，但**所有**为了防偶发超时预置 `hudAutoHide:false` 的夹具
+// 都绕开了它——于是「自动收起」自己没有任何 pass 在测。这条跑的是**默认配置**（不预置 localStorage）。
+//
+// 两条容易漏的（设计方明确要求）：
+//  1. `collapsedAtMs` **只记录，不判 ==2000**：setTimeout 只能迟到不能早到，写死就成了忙机器天天红。
+//  2. **收起的 chrome 不许吃点击**：HUD 根是 pointer-events-none，收起的条一旦变成可点区域，
+//     就等于把画布的选择热区挖掉一块（t11 的矩阵量过那片区域）。
+const HUD_COLLAPSE_MAX_MS = 5000; // 等待上限；不是判据值
+const HUD_NEGATIVE_HOLD_MS = 2600; // 负对照静置时长：大于收起阈值的余量，但不写死成"正好阈值+600"
+
+const hudState = (page) =>
+  page.evaluate(() => {
+    const q = (sel) => document.querySelectorAll(sel).length;
+    const one = (sel) => document.querySelector(sel);
+    const autoHideBtn = one('button[aria-label^="自动收起"]');
+    const topHandle = one('button[aria-label="展开天体列表"]');
+    return {
+      topChrome: q('[data-hud-chrome="top"]'),
+      dockChrome: q('[data-hud-chrome="dock"]'),
+      chipRow: q("#chip-row"),
+      topHandle: q('button[aria-label="展开天体列表"]'),
+      dockHandle: q('button[aria-label="展开操作台"]'),
+      range: q('footer input[type="range"]'),
+      header: q("header"),
+      overlay: q('[data-overlay-open="true"]'),
+      autoHidePressed: autoHideBtn ? autoHideBtn.getAttribute("aria-pressed") : null,
+      topHandleExpanded: topHandle ? topHandle.getAttribute("aria-expanded") : null,
+    };
+  });
+
+async function waitHudCollapsed(page, maxMs) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < maxMs) {
+    const s = await hudState(page);
+    if (s.chipRow === 0) return { ms: Date.now() - t0, state: s };
+    await page.waitForTimeout(100);
+  }
+  return { ms: null, state: await hudState(page) };
+}
+
+async function runHudAutoHide(browser, base) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } }); // 不预置 localStorage = 默认配置
+  const page = await ctx.newPage();
+  const out = {};
+  try {
+    await page.goto(base, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    out.initial = await hudState(page);
+
+    // 1) 指针进场景中央 → 等它自己收起（计时器只在真实 pointermove 之后才上膛）
+    await page.mouse.move(640, 300);
+    const collapsed = await waitHudCollapsed(page, HUD_COLLAPSE_MAX_MS);
+    out.collapsedAtMs = collapsed.ms; // 只记录
+    out.collapsed = collapsed.state;
+    // 收起的 chrome 不许吃点击：原顶部区位置必须命中画布
+    out.collapsedHitTest = await page.evaluate(() => {
+      const el = document.elementFromPoint(640, 90);
+      return { tag: el ? el.tagName : null };
+    });
+
+    // 2) 回顶部唤醒
+    await page.mouse.move(300, 40);
+    await page.waitForTimeout(400);
+    out.afterTopWake = await hudState(page);
+    // 3) 到底栏唤醒
+    await page.mouse.move(640, 700);
+    await page.waitForTimeout(400);
+    out.afterDockWake = await hudState(page);
+
+    // 4) 负对照：浮层开着时 chrome 不许被收（最容易坏的方式不是"不收"，而是"把浮层一起收了"）
+    await page.mouse.move(300, 40);
+    await page.waitForSelector('button[aria-label="设定时刻"]', { state: "visible", timeout: 5000 });
+    await page.locator('button[aria-label="设定时刻"]').first().click({ timeout: 8000, force: true });
+    await page.waitForTimeout(300);
+    out.overlayOpen = await hudState(page);
+    await page.mouse.move(640, 300);
+    await page.waitForTimeout(HUD_NEGATIVE_HOLD_MS);
+    out.overlayHeld = await hudState(page);
+
+    // 5) 关浮层后再静置 → 必须能收（证明抑制跟着浮层生命周期走，不是永久关闭）
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+    await page.mouse.move(320, 45); // 一次真实移动：计时器需要 pointermove 才上膛
+    await page.waitForTimeout(150);
+    await page.mouse.move(640, 300);
+    const collapsed2 = await waitHudCollapsed(page, HUD_COLLAPSE_MAX_MS);
+    out.collapsedAfterEscape = { ms: collapsed2.ms, state: collapsed2.state };
+    return out;
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeHudAutoHide(res) {
+  const name = "hud-autohide";
+  const i = res.initial;
+  if (!i) {
+    failures.push(`${name}: 没拿到初始状态 —— 判据不成立`);
+    return { available: false };
+  }
+  // 默认配置 + 标记存在性（标记缺了 = 夹具失效，要红，否则将来重构掉标记这条会静默变绿）
+  if (i.autoHidePressed !== "true") {
+    failures.push(`${name}: 默认配置下「自动收起」aria-pressed=${i.autoHidePressed}，应为 "true"（被预置成关了？或默认值变了）`);
+  }
+  if (i.topChrome !== 1) failures.push(`${name}: [data-hud-chrome="top"] 计数 ${i.topChrome}，应为 1 —— 标记没了，这条 pass 会静默变绿`);
+  if (i.dockChrome !== 1) failures.push(`${name}: [data-hud-chrome="dock"] 计数 ${i.dockChrome}，应为 1 —— 同上`);
+  if (i.chipRow !== 1) failures.push(`${name}: 初始应展开，但 #chip-row 计数 ${i.chipRow}`);
+  if (i.range !== 1) failures.push(`${name}: 初始应展开，但 footer range 计数 ${i.range}`);
+  if (i.topHandle !== 0 || i.dockHandle !== 0) {
+    failures.push(`${name}: 展开态不该出现把手（top ${i.topHandle} / dock ${i.dockHandle}）`);
+  }
+
+  const c = res.collapsed;
+  if (!c || res.collapsedAtMs === null) {
+    failures.push(`${name}: ${HUD_COLLAPSE_MAX_MS}ms 内没有收起 —— 自动收起失效，或计时器没上膛（夹具必须真的 pointermove）`);
+  } else {
+    if (c.chipRow !== 0) failures.push(`${name}: 收起后 #chip-row 计数 ${c.chipRow}，应为 0（收起是卸载，不是 display:none）`);
+    if (c.topHandle !== 1) failures.push(`${name}: 收起后应出现顶部把手，实际 ${c.topHandle}`);
+    if (c.range !== 0) failures.push(`${name}: 收起后 footer range 计数 ${c.range}，应为 0`);
+    if (c.header !== 1) failures.push(`${name}: 收起不该收抬头（header 计数 ${c.header}）`);
+  }
+  if (res.collapsedHitTest && res.collapsedHitTest.tag !== "CANVAS") {
+    failures.push(
+      `${name}: 收起后原 chrome 位置命中的是 ${res.collapsedHitTest.tag}，应为 CANVAS —— 收起的条把画布的选择热区挖掉了一块`,
+    );
+  }
+  if (!res.afterTopWake || res.afterTopWake.chipRow !== 1) failures.push(`${name}: 指针回到顶部没有展开芯片行`);
+  if (!res.afterDockWake || res.afterDockWake.range !== 1) failures.push(`${name}: 指针回到底栏没有展开操作台`);
+
+  if (!res.overlayOpen || res.overlayOpen.overlay !== 1) {
+    failures.push(`${name}: 没能打开浮层（负对照不成立，这条测不出东西）`);
+  } else if (!res.overlayHeld || res.overlayHeld.overlay !== 1 || res.overlayHeld.chipRow !== 1 || res.overlayHeld.range !== 1) {
+    failures.push(
+      `${name}: 浮层开着时 chrome 被收起了（overlay ${res.overlayHeld?.overlay} / chip-row ${res.overlayHeld?.chipRow} / range ${res.overlayHeld?.range}）` +
+        ` —— 自动收起把浮层一起收了，这是它最容易坏的方式`,
+    );
+  }
+  if (!res.collapsedAfterEscape || res.collapsedAfterEscape.ms === null) {
+    failures.push(`${name}: 关掉浮层后再静置没有收起 —— 抑制变成了永久关闭`);
+  }
+  return {
+    available: true,
+    collapsedAtMs: res.collapsedAtMs,
+    collapsedAfterEscapeMs: res.collapsedAfterEscape?.ms ?? null,
+    note: "collapsedAtMs 只记录，不判 ==2000（setTimeout 只能迟到不能早到）",
+    ...res,
+  };
+}
+
+// ——— 大红斑（聚焦档认得出、夜面认不出）———
   if (want("jupiter-spot")) {
     try {
       const spot = await runJupiterSpot(browser, base);
       results.push({ pass: "jupiter-spot", 分类: "结构量（像素统计 + 绝对下限）", ...judgeJupiterSpot(spot) });
     } catch (err) {
       failures.push(`jupiter-spot: ${err.message}`);
+    }
+  }
+  // ——— 自动收起（默认配置）———
+  if (want("hud-autohide")) {
+    try {
+      const hud = await runHudAutoHide(browser, base);
+      results.push({ pass: "hud-autohide", 分类: "结构量（DOM 存在性 + 属性；collapsedAtMs 只记录）", ...judgeHudAutoHide(hud) });
+    } catch (err) {
+      failures.push(`hud-autohide: ${err.message}`);
     }
   }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
@@ -1945,8 +2137,27 @@ try {
         failures.push("sun-occlusion: 拿不到木星候选，采不到中心亮度");
       } else if (!aligned) {
         // 没对齐就不判：这条判据只在「太阳正被木星挡住」时有意义，
-        // 对齐失败时判红等于把夹具自己的收敛问题算成产品回归（记下来，别静默通过）
+        // 对齐失败时判红等于把夹具自己的收敛问题算成产品回归（记下来，别静默通过）。
+        //
+        // t16②：但「一直对不齐」= 这条 pass 永远绿而从未真正判断，正是本仓库最怕的那种失效。
+        // 所以数**连续未对齐次数**：本次 + 归档里最近两次（`runs/index.jsonl` 的 `unaligned` 字段，
+        // 由 verify-archive 写）。连续 3 次就判红——那时已经不是「偶尔失手」，是判据没了。
         console.error(`（注意）sun-occlusion: 未对齐（Δ=${deltaPx}px, sunBehind=${sunBehind}），本轮不判红，中心亮度记录 ${lum}`);
+        let prevUnaligned = 0;
+        try {
+          const hist = readIndex();
+          const recent = hist.slice(-2); // 最近两次运行（不含本次：归档在本轮判定之后才写）
+          prevUnaligned = recent.filter((e) => Array.isArray(e.unaligned) && e.unaligned.includes("sun-occlusion")).length;
+          if (recent.length < 2) prevUnaligned = 0; // 历史不足就不判，别拿半截数据判红
+        } catch {
+          prevUnaligned = 0; // 归档目录不存在（第一次跑）→ 无从累计
+        }
+        if (prevUnaligned >= 2) {
+          failures.push(
+            `sun-occlusion: 连续 ${prevUnaligned + 1} 次运行都没对齐（本次 Δ=${deltaPx}px）——` +
+              `对齐失败按设计不判红，但连续 3 次就意味着这条 pass 已经永远绿、从未在判断。先修对齐（t10 接管 dolly 之后步进量级变了）。`,
+          );
+        }
       } else if (lum > OCCLUSION_LUM_MAX) {
         failures.push(
           `sun-occlusion: 太阳被木星挡住时中心亮度 ${lum} > ${OCCLUSION_LUM_MAX}` +

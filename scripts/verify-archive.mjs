@@ -1,4 +1,4 @@
-﻿// verify 运行归档：把每次 `npm run verify` 的整份 results + 环境指纹落盘，让失败证据活过终端。
+// verify 运行归档：把每次 `npm run verify` 的整份 results + 环境指纹落盘，让失败证据活过终端。
 //
 // 为什么要它：`sun-occlusion` 的 centerBoxLum / aligned 只活在一条消息里——全仓 `*.json` 搜它 0 命中，
 // 于是「这条判据从哪一版开始不对外」回答不了，只能靠记性。归档之后，这个问题 = 一条 Select-String。
@@ -51,6 +51,9 @@ export function archiveVerifyRun({ results, failures, meta = {}, dir = process.e
   const raster = meta.raster ?? "unknown";
   const passes = results.length;
   const failureNames = failures.map((f) => String(f).split(":")[0].trim());
+  // 哪些 pass 这轮「没对齐 / 没准备好」：sun-occlusion 这类对齐失败按设计不判红，
+  // 但**连续多次未对齐**就说明判据已经失去判断力——所以把状态记进索引，下一次运行才能数连续次数。
+  const unaligned = results.filter((r) => r && r.aligned === false).map((r) => r.pass);
   const knownBugs = results
     .map((r) => r?.knownBug)
     .filter(Boolean)
@@ -73,7 +76,7 @@ export function archiveVerifyRun({ results, failures, meta = {}, dir = process.e
     "utf8",
   );
 
-  const entry = { at, build, raster, passes, failures: failures.length, failureNames, knownBugs, viewports, file: name };
+  const entry = { at, build, raster, passes, failures: failures.length, failureNames, knownBugs, viewports, unaligned, file: name };
   appendFileSync(path.join(dir, INDEX_NAME), JSON.stringify(entry) + "\n", "utf8");
 
   const pruned = pruneRuns(dir);
