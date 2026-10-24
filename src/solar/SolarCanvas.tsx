@@ -1486,7 +1486,11 @@ function Trails() {
  */
 function releaseControls(controls: OrbitControlsImpl) {
   controls.enableRotate = true;
-  controls.enableZoom = true;
+  /*
+   * 不要在这里打开 enableZoom：缩放已经由 SandboxCamera 的 wheel/捏合接管（t10）。
+   * 打开它 = OrbitControls 的 wheel 监听复活，同一个滚轮会被我们积分一次、再被它乘一次 scale。
+   */
+  controls.enableZoom = false;
   controls.enabled = true;
 }
 
@@ -1654,22 +1658,36 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
 }
 
 /**
- * 缩放手感（t32）。
+ * 缩放手感（t32 起调，t10 接管 dolly）。
  *
- * 为什么不是"把 zoomSpeed 调大"就完事：总览到太阳特写是 50 倍，
- * 一格 3.5%（旧值 0.95^0.7）要 67 格；一格 14% 要 ~19 格；再加连续滚动加速才能压到 12 格以内。
- * 加速必须有上限、且停手就回落 —— 否则一次猛滚会直接穿进太阳里。
+ * 旧做法是"分级 dolly + 加速"：OrbitControls 每收到一格 wheel 就把半径乘一个固定系数，
+ * 每格是一次**离散位移** —— 滚一格跳一格，连续滚只是跳得更狠。t10 把 wheel 接管成
+ * **速度模型**：wheel 只把 deltaY 折算成"对数视距速度"（1/s），每帧按 exp(v·dt) 积分、
+ * 速度按 exp(-λ·dt) 衰减。连续滚速度叠加（快滚快），停手后惯性把余量走完（不是台阶）。
+ *
+ * 三个原有语义全部保留：
+ *  - 硬底线 `max(1.15, 最近天体半径×1.2)`：新视距每帧夹回底线，滚不进球体；
+ *  - 渐进阻力 `SOFT_APPROACH_SPAN / SOFT_APPROACH_MIN`：越贴近底线速度越小，最后一格不会"跳开"；
+ *  - `?diag=1` 的 `__solarPlace(ignoreMinDistance)`：底线与阻力一起关掉，允许相机进球验收。
+ *
+ * 这些数字是手感值，不是物理量：一格 -120px ≈ 1.32/s 的冲量，除以衰减 9/s ⇒ 一格 ≈ 14.6% 视距；
+ * 连续滚时倍率最高 2.2（90ms 节奏下 ≈24%/格，`zoom-budget` 的 ≤15 格靠它，实测 11 格）；
+ * 速度上限 8/s（60fps 下单帧最多约 12.5%，再大就不像缩放了，是瞬移）。
  */
-/** 基准：0.95^2.94 ≈ 0.86，即一格 14%。 */
-const ZOOM_SPEED_BASE = 2.94;
-/** 连续滚动时的倍率上限（≈23%/格）。再快就不是缩放了，是瞬移。 */
-const ZOOM_BOOST_MAX = 1.7;
-/** 两次 wheel 间隔小于它才算"连续滚动"。 */
-const ZOOM_ACCEL_WINDOW_MS = 400;
-/** 每多一格加多少倍率。 */
-const ZOOM_BOOST_STEP = 0.16;
-/** 停手这么久就复位（验收要求"几百毫秒内"）。 */
-const ZOOM_RESET_MS = 320;
+/** wheel：每 CSS px 的 deltaY 折算成多少 1/s 的对数视距速度（一格 -120px ≈ 1.32/s）。 */
+const ZOOM_WHEEL_GAIN = 0.011;
+/** 速度的指数衰减率（1/s）：时间常数 ≈ 111ms。 */
+const ZOOM_DECAY = 9;
+/** 连续滚动时的速度倍率上限（滚得越快，同一格给的速度越高）。 */
+const ZOOM_BOOST_MAX = 2.2;
+/** 两次 wheel 的间隔按这个时间常数衰减来算"连续程度"（e 折，毫秒）。 */
+const ZOOM_BOOST_WINDOW_MS = 220;
+/** 速度上限（1/s）。 */
+const ZOOM_VELOCITY_MAX = 8;
+/** 速度小于它就归零，别让指数尾巴永远算下去。 */
+const ZOOM_VELOCITY_EPS = 0.002;
+/** 双指捏合：log(两指距离比) 折算成速度的增益（与 wheel 的"一格"同量级）。 */
+const ZOOM_PINCH_GAIN = 8;
 /** 距天体中心的最小距离基数（世界单位，改造前就是 1.15）。 */
 const MIN_DISTANCE_BASE = 1.15;
 /** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
@@ -1751,25 +1769,121 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   const returning = useRef(useSim.getState().switching === "toSandbox").current;
 
   /*
-   * 缩放加速状态（见文件上方 ZOOM_* 常量）：wheel 事件只更新这两个 ref，
-   * 真正的 zoomSpeed / minDistance 每帧写进 controls —— 这样 drei 重渲染把 props 刷回来也不怕。
+   * 缩放状态（t10 接管 dolly）：wheel / 捏合只把冲量写进 `zoomVelocity`，
+   * 真正的相机位移在 useFrame 里按帧积分 —— 事件频率和帧率因此解耦，
+   * 60fps / 120fps / 掉一帧都是同一条指数曲线，不会"一格一跳"。
    */
-  const zoomBoost = useRef(1);
-  const lastWheelAt = useRef(-1e9);
+  /** 1/s，正 = 拉远（deltaY > 0）。 */
+  const zoomVelocity = useRef(0);
+  /** 指针 NDC（朝指针缩放用）；active = 至少收到过一次指针位置。 */
+  const zoomPointer = useRef({ x: 0, y: 0, active: false });
+  const zoomLastWheelAt = useRef(-1e9);
+  /** 触摸捏合：两指 pointerId → 位置；两指都在时 active。 */
+  const pinch = useRef({ active: false, dist: 0, pointers: new Map<number, { x: number; y: number }>() });
   const gl = useThree((state) => state.gl);
   useEffect(() => {
     const el = gl.domElement;
-    const onWheel = () => {
+    const clampVelocity = (v: number) =>
+      Math.max(-ZOOM_VELOCITY_MAX, Math.min(ZOOM_VELOCITY_MAX, v));
+
+    /*
+     * wheel：只记冲量与指针位置，不碰相机（相机在帧里积分）。
+     * `passive` 是安全的：OrbitControls 的 enableZoom 已经是 false，它的 wheel 监听在
+     * `scope.enableZoom === false` 处直接 return，不会 preventDefault，也不会和这里抢；
+     * 页面本身不滚动（body overflow hidden）。
+     */
+    const onWheel = (ev: WheelEvent) => {
+      const controls = controlsRef.current;
+      // 聚焦动画（controls.enabled=false）/ 模式切换期间不接滚轮：别给动画攒动量
+      if (!controls || !controls.enabled || useSim.getState().switching !== null) return;
       const now = performance.now();
-      const gap = now - lastWheelAt.current;
-      lastWheelAt.current = now;
-      // 连续滚动：倍率 +0.16，封顶 1.7；停手后由 useFrame 里复位
-      zoomBoost.current =
-        gap < ZOOM_ACCEL_WINDOW_MS ? Math.min(ZOOM_BOOST_MAX, zoomBoost.current + ZOOM_BOOST_STEP) : 1;
+      const gap = now - zoomLastWheelAt.current;
+      zoomLastWheelAt.current = now;
+      // 连续滚：间隔越小倍率越高（e 折），滚得越快、同一段位移里速度叠加得越高
+      const boost = 1 + (ZOOM_BOOST_MAX - 1) * Math.exp(-Math.max(0, gap) / ZOOM_BOOST_WINDOW_MS);
+      // deltaMode：0 = 像素、1 = 行（≈16px）、2 = 页（≈100px）—— Firefox 会给 1/2
+      const px = ev.deltaY * (ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? 100 : 1);
+      zoomVelocity.current = clampVelocity(zoomVelocity.current + px * ZOOM_WHEEL_GAIN * boost);
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        zoomPointer.current.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+        zoomPointer.current.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+        zoomPointer.current.active = true;
+      }
     };
-    // passive：只观察，不拦 OrbitControls 自己的 wheel 处理
     el.addEventListener("wheel", onWheel, { passive: true });
-    return () => el.removeEventListener("wheel", onWheel);
+
+    /*
+     * 双指捏合（手机）：enableZoom=false 把 OrbitControls 的 pinch 也一起关了，
+     * 这里用同一套速度模型补回来 —— 两指中点当"指针"，张合速度 → 冲量。
+     */
+    const pinchDistance = () => {
+      const pts = [...pinch.current.pointers.values()];
+      return pts.length === 2 ? Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y) : 0;
+    };
+    const pointerFromPinch = () => {
+      const pts = [...pinch.current.pointers.values()];
+      const rect = el.getBoundingClientRect();
+      if (pts.length !== 2 || rect.width <= 0 || rect.height <= 0) return;
+      const mx = (pts[0].x + pts[1].x) / 2;
+      const my = (pts[0].y + pts[1].y) / 2;
+      zoomPointer.current.x = ((mx - rect.left) / rect.width) * 2 - 1;
+      zoomPointer.current.y = -((my - rect.top) / rect.height) * 2 + 1;
+      zoomPointer.current.active = true;
+    };
+    const onPinchDown = (ev: PointerEvent) => {
+      if (ev.pointerType !== "touch") return;
+      pinch.current.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      if (pinch.current.pointers.size === 2) {
+        pinch.current.active = true;
+        pinch.current.dist = pinchDistance();
+        pointerFromPinch();
+        /*
+         * 两指都在时必须关掉旋转：OrbitControls 的 enableZoom/enablePan 都关着，
+         * 它两指落下时直接 return、状态还停在一指的 TOUCH_ROTATE —— 不关旋转的话，
+         * 捏合的**中指漂移**会被当成转视角，第一下还可能因为 rotateStart 过期而跳一下。
+         */
+        const controls = controlsRef.current;
+        if (controls) controls.enableRotate = false;
+      }
+    };
+    const onPinchMove = (ev: PointerEvent) => {
+      if (!pinch.current.pointers.has(ev.pointerId)) return;
+      pinch.current.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+      if (!pinch.current.active) return;
+      const d = pinchDistance();
+      if (pinch.current.dist > 0 && d > 0) {
+        // 两指张开（d 变大）= 放大 = 视距变小 = 负速度；与 wheel 共用积分器
+        zoomVelocity.current = clampVelocity(
+          zoomVelocity.current - Math.log(d / pinch.current.dist) * ZOOM_PINCH_GAIN,
+        );
+        pinch.current.dist = d;
+      }
+      pointerFromPinch();
+    };
+    const onPinchEnd = (ev: PointerEvent) => {
+      pinch.current.pointers.delete(ev.pointerId);
+      if (pinch.current.pointers.size < 2) pinch.current.active = false;
+      // 全部抬起才把旋转还回去：留一指时状态还是过期的 TOUCH_ROTATE，开旋转会跳
+      if (pinch.current.pointers.size === 0) {
+        const controls = controlsRef.current;
+        if (controls && controls.enabled && useSim.getState().switching === null) {
+          controls.enableRotate = true;
+        }
+      }
+    };
+    el.addEventListener("pointerdown", onPinchDown);
+    // move/up 挂 window：手指可能在画布外抬起（OrbitControls 自己也是挂 ownerDocument 的）
+    window.addEventListener("pointermove", onPinchMove);
+    window.addEventListener("pointerup", onPinchEnd);
+    window.addEventListener("pointercancel", onPinchEnd);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("pointerdown", onPinchDown);
+      window.removeEventListener("pointermove", onPinchMove);
+      window.removeEventListener("pointerup", onPinchEnd);
+      window.removeEventListener("pointercancel", onPinchEnd);
+    };
   }, [gl]);
 
   /*
@@ -1808,6 +1922,9 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       home: new THREE.Vector3(),
       origin: new THREE.Vector3(),
       delta: new THREE.Vector3(),
+      /** 缩放：朝指针的射线方向 / 旧视轴（见 useFrame 里的 dolly 段） */
+      zoomDir: new THREE.Vector3(),
+      zoomFwd: new THREE.Vector3(),
     }),
     [],
   );
@@ -1914,35 +2031,67 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      */
 
     /*
-     * 缩放（t32）：每帧把倍率和最小距离写回控件。必须写在 drei 的 controls.update() 之前 ——
-     * 本回调是 -2 优先级，它的 update 是 0，所以这一帧就生效。
-     *  - 倍率 = 基准 × 连续滚动加速；停手 320ms 后复位（验收要求"几百毫秒内"）；
-     *  - 最小距离 = max(1.15, 最近天体半径 × 1.2)：滚到底也钻不进太阳里（1.2×3.8 = 4.56），
-     *    而 0.2 半径的小卫星下限仍是 1.15、它 1.7 的聚焦距离进得去。
-     */
-    if (performance.now() - lastWheelAt.current > ZOOM_RESET_MS) zoomBoost.current = 1;
-    /*
-     * 渐进逼近（t47）：越靠近天体，每一格的**步长**越小。
+     * ——— 缩放（t10 接管 dolly）：速度积分 ———
      *
-     * 先说失败过的一版：把 `minDistance` 写成 `hardMin + gap×0.75` 想让钳制面跟着距离收缩。
-     * 实测无效 —— OrbitControls 的 dolly 是"半径 ×= scale 再 clamp 到 minDistance"，
-     * 一旦被 clamp 就正好落在 minDistance 上，下一帧 gap 归零，还是硬墙（实测最后 12 格距离
-     * 一点没变，全停在 5.374）。
+     * wheel / 捏合只写 `zoomVelocity`（见上面的监听）。这里每帧：
+     *  1) 把速度按 exp(-λ·dt) 衰减；
+     *  2) 把剩余速度积成一段对数视距位移 exp(v·dt)，沿"指针射线"推相机，
+     *     再把 target 放回视轴上（= OrbitControls 的 zoomToCursor + screenSpacePanning 那一支）。
+     * 位置必须写在 drei 的 controls.update()（优先级 -1）之前 —— 本回调是 -2。
      *
-     * 现在改从**倍率**下手：靠近时把 zoomSpeed 线性压到 15%，步长随距离一起衰减，
-     * 于是画面越来越近、越来越慢，最后一格只走 0.09 个单位然后停住 —— 没有一下"跳开"。
-     * `minDistance` 仍然是硬底线（1.2×半径），它只负责"不许穿进去"，不再负责手感。
+     * 保留 t47 的三个语义：
+     *  - 硬底线 hardMin = max(1.15, 最近天体半径×1.2)：滚到底也钻不进太阳里（1.2×3.8 = 4.56），
+     *    而 0.2 半径的小卫星下限仍是 1.15、它 1.7 的聚焦距离进得去；
+     *  - 渐进阻力：越贴近底线，速度乘的阻力越小（SOFT_APPROACH_MIN = 0.12 是最后一格的步长下限），
+     *    "最后一格只走 0.09 个单位然后停住" 的手感不变，只是现在由速度衰减给出，不再靠 zoomSpeed；
+     *  - `?diag=1` 的 __solarPlace(ignoreMinDistance)：底线和阻力一起关掉，允许相机进球验收。
      */
-    const hardMin = Math.max(
-      MIN_DISTANCE_BASE,
-      nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
-    );
-    const gap = camera.position.distanceTo(controls.target) - hardMin;
-    const resistance = Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
-    controls.zoomSpeed = ZOOM_SPEED_BASE * zoomBoost.current * resistance;
-    // `?diag=1` 的 __solarPlace(..., { ignoreMinDistance }) 会打开这个开关，
-    // 把相机放进球体内部做"进天体"的验收；默认路径永远是 hardMin 硬底线。
-    controls.minDistance = DIAG_PLACE.ignoreMinDistance ? 0 : hardMin;
+    {
+      const dt = Math.min(raw, 0.1);
+      const hardMin = Math.max(
+        MIN_DISTANCE_BASE,
+        nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
+      );
+      const dist = camera.position.distanceTo(controls.target);
+      // 动画/切换期间 controls.enabled=false：不接动量，攒下来的也清零
+      let v = controls.enabled && switching === null ? zoomVelocity.current : 0;
+      if (Math.abs(v) > ZOOM_VELOCITY_EPS) {
+        const bypass = DIAG_PLACE.ignoreMinDistance;
+        const gap = Math.max(0, dist - hardMin);
+        const resistance = bypass
+          ? 1
+          : Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
+        // 只在"往里缩"时踩底线；往外拉永远不受下限影响（否则已经在里面时会被弹一下）
+        const floor = v < 0 ? (bypass ? 0 : hardMin) : 0;
+        const ceiling = controls.maxDistance;
+        const next = THREE.MathUtils.clamp(dist * Math.exp(v * resistance * dt), floor, ceiling);
+        // 顶到底线/远平面就把速度清掉：别"顶着墙攒动量"，松手后突然弹开
+        zoomVelocity.current =
+          (v < 0 && next <= floor + 1e-9) || (v > 0 && next >= ceiling - 1e-9)
+            ? 0
+            : v * Math.exp(-ZOOM_DECAY * dt);
+        if (next !== dist) {
+          // 旧视轴要在移动相机之前取；移动后 target 沿它放到 next 处
+          scratch.zoomFwd.copy(controls.target).sub(camera.position).normalize();
+          if (zoomPointer.current.active) {
+            // 朝指针缩放：相机沿"相机→指针"的射线走，target 再放回视轴
+            scratch.zoomDir
+              .set(zoomPointer.current.x, zoomPointer.current.y, 1)
+              .unproject(camera)
+              .sub(camera.position)
+              .normalize();
+          } else {
+            scratch.zoomDir.copy(scratch.zoomFwd);
+          }
+          camera.position.addScaledVector(scratch.zoomDir, dist - next);
+          controls.target.copy(camera.position).addScaledVector(scratch.zoomFwd, next);
+        }
+      } else {
+        zoomVelocity.current = 0;
+      }
+      // 底线同时写给控件：OrbitControls 的 update() 每帧还会再夹一次（跟随被拖进球里时靠它兜底）
+      controls.minDistance = DIAG_PLACE.ignoreMinDistance ? 0 : hardMin;
+    }
     /*
      * 拖拽速度随视距自适应（t55 B4）。
      *
@@ -2307,13 +2456,18 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
       const persp = camera as THREE.PerspectiveCamera;
       const target = controlsRef.current?.target ?? null;
       const p = new THREE.Vector3();
-      let nearest: { id: string; dist: number } | null = null;
+      /*
+       * `dist` 是到天体**球心**的距离（不是到表面），另带 `radius`——
+       * 「相机在不在球里」只需要 `dist < radius`，调用方不用再猜半径从哪拿。
+       * 加 radius 是 t10 的顺手（verify 的过渡断言要用；现有调用只读 id/dist，纯追加）。
+       */
+      let nearest: { id: string; dist: number; radius: number } | null = null;
       for (const b of bodies) {
         const g = reg.groups.get(b.id);
         if (!g) continue;
         g.getWorldPosition(p);
         const d = camera.position.distanceTo(p);
-        if (!nearest || d < nearest.dist) nearest = { id: b.id, dist: +d.toFixed(5) };
+        if (!nearest || d < nearest.dist) nearest = { id: b.id, dist: +d.toFixed(5), radius: b.radius };
       }
       return {
         target: target ? [+target.x.toFixed(4), +target.y.toFixed(4), +target.z.toFixed(4)] : null,
@@ -2915,12 +3069,13 @@ function Scene() {
         dampingFactor={0.09}
         rotateSpeed={0.55}
         /*
-         * zoomSpeed / minDistance 每帧由 SandboxCamera 重写（倍率要随连续滚动加速、
-         * 最小距离要跟着目标天体半径走）。这里的值只是首帧的起点。
-         * zoomToCursor：朝指针位置缩放，不用先把星球拖到画面中心再滚。
+         * 缩放由 SandboxCamera 自己接管（t10）：wheel/捏合 → 速度冲量 → 每帧积分。
+         * 这里必须关掉 enableZoom，否则 OrbitControls 会在自己的 wheel 监听里再乘一次
+         * scale（同一格被算两遍，而且又变回"一格一跳"）。
+         * 代价是它的双指 pinch 也一起关了 —— SandboxCamera 里用同一套速度模型补回来了。
+         * minDistance 仍由 SandboxCamera 每帧重写（跟着目标天体半径走），这里只是首帧起点。
          */
-        zoomSpeed={ZOOM_SPEED_BASE}
-        zoomToCursor
+        enableZoom={false}
         minDistance={MIN_DISTANCE_BASE}
         maxDistance={280}
         minPolarAngle={0.02}
