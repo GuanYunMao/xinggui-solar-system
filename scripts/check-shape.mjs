@@ -427,7 +427,7 @@ const CHECKS = [
     // 占位：周期一致性（开普勒 T²∝a³ 在压缩比例下必然不成立）**不在这里判**，等行为断言那层。
     expect:
       "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%、moon.inclination 5.145°、mercury.inclination 7.004°（各 ±5%），且 README.md 里同样印着前四个数；本影/偏移 与 周期一致性 明确未纳入（原因见输出）",
-    run(loaded) {
+    run(loaded, root) {
       const f = loaded.find((x) => x.file === "src/solar/data.ts");
       if (!f) {
         return { hits: [{ file: "src/solar/data.ts", line: 0, text: "读不到 data.ts，这条判不了" }], observed: "缺文件", ok: false, raw: 1 };
@@ -521,7 +521,9 @@ const CHECKS = [
       // 只匹配「数 + 单位」这种最紧的 token，不匹配整句：措辞可以改，数不许漂。
       let md = "";
       try {
-        md = readFileSync(path.join(ROOT, "README.md"), "utf8");
+        // 读「这次的 root」而不是写死仓库根：selftest 会把 README 拷进临时目录，
+        // 写死 root 会让注入永远改不到它（第 9 条踩过的同形坑）。
+        md = readFileSync(path.join(root ?? ROOT, "README.md"), "utf8");
       } catch {
         md = "";
       }
@@ -601,9 +603,16 @@ const CHECKS = [
     // 为什么要有这条：这轮开头最贵的发现就是「README 落后两版而零告警」——
     // 文档写着「线上正式版 1.1.6 / 开发中 1.2.0-snap.14」，实际已经 1.2.1 发布。
     // 版本号是**同一个事实的两个住处**（文档 / 包清单），必须机器对账，不能靠人记得改。
-    // 另外半条（「线上正式版」== 最新正式 release tag）只能在 CI 跑——本地没有 tag，
-    // 那半条在 .github/workflows/build.yml 里，且本地会明确打印「跳过」而不是静默。
+    // 另外半条（「线上正式版」== 线上的最新正式版）只能在 CI 判，见 .github/workflows/build.yml。
     // 只扫版本表那两行，**不依赖** README 里那张版本规则表（那张表可能被删成一句指路）。
+    //
+    // ⚠ 那半条**不能按 tag 判**，原因是结构性的，不是偶发污染：
+    //   CHANGELOG「版本号重置（2026-10-23）」写着 1.1.0→1.4.0 都是同一个太阳系里的修补，
+    //   后来判定用掉四个号是错的、全部并回 1.0.1，而「历史的 v1.1.0–v1.4.0 git tag 与 release
+    //   保留作档案，不再更新」。所以本地确实存在 v1.3.0 / v1.4.0 这些**墓碑**，
+    //   **`v1.4.0` 不是比 1.2.1 更高的版本**——按字典序取最大 tag 会永远取到它。
+    //   正确的口径是 `releases/latest`（release 是发布事实，tag 是代码标记，两者可以不等）。
+    //   **看到闸红时不要去把 README 改成 1.4.0**——那个方向比红着更坏：它把墓碑扶成事实。
     expect: "README 版本表「开发中」行的版本号，与 package.json 的 version 逐字相等（含 -snap.N 后缀）",
     run(loaded, root) {
       const dir = root ?? ROOT;
@@ -747,8 +756,16 @@ function printReport({ results, manifest }, { root }) {
 // ——— --selftest：证明每条判据都有牙齿 ————————————————
 /**
  * 在临时副本里故意重引入一份「第二真相」，断言对应判据确实变红。
- * 覆盖六条各一次（#3 允许 ≤2、#4 允许 ≤1，所以要注入到跨过阈值）。
+ * 覆盖每条判据至少一次（#3 允许 ≤2、#4 允许 ≤1，所以要注入到跨过阈值）。
+ *
+ * **自证规则（三次同形翻车换来的）**：注入这一步必须证明自己真的落到了目标上——
+ *   ① 文件集合要自证（拷进临时目录后逐字节比对，见 SELFTEST_EXTRA_FILES 那段）；
+ *   ② 注入要自证（改完读回来，内容必须真的变了、且含有要注入的东西）；
+ *   ③ 投不到就 throw，不许静默继续。
+ * 三次翻车的形状是同一个：raw 不单调（#7/#9）、只追加不替换（#7）、
+ * 只拷 SCAN_FILES 而判据读的是 README/package.json（#9）——都是"注入没落地还判绿"。
  */
+const SELFTEST_EXTRA_FILES = ["README.md", "package.json"];
 const SELFTEST_CASES = [
   {
     id: 1,
@@ -819,21 +836,45 @@ function selftest() {
       }
       // 第 9 条的对账对象不在 src 里：版本表在 README.md、版本号在 package.json。
       // selftest 要把它们也拷进临时目录，否则注入改不到、判据永远绿（又是"假证明"）。
-      for (const rel of ["README.md", "package.json"]) {
+      for (const rel of SELFTEST_EXTRA_FILES) {
         cpSync(path.join(ROOT, rel), path.join(dir, rel));
       }
+      /*
+       * 拷贝清单**自证**：只"拷了"不等于"拷到了"。
+       * 这一条来自三次同形的翻车（raw 不单调 / 只追加不替换 / 只拷 SCAN_FILES），
+       * 共同形状都是「注入这一步没有证明自己真的落到目标上」。
+       * 所以凡是判据要读的文件，拷完逐字节比对；不一致就 throw，不许静默继续。
+       */
+      for (const rel of SELFTEST_EXTRA_FILES) {
+        const srcBuf = readFileSync(path.join(ROOT, rel));
+        const dstBuf = readFileSync(path.join(dir, rel));
+        if (!srcBuf.equals(dstBuf)) {
+          throw new Error(`[selftest] 拷贝自证失败：${rel} 拷进临时目录后与源文件不一致（判据读到的不是源文件的副本）`);
+        }
+      }
       const target = path.join(dir, test.file);
+      const beforeText = readFileSync(target, "utf8");
       // 两种注入方式：
       //   inject  —— 往文件末尾追加（适合"在别处再写一份"这类第二真相）
       //   replace —— 就地改一个常数（适合"把 5.1° 改成 11°"这类，追加改不动第一次出现的值）
-      // replace 找不到目标时**直接抛错**：否则注入悄悄没生效、判据照样绿，selftest 就变成了假证明。
       if (test.replace) {
-        const before = readFileSync(target, "utf8");
-        const after = before.replace(test.replace[0], test.replace[1]);
-        if (after === before) throw new Error(`[${test.id}] 注入无效：找不到 ${test.replace[0]}`);
-        writeFileSync(target, after);
+        const patched = beforeText.replace(test.replace[0], test.replace[1]);
+        if (patched === beforeText) throw new Error(`[${test.id}] 注入无效：找不到 ${test.replace[0]}`);
+        writeFileSync(target, patched);
       } else {
-        writeFileSync(target, readFileSync(target, "utf8") + test.inject);
+        writeFileSync(target, beforeText + test.inject);
+      }
+      // 注入也要**自证**：改完重新读回来，内容必须真的变了、且真的含有要注入的东西。
+      // 不做这一步，注入失手时判据照样绿，selftest 就成了自我证明失败。
+      const afterText = readFileSync(target, "utf8");
+      if (afterText === beforeText) {
+        throw new Error(`[${test.id}] 注入自证失败：${test.file} 内容没变`);
+      }
+      if (test.inject && !afterText.includes(test.inject.trim())) {
+        throw new Error(`[${test.id}] 注入自证失败：${test.file} 里找不到注入内容`);
+      }
+      if (test.replace && !afterText.includes(test.replace[1])) {
+        throw new Error(`[${test.id}] 注入自证失败：${test.file} 里找不到替换后的内容 ${test.replace[1]}`);
       }
       const after = runChecks(dir, SCAN_FILES);
       const b = base.results.find((r) => r.check.id === test.id);
