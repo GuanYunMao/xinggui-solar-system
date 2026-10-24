@@ -1,4 +1,4 @@
-import { ChevronRight, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
+import { ChevronRight, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
@@ -630,6 +630,194 @@ function LayerKey({ label, pressed, onToggle, icon }: { label: string; pressed: 
   );
 }
 
+/* ── 设定时刻（t49）：把 store 的 `setSimTime` 接到界面上 ── */
+
+/**
+ * 显示用的年长是 **365 天** —— 必须和 `formatEpoch` 的分母一致。
+ * 用 365.25 的话，连按四次「+1 年」会多出一天，读数会被自己打脸（"3 年 1 日"）。
+ * 历法里没有"月"，所以一步月取 1/12 年 = 30.4167 天：它是"十二个月的年"里的那个月，
+ * 不是日历月 —— 真要日历月，得先有真日历（见 store 里 SIM_EPOCH_MS 那段警告）。
+ */
+const DAYS_PER_YEAR = 365;
+const DAYS_PER_MONTH = DAYS_PER_YEAR / 12;
+
+/** 模拟日 → 模拟秒。用 store 导出的 `daysOf` 反推，**不重写压缩常数**。 */
+function simSecondsOfDays(days: number) {
+  return days / daysOf(1);
+}
+
+/** 距离历元的日数 → 历法年/日。与 `formatEpoch` 同一套算法，所以回读永远对得上。 */
+function splitEpoch(days: number) {
+  const total = Math.max(0, Math.floor(days));
+  const years = Math.floor(total / DAYS_PER_YEAR);
+  return { years, days: total - years * DAYS_PER_YEAR };
+}
+
+/** 相对拨动的步长（天）。负数往回拨，但不许早于历元。 */
+const TIME_STEPS = [
+  { label: "-1 年", days: -DAYS_PER_YEAR },
+  { label: "-1 月", days: -DAYS_PER_MONTH },
+  { label: "-1 天", days: -1 },
+  { label: "+1 天", days: 1 },
+  { label: "+1 月", days: DAYS_PER_MONTH },
+  { label: "+1 年", days: DAYS_PER_YEAR },
+] as const;
+
+/**
+ * 「设定时刻」。入口是底栏速度行右侧那颗时计键 —— 时间的两件事（跑多快、从哪里开始）
+ * 放在同一行，是仪表台的习惯：同一量纲的控件相邻，换一行找就是另一件事了。
+ *
+ * 两种拨法：
+ *  - **绝对**：填「年 / 日」再「应用」。年月日这套就是 HUD 模拟历自己的格式，
+ *    `splitEpoch` 与 `formatEpoch` 共用 365 天年长，所以填什么、显示什么一致。
+ *  - **相对**：±1 天 / ±1 月 / ±1 年，一步一次、立刻生效，不用确认。
+ *
+ * 不给早于历元的时刻：读数只会显示「第 N 日」，负数会被显示层夹成 0 —— 那是在撒谎。
+ */
+function TimeSetter({ disabled }: { disabled: boolean }) {
+  const days = useSim((state) => state.days);
+  const setSimTime = useSim((state) => state.setSimTime);
+  const [open, setOpen] = useState(false);
+  const [draftYear, setDraftYear] = useState("0");
+  const [draftDay, setDraftDay] = useState("0");
+  /** 用户改过输入框之前，字段跟着时钟走；改过之后就不许再被覆盖（否则打到一半的字被抹掉）。 */
+  const [edited, setEdited] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // 面板开着、用户还没动手时，把「当前」同步进输入框：仪表上的数字该是活的钟，不是快照。
+  useEffect(() => {
+    if (!open || edited) return;
+    const now = splitEpoch(days);
+    setDraftYear(String(now.years));
+    setDraftDay(String(now.days));
+  }, [open, edited, days]);
+
+  // 切换模式期间禁「拨时间」：相机正在换系统，此时改时间等于在动画中途换片场
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (panelRef.current && !panelRef.current.contains(target)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "Escape") setOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const jumpTo = (targetDays: number) => {
+    setSimTime(simSecondsOfDays(Math.max(0, targetDays)));
+  };
+
+  const bump = (deltaDays: number) => {
+    // 相对拨动用 store 里的精确 simSeconds，不用被节流过的 days（那最多差 0.25 秒）
+    jumpTo(daysOf(useSim.getState().simSeconds) + deltaDays);
+  };
+
+  const applyDraft = () => {
+    const years = Math.min(9999, Math.max(0, Math.floor(Number(draftYear) || 0)));
+    const rest = Math.min(DAYS_PER_YEAR - 1, Math.max(0, Math.floor(Number(draftDay) || 0)));
+    jumpTo(years * DAYS_PER_YEAR + rest);
+    setEdited(false); // 应用完回到跟随模式：下一个读数由时钟接管
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        className={`hud-btn inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md border ${
+          open ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
+        } ${disabled ? "opacity-40" : ""}`}
+        aria-label="设定时刻"
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-disabled={disabled}
+        onClick={() => {
+          if (disabled) return;
+          if (!open) setEdited(false); // 每次打开都从"跟随时钟"开始
+          setOpen((prev) => !prev);
+        }}
+      >
+        <Clock className="size-4" />
+      </button>
+
+      {open && (
+        <div
+          ref={panelRef}
+          data-overlay-open="true"
+          role="dialog"
+          aria-label="设定时刻"
+          className="panel-in absolute right-2 bottom-full z-20 mb-2 w-72 max-w-[calc(100vw-1rem)] rounded-xl border border-line bg-elevated p-2"
+        >
+          <p className="px-1 text-xs text-muted">设定时刻</p>
+          <p className="px-1 pb-2 text-sm tabular-nums text-fg">当前 {formatEpoch(days)}</p>
+          <div className="flex items-end gap-1.5">
+            <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs text-muted">
+              年
+              <input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                step={1}
+                value={draftYear}
+                onChange={(event) => {
+                  setEdited(true);
+                  setDraftYear(event.target.value);
+                }}
+                className="hud-btn h-11 w-full rounded-md border border-line bg-bg px-2 text-sm tabular-nums text-fg"
+              />
+            </label>
+            <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs text-muted">
+              日
+              <input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                max={DAYS_PER_YEAR - 1}
+                step={1}
+                value={draftDay}
+                onChange={(event) => {
+                  setEdited(true);
+                  setDraftDay(event.target.value);
+                }}
+                className="hud-btn h-11 w-full rounded-md border border-line bg-bg px-2 text-sm tabular-nums text-fg"
+              />
+            </label>
+            <button
+              type="button"
+              className="hud-btn h-11 shrink-0 rounded-md bg-accent px-3 text-sm text-accent-fg"
+              onClick={applyDraft}
+            >
+              应用
+            </button>
+          </div>
+          <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+            {TIME_STEPS.map((step) => (
+              <button
+                key={step.label}
+                type="button"
+                className="hud-btn h-11 rounded-md border border-line text-sm tabular-nums text-fg"
+                onClick={() => bump(step.days)}
+              >
+                {step.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 /**
  * 底栏只在沙盘。四样东西各有理由：
  * - 速度滑条 / 暂停：实境的模拟时间不前进（look.freezesTime = true，推进在生产端被跳过），
@@ -655,6 +843,8 @@ function Dock({ compact }: { compact: boolean }) {
   const toggleOrbits = useSim((state) => state.toggleOrbits);
   const toggleTrails = useSim((state) => state.toggleTrails);
   const requestReset = useSim((state) => state.requestReset);
+  /** 切换模式期间禁拨时间（相机正在换系统，此时改时间等于在动画中途换片场）。 */
+  const switching = useSim((state) => state.switching);
   const [layerOpen, setLayerOpen] = useState(false);
   const sheetRef = useRef<HTMLDivElement>(null);
 
@@ -693,33 +883,37 @@ function Dock({ compact }: { compact: boolean }) {
   return (
     <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
       {/*
-        速度：对数档位（0.05→8 共 8 档）。
-        滑条值 = 档位下标（0..7），**回读时从实际速度反推下标** —— store 把 0.05 夹成 0.2 时，
-        旋钮会退回 0.2 那一档，而不是停在一个不存在的档上假装能到。
+        速度 + 时刻：两个控件同属"时间"这一量纲，放在同一行。
+        滑条值 = 档位下标，回读时从实际速度反推 —— store 把 0.05 夹成 0.2 时，旋钮会退回
+        0.2 那一档，而不是停在一个不存在的档上假装能到。
+        读数在 label 外面：label 里放按钮会让"点读数"顺带触发滑条。
       */}
-      <label className="flex items-center gap-3">
-        <span className="w-10 shrink-0 text-sm text-muted">速度</span>
-        <input
-          className="speed-range min-w-0 flex-1"
-          type="range"
-          min={0}
-          max={SPEED_STOPS.length - 1}
-          step={1}
-          value={stopIndexOf(speed)}
-          aria-valuemin={SPEED_STOPS[0]}
-          aria-valuemax={SPEED_MAX}
-          aria-valuenow={speed}
-          aria-valuetext={`1 秒 = ${rate.value} ${rate.unit}`}
-          aria-label="模拟速度"
-          onChange={(event) => setSpeed(SPEED_STOPS[Number(event.target.value)] ?? speed)}
-        />
+      <div className="flex items-center gap-3">
+        <label className="flex min-w-0 flex-1 items-center gap-3">
+          <span className="w-10 shrink-0 text-sm text-muted">速度</span>
+          <input
+            className="speed-range min-w-0 flex-1"
+            type="range"
+            min={0}
+            max={SPEED_STOPS.length - 1}
+            step={1}
+            value={stopIndexOf(speed)}
+            aria-valuemin={SPEED_STOPS[0]}
+            aria-valuemax={SPEED_MAX}
+            aria-valuenow={speed}
+            aria-valuetext={`1 秒 = ${rate.value} ${rate.unit}`}
+            aria-label="模拟速度"
+            onChange={(event) => setSpeed(SPEED_STOPS[Number(event.target.value)] ?? speed)}
+          />
+        </label>
         <span className="flex w-20 shrink-0 flex-col items-end justify-center leading-tight">
           <span className="text-xs tabular-nums text-fg">
             1 秒 = {rate.value} {rate.unit}
           </span>
           <span className="text-[10px] tabular-nums text-subtle">{formatMultiplier(speed)}</span>
         </span>
-      </label>
+        <TimeSetter disabled={switching !== null} />
+      </div>
 
       {compact ? (
         <>
