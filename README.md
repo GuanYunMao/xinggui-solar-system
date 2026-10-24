@@ -21,6 +21,7 @@
 | | |
 | --- | --- |
 | 线上正式版 | **1.2.1**（`releases/latest` 指向它，tag `v1.2.1`） |
+| 开发中 | **1.3.0-snap.1**（快照：只出 Actions artifact，不建 release、不动 latest；7 天内合并或删除） |
 | 产物 | `release/巡星.html`（单文件）、`release/site/`（静态站点） |
 
 固定下载地址，跨版本不变：
@@ -150,12 +151,14 @@ scripts/             构建、打包、验收、截图（详见 scripts/README.m
 
 版本号只有一个来源：`package.json` 的 `version`。界面左上角的版本、CI 打的 tag、release 标题都从它取，改版本就是改这一处。
 
+> 规则的正本在 [CHANGELOG.md](CHANGELOG.md) 的「版本规则」一节；下面这张是速查，**两处不一致时以 CHANGELOG 为准**。
+
 | 号 | 含义 | 发布方式 |
 | --- | --- | --- |
 | `X.0.0` | 代际（测绘 → 远征） | release + latest |
 | `1.X.0` | 结构性 / 能力变化 | release + latest |
 | `1.0.X` | bug 与小改动混编 | release + latest |
-| `1.0.X-snap.N` | 随手改的小东西，不占正式号 | 只出 Actions artifact，不建 release |
+| `X.Y.Z-snap.N` | 小改动，或还没验收完的结构性改动的预览；不占正式号 | 只出 Actions artifact，不建 release |
 
 CI 在 `.github/workflows/build.yml`：push 到 `main` → `npm ci` → `npm run build` → 按 `package.json` 的版本号打 `v<版本>` tag、用 `releaseNote` 拼标题、上传 `xinggui.html`。不需要本地打包再手动传。版本历史见 [CHANGELOG.md](CHANGELOG.md) 与 GitHub Releases。
 
