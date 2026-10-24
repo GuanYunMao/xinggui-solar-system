@@ -960,6 +960,307 @@ try {
     failures.push(`zoom-budget: ${err.message}`);
   }
   await zbCtx.close();
+
+  // ═══ 太阳遮挡（t42 的守卫）+ 启动分期（t41）+ 相机避让测量（t47 的基线）═══
+  //
+  // 三条的分类不一样，别混：
+  //  · 太阳遮挡 = **结构量**，判红：光晕 Sprite 的 depthTest 一旦被改回 false，
+  //    木星哪怕挡在太阳前面，中心也会被那颗亮核穿透（t42 实测改前 171.3 / 改后 18.9）。
+  //  · 启动分期 = 半结构：`__solarReady` 只在全量置位（用 belt 可观测），长任务**只记录**
+  //    ——那台机器上长任务判据分不出启动和稳态（已有结论），拿它判红就是重犯 26ms 的错。
+  //  · 相机避让 = **只测量**：t47 还没落地，现在还没有"多少算跳变"的依据，先攒基线。
+  const SUN_JUP_ALIGN_PX = 12; // 太阳中心落进木星盘面中心的判据（盘半径 r≈171px，很宽松）
+  const OCCLUSION_LUM_MAX = 60; // 设计口径：被挡住时中心亮度应明显低于"透亮核"（改前 171.3）
+  const EARTH_RADIUS_WORLD = 0.76; // src/solar/data.ts 的 earth.radius（天体数值改动须 captain 批）
+  const CLEARANCE_FRAMES = 260; // ≈1.7 个公转周期（月球 period 2.55，speed 1 时 1 单位≈1 秒）
+
+  /** 取某几个天体的候选（拾取器会把相机背后的天体剔除，所以 sun 可能是 null） */
+  const candidatesOf = (page, ids) =>
+    page.evaluate((ids) => {
+      const cs = window.__solarPick?.candidates?.() ?? [];
+      const out = {};
+      for (const id of ids) {
+        const c = cs.find((x) => x.id === id);
+        out[id] = c ? { x: +c.x.toFixed(1), y: +c.y.toFixed(1), r: +c.radiusPx.toFixed(1), d: +c.depth.toFixed(3) } : null;
+      }
+      return { ...out, total: cs.length };
+    }, ids);
+
+  /** 以 (cx,cy) 为中心采 size×size 的亮度（CSS px，内部换算设备像素与 Y 轴翻转） */
+  const boxLuma = (page, cx, cy, size) =>
+    page.evaluate(
+      async ({ cx, cy, size }) => {
+        const canvas = document.querySelector("canvas");
+        const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+        const scale = canvas.width / canvas.clientWidth;
+        const n = Math.max(2, Math.round(size * scale));
+        const x = Math.round(cx * scale - n / 2);
+        const y = Math.round(canvas.height - cy * scale - n / 2);
+        await new Promise((r) => requestAnimationFrame(() => r()));
+        const buf = new Uint8Array(n * n * 4);
+        gl.readPixels(x, y, n, n, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i += 4) {
+          sum += 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2];
+        }
+        return +(sum / (n * n)).toFixed(2);
+      },
+      { cx, cy, size },
+    );
+
+  // ——— ① 太阳被木星挡住时必须变暗 ———
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    const errs = [];
+    page.on("pageerror", (e) => errs.push(e.message));
+    page.on("console", (m) => m.type() === "error" && errs.push(m.text()));
+    try {
+      await page.goto(withDiag(base), { waitUntil: "load" });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      await page.waitForTimeout(800);
+      // 机位不硬编码：先点木星芯片让它成为跟随目标，再等聚焦动画收敛
+      await page.locator("#chip-jupiter").click();
+      let prevDepth = -1;
+      for (let i = 0; i < 40; i++) {
+        await page.waitForTimeout(200);
+        const c = await candidatesOf(page, ["jupiter"]);
+        if (c.jupiter && Math.abs(c.jupiter.d - prevDepth) < 0.01) break;
+        prevDepth = c.jupiter?.d ?? -1;
+      }
+      // 闭环把太阳拖到木星盘面中心（两轴分别自适应符号与步长）。
+      // 拖动量由**实测屏幕坐标**算出来，所以换视口/换 dpr 仍然成立。
+      const sign = { x: 1, y: 1 };
+      const prevAbs = { x: Infinity, y: Infinity };
+      let aligned = false;
+      let finalState = null;
+      for (let iter = 0; iter < 26; iter++) {
+        const st = await candidatesOf(page, ["jupiter", "sun"]);
+        finalState = st;
+        if (!st.jupiter) break;
+        if (!st.sun) {
+          // 太阳在相机背后（拾取器剔除）：先绕一大步把它找回来
+          await page.mouse.move(640, 400);
+          await page.mouse.down();
+          await page.mouse.move(640 + 200 * sign.x, 400, { steps: 10 });
+          await page.mouse.up();
+          await page.waitForTimeout(140);
+          continue;
+        }
+        const dx = st.sun.x - st.jupiter.x;
+        const dy = st.sun.y - st.jupiter.y;
+        if (Math.hypot(dx, dy) < SUN_JUP_ALIGN_PX && st.sun.d > st.jupiter.d) {
+          aligned = true;
+          break;
+        }
+        if (Math.abs(dx) > 6) {
+          if (Math.abs(dx) > prevAbs.x) sign.x = -sign.x;
+          prevAbs.x = Math.abs(dx);
+        }
+        if (Math.abs(dy) > 6) {
+          if (Math.abs(dy) > prevAbs.y) sign.y = -sign.y;
+          prevAbs.y = Math.abs(dy);
+        }
+        const sx = Math.abs(dx) > 6 ? Math.max(-260, Math.min(260, -dx * 0.55 * sign.x)) : 0;
+        const sy = Math.abs(dy) > 6 ? Math.max(-260, Math.min(260, -dy * 0.55 * sign.y)) : 0;
+        await page.mouse.move(640, 400);
+        await page.mouse.down();
+        await page.mouse.move(640 + sx, 400 + sy, { steps: 12 });
+        await page.mouse.up();
+        await page.waitForTimeout(140);
+      }
+      const st = (await candidatesOf(page, ["jupiter", "sun"])) ?? finalState;
+      const lum = st.jupiter ? await boxLuma(page, st.jupiter.x, st.jupiter.y, 24) : null;
+      const deltaPx = st.jupiter && st.sun ? +Math.hypot(st.sun.x - st.jupiter.x, st.sun.y - st.jupiter.y).toFixed(1) : null;
+      const sunBehind = st.jupiter && st.sun ? st.sun.d > st.jupiter.d : null;
+      results.push({
+        pass: "sun-occlusion",
+        aligned,
+        deltaPx,
+        sunBehind,
+        sunDepth: st.sun?.d ?? null,
+        jupiterDepth: st.jupiter?.d ?? null,
+        jupiterRadiusPx: st.jupiter?.r ?? null,
+        centerBoxLum: lum,
+        lumMax: OCCLUSION_LUM_MAX,
+        box: "24×24 @ 木星投影中心",
+        errors: errs,
+      });
+      if (lum === null) {
+        failures.push("sun-occlusion: 拿不到木星候选，采不到中心亮度");
+      } else if (!aligned) {
+        // 没对齐就不判：这条判据只在「太阳正被木星挡住」时有意义，
+        // 对齐失败时判红等于把夹具自己的收敛问题算成产品回归（记下来，别静默通过）
+        console.error(`（注意）sun-occlusion: 未对齐（Δ=${deltaPx}px, sunBehind=${sunBehind}），本轮不判红，中心亮度记录 ${lum}`);
+      } else if (lum > OCCLUSION_LUM_MAX) {
+        failures.push(
+          `sun-occlusion: 太阳被木星挡住时中心亮度 ${lum} > ${OCCLUSION_LUM_MAX}` +
+            `（Δ=${deltaPx}px, sun.depth ${st.sun?.d} > 木星 ${st.jupiter?.d}）—— 光晕又穿透了？看 depthTest`,
+        );
+      }
+      if (errs.length) failures.push(`sun-occlusion: 控制台/页面报错 ${errs.length} 条`);
+    } catch (err) {
+      failures.push(`sun-occlusion: ${err.message}`);
+    }
+    await ctx.close();
+  }
+
+  // ——— ② 启动分期仍然成立 ———
+  {
+    const LT_INIT = () => {
+      window.__lt = [];
+      try {
+        new PerformanceObserver((list) => {
+          for (const e of list.getEntries()) window.__lt.push({ start: e.startTime, dur: e.duration });
+        }).observe({ type: "longtask", buffered: true });
+      } catch {
+        window.__lt = null;
+      }
+    };
+    const stages = [];
+    for (const q of ["", "?bootstage=1", "?bootstage=2", "?bootstage=3"]) {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+      const page = await ctx.newPage();
+      await page.addInitScript(LT_INIT);
+      const t0 = Date.now();
+      try {
+        await page.goto(`${base}${q ? `${q}&` : "?"}diag=1`, { waitUntil: "load" });
+        let ready = true;
+        try {
+          await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 20000 });
+        } catch {
+          ready = false;
+        }
+        const elapsedMs = Date.now() - t0;
+        await page.waitForTimeout(600);
+        const info = await page.evaluate(() => {
+          const lt = window.__lt ?? [];
+          const look = window.__solarLook?.();
+          const cs = window.__solarPick?.candidates?.() ?? [];
+          return {
+            ltCount: lt.length,
+            ltTotalMs: +lt.reduce((a, e) => a + e.dur, 0).toFixed(0),
+            ltMaxMs: +Math.max(0, ...lt.map((e) => e.dur)).toFixed(0),
+            bodies: cs.length,
+            belt: Boolean(look?.mounted?.belt),
+            clouds: look?.mounted?.clouds ?? null,
+          };
+        });
+        stages.push({ query: q || "(默认)", ready, elapsedMs, ...info });
+        await page.screenshot({ path: path.join(SHOTS, `boot-${q ? q.replace("?bootstage=", "stage") : "default"}.png`) });
+      } catch (err) {
+        stages.push({ query: q || "(默认)", error: err.message });
+      }
+      await ctx.close();
+    }
+    results.push({ pass: "boot-stage", stages, judged: "天体数 / ready 时 belt；长任务只记录" });
+    const def = stages.find((s) => s.query === "(默认)");
+    if (!def || def.error) {
+      failures.push(`boot-stage: 默认路径测不到（${def?.error ?? "缺记录"}）`);
+    } else {
+      if (!def.ready) failures.push("boot-stage: 默认路径 20s 内 __solarReady 未置位");
+      // ready 只在全量置位 → 到那一刻小行星带（stage3 才有）必须已经挂上
+      if (!def.belt) failures.push("boot-stage: ready 时 belt 还没挂 —— ready 提前置位了？");
+      if (def.bodies !== 15) failures.push(`boot-stage: 默认路径探针只有 ${def.bodies} 个天体（应 15）`);
+    }
+    for (const s of stages) {
+      if (s.error) continue;
+      if (s.bodies !== 15) {
+        failures.push(`boot-stage: ${s.query} 只挂到 ${s.bodies} 个天体（应 15 —— 分期不该少画天体）`);
+      }
+    }
+    const pinned = stages.filter((s) => s.query !== "(默认)" && !s.error);
+    if (pinned.length === 3) {
+      const st3 = pinned.find((s) => s.query.includes("3"));
+      const st12 = pinned.filter((s) => !s.query.includes("3"));
+      if (st3 && !st3.belt) failures.push("boot-stage: ?bootstage=3 钉全量时 belt 没挂");
+      for (const s of st12) {
+        if (s.belt) failures.push(`boot-stage: ${s.query} 不应该有小行星带（那是第 3 期）`);
+      }
+    }
+  }
+
+  // ——— ③ 相机避让：先只测量（t47 的基线）———
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    try {
+      await page.goto(withDiag(base), { waitUntil: "load" });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      await page.waitForTimeout(1200);
+      // 卫星行是条件渲染：先选地球，`#chip-moon` 才出现（Hud.tsx:308）
+      await page.locator("#chip-earth").click();
+      await page.waitForTimeout(2200);
+      const hasMoonChip = (await page.locator("#chip-moon").count()) > 0;
+      if (hasMoonChip) await page.locator("#chip-moon").click();
+      await page.waitForTimeout(2800);
+      const before = await candidatesOf(page, ["moon", "earth"]);
+      // 按**模拟时间**跑满一个公转周期，不按帧数：
+      // 无 vsync 时 rAF 能飙到上千帧/秒（实测 260 帧只推进 0.24 个模拟单位，而同一段代码
+      // 在 60fps 下 260 帧走 4.33 个单位）。按帧数采样会让"跑满一个周期"变成随缘。
+      const series = await page.evaluate(async () => {
+        const out = [];
+        const t = window.__solarTime;
+        const t0 = t.now();
+        const wall0 = performance.now();
+        while (out.length < 3000) {
+          await new Promise((r) => requestAnimationFrame(r));
+          const cs = window.__solarPick?.candidates?.() ?? [];
+          const earth = cs.find((c) => c.id === "earth");
+          out.push({ d: earth ? earth.depth : null, t: t.now() - t0 });
+          if (t.now() - t0 >= 2.6 || performance.now() - wall0 > 25000) break; // ≥ 一个周期 / 或超时
+        }
+        return out;
+      });
+      const depths = series.map((s) => s.d).filter((d) => d !== null);
+      const simSpan = series.at(-1)?.t ?? 0;
+      const jumpPerFrame = [];
+      const jumpPerSim = [];
+      for (let i = 1; i < series.length; i++) {
+        const a = series[i - 1];
+        const b = series[i];
+        if (a.d === null || b.d === null) continue;
+        const dd = Math.abs(b.d - a.d);
+        const dt = b.t - a.t;
+        jumpPerFrame.push(dd);
+        if (dt > 1e-6) jumpPerSim.push(dd / dt);
+      }
+      const sortedJ = [...jumpPerFrame].sort((x, y) => x - y);
+      const medianJ = sortedJ[Math.floor(sortedJ.length / 2)] ?? 0;
+      const minDepth = depths.length ? Math.min(...depths) : null;
+      const clearance = {
+        pass: "camera-clearance",
+        moonChip: hasMoonChip,
+        frames: series.length,
+        simSpan: +simSpan.toFixed(2), // 应 ≥2.55（一个公转周期）
+        moonRadiusPx: before.moon?.r ?? null,
+        moonDepth: before.moon?.d ?? null,
+        earthDepthMin: minDepth === null ? null : +minDepth.toFixed(3),
+        earthDepthMax: depths.length ? +Math.max(...depths).toFixed(3) : null,
+        jumpMaxPerFrame: jumpPerFrame.length ? +Math.max(...jumpPerFrame).toFixed(4) : null,
+        jumpP95PerFrame: +(sortedJ[Math.floor(sortedJ.length * 0.95)] ?? 0).toFixed(4),
+        jumpMedianPerFrame: +medianJ.toFixed(4),
+        jumpMaxPerSimUnit: jumpPerSim.length ? +Math.max(...jumpPerSim).toFixed(4) : null, // 与帧率无关
+        insideEarth: minDepth === null ? null : minDepth < EARTH_RADIUS_WORLD,
+        clampLine: +(EARTH_RADIUS_WORLD * 1.35).toFixed(3), // 产品当前的钳制半径（SolarCanvas clampOutsideParent）
+        note: "只测量不判红：t47 落地后再定阈值；jumpMaxPerSimUnit 是换算到同一模拟时间尺度的跳变",
+      };
+      results.push(clearance);
+      if (!hasMoonChip) console.error("（注意）camera-clearance: 选中地球后没有 chip-moon，测的是未聚焦状态");
+      if (series.length < 10) console.error("（注意）camera-clearance: 没采到样本");
+      else if (clearance.simSpan < 2.5) {
+        console.error(`（注意）camera-clearance: 只推进了 ${clearance.simSpan} 个模拟单位（不足一个周期），基线不完整`);
+      } else if (clearance.insideEarth) {
+        // 虽然"只测量"，但「相机进到地球内部」是硬伤（画面上整颗地球会消失），记成失败更诚实
+        failures.push(
+          `camera-clearance: 跟随月球时相机进到地球内部（地心距离 ${clearance.earthDepthMin} < 半径 ${EARTH_RADIUS_WORLD}）`,
+        );
+      }
+    } catch (err) {
+      failures.push(`camera-clearance: ${err.message}`);
+    }
+    await ctx.close();
+  }
 } finally {
   await browser.close();
   server.close();
