@@ -50,6 +50,8 @@ const SOL_SYSTEM: SystemSpec = {
     labels: true,
     decor: true,
     orbitLines: true,
+    /* t24：沙盘是示意图，轨道回到正圆共面（倾角值仍留在 data.ts，实境才用）。 */
+    flatOrbits: true,
     freezesTime: false,
     refineGeometry: false,
     camera: "sandbox",

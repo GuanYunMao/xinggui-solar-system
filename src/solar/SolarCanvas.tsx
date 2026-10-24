@@ -562,7 +562,13 @@ function Simulation({ ready = true }: { ready?: boolean }) {
           const angle = (t / body.period) * Math.PI * 2 + body.phase;
           const lx = Math.cos(angle) * body.orbitRadius;
           const lz = Math.sin(angle) * body.orbitRadius;
-          group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+          /*
+           * t24：沙盘 flatOrbits=true → 忽略倾角，所有轨道共面（XZ）。
+           * 实境 flatOrbits=false 保留原来的绕 X 轴倾角公式；更远的实境天体走上面的
+           * 六根数分支，根本不进这里。inclination 的数据值不动（实境与 t26 还在用）。
+           */
+          const inc = look.flatOrbits ? 0 : body.inclination;
+          group.position.set(lx, Math.sin(inc) * lz, Math.cos(inc) * lz);
         }
       }
       if (!look.spins) continue;
@@ -582,6 +588,9 @@ function Simulation({ ready = true }: { ready?: boolean }) {
 }
 
 function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
+  // t24：轨道线是否共面由 look 声明（沙盘 true / 实境 false），渲染层不看 mode
+  const { spec } = useSystem();
+  const flat = spec.look.flatOrbits;
   /*
    * 轨道线不能穿过球面、也**不能出现可见的缺口**（t52 修正 t51 的回归）。
    *
@@ -613,11 +622,14 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
         cols.push(1, 1, 1, 1);
       }
     } else {
+      const inc = body.inclination;
       for (let i = 0; i <= RING_SEGMENTS; i++) {
         const angle = (i / RING_SEGMENTS) * Math.PI * 2;
         const lx = Math.cos(angle) * body.orbitRadius;
         const lz = Math.sin(angle) * body.orbitRadius;
-        pts.push(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+        // t24：flatOrbits 时轨道线也压到同一平面，和 Simulation 的位置公式同源
+        const tilt = flat ? 0 : inc;
+        pts.push(lx, Math.sin(tilt) * lz, Math.cos(tilt) * lz);
         cols.push(1, 1, 1, 1);
       }
     }
@@ -638,7 +650,7 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
     const mesh = new THREE.Line(geo, mat);
     mesh.frustumCulled = false;
     return mesh;
-  }, [body, selected]);
+  }, [body, selected, flat]);
   // 淡出带（参数单位 = 角度/2π）：从 1.1 倍半径（贴面）到 1.6 倍半径（全亮）。
   // 带子必须窄：t51 的硬缺口看起来是"断线"，但带宽 2.2 倍半径又会让人以为线在半空中消失了。
   const fadeOuter = useMemo(() => {
@@ -2639,6 +2651,28 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
     (window as unknown as { __solarOrbitFrames?: typeof orbitFrames }).__solarOrbitFrames = orbitFrames;
 
     /*
+     * t24 结构探针：每条轨道相对母天体的世界位置（采 3 个时刻就能算法向量）。
+     * 沙盘 flatOrbits=true 时三条采样点的平面法向量应当两两重合（夹角 <0.01°）；
+     * 实境不共面，不能用这一条判。返回的是**世界系**偏移，不做任何反旋。
+     */
+    const orbitPlanes = () => {
+      const rows: { id: string; parent: string; rel: [number, number, number] }[] = [];
+      const wp = new THREE.Vector3();
+      const pp = new THREE.Vector3();
+      for (const body of bodies) {
+        if (!body.parent) continue;
+        const g = reg.groups.get(body.id);
+        const pg = reg.groups.get(body.parent);
+        if (!g || !pg) continue;
+        g.getWorldPosition(wp);
+        pg.getWorldPosition(pp);
+        rows.push({ id: body.id, parent: body.parent, rel: [wp.x - pp.x, wp.y - pp.y, wp.z - pp.z] });
+      }
+      return rows;
+    };
+    (window as unknown as { __solarOrbitPlanes?: typeof orbitPlanes }).__solarOrbitPlanes = orbitPlanes;
+
+    /*
      * 贴图预算探针：启动时每张程序化贴图多大、总像素多少、还有几个任务在排队。
      * 它要证明的是两件事 ——「启动期只付总览档的钱」和「放大后真的升了档」，
      * 不是"每个像素都对"（那要截图）。摄影贴图（地球/月球）不参与预算，不在报告里。
@@ -2927,6 +2961,7 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
       delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
       delete (window as unknown as { __solarOrbitFrames?: typeof orbitFrames }).__solarOrbitFrames;
+      delete (window as unknown as { __solarOrbitPlanes?: typeof orbitPlanes }).__solarOrbitPlanes;
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
       delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;

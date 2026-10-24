@@ -31,8 +31,19 @@ export type SystemLook = {
   labels: boolean;
   /** 装饰体：星空 / 小行星带 / 尾迹 */
   decor: boolean;
-  /** 轨道线（还要叠 HUD 的 showOrbits 开关） */
+  /**
+   * 轨道线（还要叠 HUD 的 showOrbits 开关）
+   */
   orbitLines: boolean;
+  /**
+   * 轨道共面（t24）：true = 忽略 `body.inclination`，所有轨道落在同一个 XZ 平面。
+   *
+   * 为什么是 look 而不是在渲染层判 mode：沙盘是示意图（口径：能看懂就行），
+   * 实境才是真实物理（六根数）。这是一个**观感声明**，和 spins/decor 同一层；
+   * 渲层只按字段走，不认 mode、不认 unit。`data.ts` 的 inclination 值保留 ——
+   * 它们是真实值，实境（t14）和 t26 的不变量都还在用。
+   */
+  flatOrbits: boolean;
   /** 冻结模拟时间推进（生产端不推进，见 SolarCanvas 的 Simulation） */
   freezesTime: boolean;
   /**
@@ -366,6 +377,8 @@ export const REAL_PROTO: SystemSpec = {
     labels: false,
     decor: false,
     orbitLines: false,
+    /* t24：实境是真三维（六根数/倾角），不共面。沙盘才用 flatOrbits=true。 */
+    flatOrbits: false,
     freezesTime: true,
     refineGeometry: true,
     camera: "meter",
