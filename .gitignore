@@ -6,3 +6,4 @@ release/
 screenshots/
 .texture-src/
 .tmp-*
+runs/

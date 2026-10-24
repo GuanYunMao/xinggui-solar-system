@@ -8,6 +8,8 @@ import { createServer } from "node:http";
 import { readFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
+// 运行归档：把每次的 results + 环境指纹落盘，让失败证据活过终端（详见该文件头部注释）
+import { archiveVerifyRun } from "./verify-archive.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // 产物的根目录。默认 release/。想验一份**冻结快照**时用 XG_RELEASE 指过去
@@ -792,6 +794,9 @@ async function run(browser, spec) {
     await page.waitForTimeout(1200);
 
     result.solarReady = true;
+    // 归档要能回答「哪个视口下出的问题」，所以把这一页的视口与 dpr 记进结果（纯追加字段）
+    result.viewport = `${spec.viewport.width}x${spec.viewport.height}`;
+    result.dpr = spec.dpr ?? 1;
     result.title = await page.locator("h1").innerText();
     result.canvas = await page.locator("canvas").count();
     result.epoch = await page.locator("header p.text-lg").innerText();
@@ -1768,4 +1773,39 @@ try {
 console.log(JSON.stringify({ results, failures }, null, 2));
 console.log(failures.length ? `\n✗ ${failures.length} 项未通过` : "\n✓ 全部通过");
 console.log(`耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s（${results.length} 条 pass 记录）`);
+
+// ——— 归档（失败绝不影响退出码）———————————————————————————————
+// 测量工具不该吃被测结果的账：归档坏了只打警告，verify 的红绿仍由 failures 决定。
+// 关掉的办法：`--no-archive` 或 XG_NO_ARCHIVE=1。
+{
+  const noArchive = process.argv.includes("--no-archive") || process.env.XG_NO_ARCHIVE === "1";
+  if (noArchive) {
+    console.log("（--no-archive：本次不写归档）");
+  } else {
+    try {
+      const buildHtml = await readFile(path.join(SITE, "index.html"), "utf8").catch(() => "");
+      const buildMatch = /assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(buildHtml);
+      const archived = archiveVerifyRun({
+        results,
+        failures,
+        meta: {
+          at: new Date().toISOString(),
+          build: buildMatch ? `assets/${buildMatch[1]}` : "unknown",
+          raster: "software(swiftshader)", // verify 固定用 swiftshader，与 t20 的 hardware 轮不是一条路径
+          edge: EDGE,
+          node: process.version,
+          viewports: [...new Set(results.map((r) => r?.viewport).filter(Boolean))],
+          elapsedSeconds: +((Date.now() - startedAt) / 1000).toFixed(1),
+          only: ONLY.length ? ONLY : "all",
+          strict: STRICT,
+        },
+      });
+      const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, "/");
+      console.log(`归档：${rel(archived.file)}（索引 ${rel(archived.index)}）`);
+      if (archived.pruned.length) console.log(`清掉 ${archived.pruned.length} 份超期归档（保留最近 40 次 / 30 天）`);
+    } catch (err) {
+      console.warn(`⚠ 归档失败（不影响退出码）：${err.message}`);
+    }
+  }
+}
 process.exit(failures.length ? 1 : 0);

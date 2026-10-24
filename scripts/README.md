@@ -641,6 +641,32 @@ rm -rf .tmp-release-snap
 另外，**两台 verify 同时跑也会互相污染**：双方的全屏 WebGL 互抢光栅，
 `frame-time` 的分母会把对方的开销算成「机器基」。端口不会撞（自动往后找），CPU 会。
 
+## 运行归档（`runs/`）：让失败证据活过终端
+
+每次 `npm run verify` 结束都会把**整份 results + 环境指纹**写进 `runs/`：
+
+- `runs/<时刻>__<build 哈希>__<光栅>.json`：那一次的完整结果（含 `knownBug` 之类的记录字段）；
+- `runs/index.jsonl`：一行一次运行，字段固定（`at / build / raster / passes / failures / failureNames / knownBugs / viewports / file`）。
+
+**为什么要有它**：`sun-occlusion` 的 `centerBoxLum` 与 `aligned` 曾经只活在一条消息里——全仓 `*.json` 搜它 0 命中，
+于是「这条判据从哪一版开始不对」回答不了，只能靠记性。归档之后那是一句：
+
+```powershell
+Select-String -Path runs\index.jsonl -Pattern 'sun-occlusion'   # 哪几次红、红的 build 是哪个
+node scripts/verify-archive.mjs --list                          # 人看的历史列表
+```
+
+三条硬约束（都是踩出来的）：
+
+1. **归档失败绝不让 verify 变红** —— try/catch 包住、只打警告。测量工具不该吃被测结果的账。
+2. **索引字段固定** —— 它就是"用 Select-String 查历史"的接口，改名等于悄悄废掉所有历史查询。
+3. **保留策略写死**（最近 **40 次 / 30 天**，先到先清）—— 不写保留策略，一年后就是几百 MB 垃圾。
+   只清 run 文件，**`index.jsonl` 永不删**（历史不能丢）。
+
+开关：`--no-archive` 或 `XG_NO_ARCHIVE=1` 可跳过归档（会打印「本次不写归档」，不静默）。
+`runs/` 已在 `.gitignore` 里；**归档不进 git**。
+归档器自带离线自测：`node scripts/verify-archive.mjs --selftest`（不开浏览器，含「写不进去时会抛」的正向证明）。
+
 ## 夹具与自动收起（`hudAutoHide` 之后的硬规则）
 
 自动收起默认开着，它改了两件夹具必须知道的事。**这不是"注意事项"，是照着做才跑得通的规则**：
