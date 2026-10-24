@@ -169,6 +169,16 @@ type SimStore = GateSlice & {
   showTrails: boolean;
   /** 顶部天体行 / 底栏的空闲自动收起（t12）。关掉 = 常显。 */
   hudAutoHide: boolean;
+  /**
+   * 实境：当前取景目标（t22）。`frameEarthMoon` 那一片视野只能在地月之间换，
+   * 三个状态对应验收要的三个取景：
+   *  - `"wide"`  = 地月同框（默认，也是"再点一次当前目标"的回落）；
+   *  - `"earth"` = 地球特写；
+   *  - `"moon"`  = 月球。
+   * **只表示"玩家想看的对象"**，相机怎么摆是渲染层的事（t23 让 MeterCamera 读它，
+   * 并把相机到该目标的距离喂给 `realDistanceM`）。
+   */
+  realFocus: "wide" | "earth" | "moon";
   selectedId: string | null;
   /**
    * 模拟时间，**时间的唯一真值**（秒）。公转、自转、太阳 uTime、HUD 历法全部从它派生。
@@ -198,6 +208,8 @@ type SimStore = GateSlice & {
    * 「不知道」而不是 0 —— 0 会被格式化成「0 米」，那是谎言。
    */
   realDistanceM: number | null;
+  /** 实境取景目标（t22）：地 / 月 两个按钮唯一的写入点；再点当前目标回落到地月同框。 */
+  setRealFocus: (focus: "wide" | "earth" | "moon") => void;
   togglePaused: () => void;
   setSpeed: (speed: number) => void;
   toggleLabels: () => void;
@@ -310,6 +322,7 @@ export const useSim = create<SimStore>((set, get) => {
   prevSpeed: DEFAULT_SPEED,
   queuedSelectId: null,
   realDistanceM: null,
+  realFocus: "wide",
   gateLit: [],
   gateUnlocked: false,
   gateUnlockedAt: null,
@@ -415,6 +428,19 @@ export const useSim = create<SimStore>((set, get) => {
     set({ realDistanceM: meters });
   },
 
+  // 实境取景目标：同一个手势里不会有并发写，直接 set；切模式时由 setMode 重置成 wide。
+  // 再点当前目标 = 回落到「地月同框」（两个按钮、三个取景，验收要的那三个）。
+  setRealFocus: (focus) => {
+    const current = get().realFocus;
+    if (focus !== "wide" && current === focus) {
+      set({ realFocus: "wide", realDistanceM: null });
+      return;
+    }
+    if (current === focus) return;
+    // 换目标的那一刻旧距离就作废了：留着会让界面先显示「到月球的距离」再突然跳
+    set({ realFocus: focus, realDistanceM: null });
+  },
+
   refocus: () => set((s) => ({ resetToken: s.resetToken + 1 })),
   // 必须一次 set 同时改两个字段：分两次会让 CameraRig 在相邻两帧看到 key 变两次，
   // 起两次聚焦动画（SolarCanvas 的去重键是 `${selectedId}|${resetToken}`）。
@@ -433,7 +459,8 @@ export const useSim = create<SimStore>((set, get) => {
       // 硬门：没解锁就没有这个目的地。入口只会在 UI 层被禁用，这里再守一层。
       if (!isUnlocked(s)) return;
       // 切模式时清空距离读数：旧目标（沙盘的太阳）的距离喂给实境是假数
-      set({ mode: "real", switching: "toReal", prevSpeed: s.speed, speed: 1, paused: false, realDistanceM: null });
+      // 进实境一律从"地球"开始：`frameEarthMoon` 默认就是地月同框，读数是到地球
+      set({ mode: "real", switching: "toReal", prevSpeed: s.speed, speed: 1, paused: false, realDistanceM: null, realFocus: "wide" });
       armSwitchTimeout();
       return;
     }

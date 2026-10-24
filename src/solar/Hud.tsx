@@ -1,8 +1,8 @@
-import { ChevronDown, ChevronRight, ChevronUp, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, ChevronUp, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
-import { APP_ERA_NAME, snapshotTag, versionLabel } from "./brand";
+import { APP_ERA_NAME, formatDistanceMeters, snapshotTag, versionLabel } from "./brand";
 import type { Body } from "./data";
 import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
 import { useSystem } from "./system-context";
@@ -364,6 +364,20 @@ function SandboxHud() {
 
 /* ────────────────────────────── 实境：航行仪表 ────────────────────────────── */
 
+/**
+ * 实境最小控件（t22）——只有三样，别加戏：
+ *
+ *  1. 常显的「回沙盘」出口（抬头右侧，不藏进卡片）：Esc 一直能回去，但玩家不知道；
+ *  2. 距离读数：相机到**当前取景目标**的距离，m / km / 万 km 自动换档；
+ *  3. 地 / 月 取景切换：`frameEarthMoon` 那一片视野能给的最大动作就是在这两颗之间换。
+ *
+ * 时间推进 / 暂停 / 速度 / 图层**一律不在实境出现**：那里的时间冻结是 1.1.5 专门修过的
+ * 行为（"实境模式下模拟时间停止推进"），加回任何一条都是回滚一个已修的 bug。
+ *
+ * 黑幕：`App.tsx` 进实境的头 240ms 是不透明且吃指针的。HUD 在 z-10，比黑幕（z-[2]）高，
+ * 所以这组控件会被黑幕"盖不住" —— 由 `data-real-veil` + `.real-controls` 的 CSS
+ * 在那一瞬间把指针关掉（见 styles.css），不去绕过既有机制。
+ */
 function RealHud() {
   return (
     <>
@@ -373,11 +387,67 @@ function RealHud() {
         把它设成 true —— 所以模拟历会停在进入实境的那一刻，既不涨也不归零。
         停住的数字和坏掉的钟看起来一模一样，所以这里不是"隐藏 Epoch"，是 **Epoch 不在树里**。
       */}
-      <HudHeader />
+      <HudHeader trailing={<RealExitKey />} />
+      <RealInstruments />
       <div className="relative min-h-0 flex-1">
         <RealCard />
       </div>
     </>
+  );
+}
+
+/** 常显出口。点一次 = `setMode("sandbox")`，和 Esc 走同一条路（选中态与 ?body= 由它维护）。 */
+function RealExitKey() {
+  const setMode = useSim((state) => state.setMode);
+  return (
+    <button
+      type="button"
+      className="hud-btn real-controls inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full border border-line bg-elevated px-3 text-sm text-fg md:h-8"
+      aria-label="回沙盘"
+      onClick={() => setMode("sandbox")}
+    >
+      <ArrowLeft className="size-4" aria-hidden />
+      <span>回沙盘</span>
+    </button>
+  );
+}
+
+/** 距离读数 + 地/月取景切换。读数来源是 `realDistanceM`（t23 的 MeterCamera 喂，10Hz）。 */
+function RealInstruments() {
+  const distance = useSim((state) => state.realDistanceM);
+  const focus = useSim((state) => state.realFocus);
+  const setFocus = useSim((state) => state.setRealFocus);
+  // 三个取景：wide（地月同框，默认）/ earth / moon。两个按钮，再点当前目标回落 wide。
+  const targetName = focus === "moon" ? "月球" : focus === "earth" ? "地球" : "地月";
+  const option = (value: "earth" | "moon", label: string) => (
+    <button
+      key={value}
+      type="button"
+      className={`hud-btn inline-flex h-9 shrink-0 items-center rounded-full border px-3 text-xs md:h-8 ${
+        focus === value ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
+      }`}
+      aria-label={`${label}取景`}
+      aria-pressed={focus === value}
+      onClick={() => setFocus(value)}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="real-controls pointer-events-auto mt-1 flex items-center justify-between gap-2 px-4 md:mt-2 md:px-6">
+      <p className="flex min-w-0 items-baseline gap-2 text-xs text-muted">
+        <span className="shrink-0">距离</span>
+        {/* null 时显示「—」：0 会被读成「贴脸了」，那是谎言 */}
+        <span data-real-distance={formatDistanceMeters(distance)} className="text-sm tabular-nums text-fg">
+          {formatDistanceMeters(distance)}
+        </span>
+        <span className="truncate text-subtle">到{targetName}</span>
+      </p>
+      <div className="flex shrink-0 items-center gap-1.5" role="group" aria-label="取景目标">
+        {option("earth", "地球")}
+        {option("moon", "月球")}
+      </div>
+    </div>
   );
 }
 

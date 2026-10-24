@@ -105,6 +105,16 @@
   padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
 }
 
+/*
+ * t22：实境黑幕期间（App.tsx 的 data-real-veil=1，头 240ms）不许点实境控件。
+ * HUD 在 z-10、黑幕在 z-[2]，黑幕自己挡不住 HUD；用这一条把指针关掉，
+ * 而不是去改 z 序或给按钮加 disabled（"点了没反应"要能看得出来）。
+ */
+main[data-real-veil="1"] .real-controls {
+  pointer-events: none;
+  opacity: 0.45;
+}
+
 .panel-in {
   animation: panel-in var(--motion-slow) var(--ease-smooth-out);
 }

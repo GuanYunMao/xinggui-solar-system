@@ -53,3 +53,27 @@ export function versionLabel(raw: string): string {
   const tag = snapshotTag(raw);
   return tag ? `v${shortVersion(raw)}·${tag}` : `v${shortVersion(raw)}`;
 }
+
+/**
+ * 实境距离读数的单位换档（t22）：米 → m / km / 万 km。
+ *
+ * 放这里而不是塞进 Hud 的组件里：它是**纯函数**，Node 能直接 import 来测
+ * （Hud.tsx 带 JSX，Node 进不去）。也别在组件里再写一份 —— 换档规则只该有一处。
+ *
+ * 口径：
+ *  - `< 1000 m`      → 整数米（`637 m`）
+ *  - `< 1e7 m`       → 公里；< 100 km 给 1 位小数，其余整数（`12.3 km` / `6371 km`）
+ *  - `>= 1e7 m`      → 万公里；< 100 万 km 给 2 位，其余整数（`38.44 万 km`）
+ *  - `null` / 非有限值 → `—`（**不是 0**：那是谎言，说明相机还没摆位）
+ */
+export function formatDistanceMeters(meters: number | null): string {
+  if (meters === null || !Number.isFinite(meters)) return "—";
+  const m = Math.max(0, meters);
+  if (m < 1000) return `${Math.round(m)} m`;
+  if (m < 1e7) {
+    const km = m / 1000;
+    return `${km < 100 ? km.toFixed(1) : Math.round(km)} km`;
+  }
+  const wan = m / 1e7;
+  return `${wan < 100 ? wan.toFixed(2) : Math.round(wan)} 万 km`;
+}

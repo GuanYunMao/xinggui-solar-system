@@ -127,7 +127,16 @@ export function App() {
 
   return (
     <SystemProvider value={system}>
-      <main className="relative h-screen w-full overflow-hidden bg-bg text-fg" style={{ height: "100dvh" }}>
+      {/*
+        `data-real-veil`：进实境头 240ms 的黑幕是 `pointer-events-auto` 的，但 HUD 在 z-10、
+        黑幕在 z-[2]，HUD 会"盖不住地"漏出来点得动。这个属性让 HUD 侧用 CSS 把
+        `.real-controls` 的指针关掉（t22），不去绕过既有黑幕机制、也不改 z 序。
+      */}
+      <main
+        className="relative h-screen w-full overflow-hidden bg-bg text-fg"
+        style={{ height: "100dvh" }}
+        data-real-veil={inReal && !veilLifted ? "1" : undefined}
+      >
         <div className="sky absolute inset-0" aria-hidden />
         {/*
           启动页是全名唯一的家：「巡星·未至之境」是一整个名字，不拆开、不缩写，
