@@ -9,7 +9,7 @@ import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
 import { frameEarthMoon, tightenClipPlanes } from "./systems";
-import { cloudTexture, glowTexture, textureFor } from "./textures";
+import { acquireCloudTexture, acquirePlanetTexture, glowTexture, textureReport } from "./textures";
 
 declare global {
   interface Window {
@@ -627,12 +627,21 @@ function SunSurface({ body }: { body: Body }) {
 
 function PlanetSurface({ body }: { body: Body }) {
   const reg = useRegistry();
-  const map = useMemo(() => textureFor(body), [body]);
+  const camera = useThree((state) => state.camera);
+  const gl = useThree((state) => state.gl);
+  const size = useThree((state) => state.size);
+  /*
+   * 贴图不是 useMemo 里同步算出来的，而是一个有生命周期的句柄：
+   * 拿到的第一张可能是 1×1 占位色（程序化贴图还没轮到）或摄影贴图，
+   * 之后尺寸随「这颗星在屏幕上占多少设备像素」升档，好了走 onChange 换 uniform。
+   * 预算与分帧的取舍写在 textures.ts 的 textureBudget / pump 注释里。
+   */
+  const map = useMemo(() => acquirePlanetTexture(body), [body]);
   const mat = useMemo(
     () =>
       new THREE.ShaderMaterial({
         toneMapped: false,
-        uniforms: { uMap: { value: map } },
+        uniforms: { uMap: { value: map.texture } },
         vertexShader: PLANET_VERT,
         fragmentShader: PLANET_FRAG,
       }),
@@ -642,23 +651,69 @@ function PlanetSurface({ body }: { body: Body }) {
   // 像素回读找"背景→圆盘"边缘时会锁在云斑而不是球面轮廓上，
   // 实测把现代路径的残余噪声从 0.1 px 抬到 0.6 px，正好盖住要测的东西。
   const clouds = body.texture === "earth" && useSystem().spec.unit !== "meter";
+  const cloudMap = useMemo(() => (clouds ? acquireCloudTexture() : null), [clouds]);
   const cloudMat = useMemo(() => {
-    if (!clouds) return null;
+    if (!cloudMap) return null;
     return new THREE.ShaderMaterial({
       transparent: true,
       depthWrite: false,
       toneMapped: false,
-      uniforms: { uMap: { value: cloudTexture() } },
+      uniforms: { uMap: { value: cloudMap.texture } },
       vertexShader: PLANET_VERT,
       fragmentShader: CLOUD_FRAG,
     });
-  }, [clouds]);
+  }, [cloudMap]);
+  // 贴图升档时只换 uniform 的值，不重建材质、不触发 React 重渲染：
+  // 材质住在这个组件的生命周期里，重建一次就丢一次 GPU 程序。
+  useEffect(() => {
+    const off = map.onChange((tex) => {
+      mat.uniforms.uMap!.value = tex;
+    });
+    const offCloud = cloudMap
+      ? cloudMap.onChange((tex) => {
+          if (cloudMat) cloudMat.uniforms.uMap!.value = tex;
+        })
+      : () => {};
+    return () => {
+      off();
+      offCloud();
+    };
+  }, [map, cloudMap, mat, cloudMat]);
+  /*
+   * 每 10 帧量一次屏幕占幅，把「这颗星此刻要多大贴图」告诉调度器（只升不降）。
+   *
+   * 为什么量实际投影、而不是按设备档位或固定视距查表：视距是相机自由度的函数
+   * （总览 38 px 的木星，用户滚轮两下就能拉到占满屏），档位是静态的，
+   * 用静态表必然二选一：要么首屏为没发生的放大付钱，要么放大后糊。
+   */
+  const tick = useRef(0);
+  const planPos = useMemo(() => new THREE.Vector3(), []);
+  useFrame(() => {
+    const n = tick.current++;
+    if (n !== 0 && n % 10 !== 0) return;
+    const group = reg.groups.get(body.id);
+    if (!group) return;
+    if (!(camera instanceof THREE.PerspectiveCamera)) return;
+    group.getWorldPosition(planPos);
+    const dist = camera.position.distanceTo(planPos);
+    // 相机进到球体内部时这颗星本来就画不出来（正面被剔除），不必为它生成大图
+    if (dist <= body.radius * 1.001) return;
+    const focal = size.height / 2 / Math.tan((camera.fov * Math.PI) / 360);
+    const radiusCss = focal * Math.tan(Math.asin(Math.min(0.999, body.radius / dist)));
+    // 贴图预算按**设备**像素算：视网膜屏上同一颗球有更多物理像素要糊
+    const devicePx = Math.min(4096, 2 * radiusCss * gl.getPixelRatio());
+    if (!Number.isFinite(devicePx)) return;
+    map.plan(devicePx);
+    cloudMap?.plan(devicePx);
+  });
   useEffect(
     () => () => {
       mat.dispose();
       cloudMat?.dispose();
+      map.release();
+      cloudMap?.release();
     },
-    [mat, cloudMat],
+    [mat, cloudMat, map, cloudMap],
   );
   /*
    * 实境原型（米）下把球面细分拉高。原因不是好看，是测量：
@@ -1549,6 +1604,14 @@ function Probe() {
     (window as unknown as { __solarClip?: typeof clip }).__solarClip = clip;
 
     /*
+     * 贴图预算探针：启动时每张程序化贴图多大、总像素多少、还有几个任务在排队。
+     * 它要证明的是两件事 ——「启动期只付总览档的钱」和「放大后真的升了档」，
+     * 不是"每个像素都对"（那要截图）。摄影贴图（地球/月球）不参与预算，不在报告里。
+     */
+    const textures = () => textureReport();
+    (window as unknown as { __solarTextures?: typeof textures }).__solarTextures = textures;
+
+    /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
      * 算亮斑的水平质心。为什么不是别的做法：
      *
@@ -1727,6 +1790,7 @@ function Probe() {
       delete (window as unknown as { __solarProbe?: typeof probe }).__solarProbe;
       delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
+      delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
     };
   }, [reg, camera, gl, bodies, size.height, size.width]);
 
