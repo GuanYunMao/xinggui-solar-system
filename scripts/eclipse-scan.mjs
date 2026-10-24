@@ -292,24 +292,63 @@ for (const [id, occ] of PAIRS) {
    * （太阳角半径 ~14.5°，地球在月距处 ~22°）。用本模型的角半径算 cover，
    * 才分得清"该暗"与"不该暗"，也才谈得上阈值从分布取。
    */
-  const buckets = { total: [], partial: [], none: [] };
+  /*
+   * 分组键（t53 定稿）：
+   *   正侧 = `dot > 0 且 cover ≥ 1`   ← 必须带 dot>0！`sep=|sinθ|` 是偶函数，
+   *                                     只用 cover 会把 `dot=−1`（地球在背面）分进"全食"，
+   *                                     那正是 t50 的 bug 形状，验收侧也会犯（我犯过一次）。
+   *   反侧 = `dot < 0`（不论 cover）  ← t50 的签字：背面不该变暗
+   *   参照 = `cover ≤ 0`
+   * 窗口窄是几何决定的 ⇒ 先粗扫找 `dot` 的局部极大/极小，再在极值附近 0.002 细扫凑够 n。
+   */
+  const coarse = [];
   for (let t = 0; t <= SWEEP_END + 1e-9; t += SWEEP_STEP) {
     const tt = +t.toFixed(3);
     const pos = await worldAt(tt);
     if (!radii0.sun || !radii0[occ]) continue;
     const g0 = geometryOf(pos, id, occ, radii0);
-    if (!g0) continue;
-    const g = g0.cover >= 1 ? "total" : g0.cover <= 0 ? "none" : "partial";
-    buckets[g].push({ t: tt, dot: g0.dot, cover: g0.cover, geo: g0 });
+    if (g0) coarse.push({ t: tt, dot: g0.dot, cover: g0.cover, geo: g0 });
   }
-  const GROUP_LABEL = { total: "全食(cover≥1)", none: "无食(cover≤0)", partial: "偏食(0<cover<1)" };
+  // 在 +1 / −1 附近各取 3 个极值窗口，用 0.002 细扫补样本
+  const refineAround = async (center, span = 0.08, step = 0.002) => {
+    const out = [];
+    for (let dt = -span; dt <= span + 1e-9; dt += step) {
+      const tt = +Math.max(0, center + dt).toFixed(3);
+      const pos = await worldAt(tt);
+      const g0 = radii0.sun && radii0[occ] ? geometryOf(pos, id, occ, radii0) : null;
+      if (g0) out.push({ t: tt, dot: g0.dot, cover: g0.cover, geo: g0 });
+    }
+    return out;
+  };
+  const peaks = (arr, wantSign) =>
+    arr
+      .filter((r) => (wantSign > 0 ? r.dot > 0.9 : r.dot < -0.9))
+      .sort((a, b) => (wantSign > 0 ? b.dot - a.dot : a.dot - b.dot))
+      .slice(0, 3)
+      .map((r) => r.t);
+  const fine = [...coarse];
+  for (const t0 of [...peaks(coarse, +1), ...peaks(coarse, -1)]) {
+    try {
+      fine.push(...(await refineAround(t0)));
+    } catch {
+      /* 细扫失败就只用粗扫样本，n 会小，下面会报出来 */
+    }
+  }
+  const seen = new Set();
+  const uniq = fine.filter((r) => (seen.has(r.t) ? false : (seen.add(r.t), true)));
+  const buckets = {
+    total: uniq.filter((r) => r.dot > 0 && r.cover >= 1),
+    antisolar: uniq.filter((r) => r.dot < 0),
+    none: uniq.filter((r) => r.cover <= 0),
+  };
+  const GROUP_LABEL = { total: "正侧(dot>0 且 cover≥1)", antisolar: "反侧(dot<0)", none: "参照(cover≤0)" };
   const pick = (arr) => {
     if (arr.length <= PER_GROUP) return arr;
     const step = (arr.length - 1) / (PER_GROUP - 1);
     return Array.from({ length: PER_GROUP }, (_, i) => arr[Math.round(i * step)]);
   };
-  const rec = { pair: `${id}:${occ}`, groups: {} };
-  for (const g of ["total", "none", "partial"]) {
+  const rec = { pair: `${id}:${occ}`, groupLabels: GROUP_LABEL, groupSizes: Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length])), groups: {} };
+  for (const g of ["total", "antisolar", "none"]) {
     const chosen = pick(buckets[g]);
     const rows = [];
     const fails = [];
@@ -324,12 +363,13 @@ for (const [id, occ] of PAIRS) {
       min: v.length ? v[0] : null,
       max: v.length ? v[v.length - 1] : null,
       median: v.length ? v[Math.floor(v.length / 2)] : null,
+      dotRange: rows.length ? [Math.min(...rows.map((r) => r.dot)), Math.max(...rows.map((r) => r.dot))] : null,
       rows,
       failures: fails,
     };
   }
   const zeroMed = rec.groups.none.median;
-  for (const g of ["total", "none"]) {
+  for (const g of ["total", "antisolar"]) {
     const b = rec.groups[g];
     b.ratioToNone = {
       min: zeroMed && b.min !== null ? +(b.min / zeroMed).toFixed(3) : null,
@@ -339,9 +379,9 @@ for (const [id, occ] of PAIRS) {
   }
   out.pairs.push(rec);
   console.log(
-    `${rec.pair}  plus ${rec.groups.total.n}帧 [${rec.groups.total.min}–${rec.groups.total.max}] 中位 ${rec.groups.total.median}（对参照 ${JSON.stringify(rec.groups.total.ratioToNone)}）` +
-      `  |  none ${rec.groups.none.n}帧 [${rec.groups.none.min}–${rec.groups.none.max}] 中位 ${rec.groups.none.median}` +
-      `  |  partial ${rec.groups.partial.n}帧 中位 ${rec.groups.partial.median}`,
+    `${rec.pair}  正侧 ${rec.groups.total.n}帧 [${rec.groups.total.min}–${rec.groups.total.max}] 中位 ${rec.groups.total.median}（对参照 ${JSON.stringify(rec.groups.total.ratioToNone)}）` +
+      `  |  参照 ${rec.groups.none.n}帧 [${rec.groups.none.min}–${rec.groups.none.max}] 中位 ${rec.groups.none.median}` +
+      `  |  反侧 ${rec.groups.antisolar.n}帧 [${rec.groups.antisolar.min}–${rec.groups.antisolar.max}] 中位 ${rec.groups.antisolar.median}（对参照 ${JSON.stringify(rec.groups.antisolar.ratioToNone)}）`,
   );
 }
 out.errors = errors.slice(0, 8);

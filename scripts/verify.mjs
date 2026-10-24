@@ -1021,6 +1021,255 @@ function judgeJupiterSpot(res) {
   };
 }
 
+// ——— 月食半球判据（`eclipse-hemisphere`）：正侧必须暗、反侧必须不暗 ————
+//
+// 为什么要它：`sun-occlusion` 证明的是「太阳在木星背后时木星盘心不透光」，
+// 它**不覆盖** PLANET_FRAG 里那套解析遮挡公式本身。而那个公式曾经（`t50`）用
+// `sep = |sin θ|` 判遮挡、丢了半球判断 ⇒ 卫星绕到「母天体在身后」的相位时整面被误判成全食。
+//
+// ⚠ 两条方法论写在这里，别删：
+// 1. **分组键必须带 `dot > 0`**：`sep=|sinθ|` 是偶函数，只用 cover 会把 `dot=−1`（地球在背面）
+//    分进"全食"——那正是 t50 的 bug 形状。我在验收侧第一次就照同一套公式分组，
+//    结果 `dot=+1` 与 `dot=−1` 拿到几乎相同的 cover（1.05 vs 1.16）。
+//    **验收逻辑不能复用被测逻辑的公式**：复用数据会被动跟着产品漂，复用公式会把 bug 一起继承。
+// 2. **沙盘是压缩几何**：实测（`scripts/eclipse-scan.mjs`）太阳角半径 **12.72–16.44°**、
+//    地球在月距处 **22.33°** —— **地球的角半径比太阳还大**，所以沙盘里食很常见。
+//    别拿真世界的 0.27° 去质疑它（那正是我这轮犯过的错）。
+//
+// 判据（阈值从实测分布取，见 `ECLIPSE_*` 常量）：
+//   正侧 `dot>0 且 cover≥1`（地球挡住太阳）→ 月球整盘平均 **≤ 0.5 ×** 参照
+//   反侧 `dot<0`（地球在背面）           → **≥ 0.85 ×** 参照
+//   参照 `cover≤0`
+const ECLIPSE_PAIR = ["moon", "earth"];
+const ECLIPSE_TOTAL_MAX_RATIO = 0.5; // 实测正侧 0.204–0.316（n=5），留 58% 余量
+const ECLIPSE_ANTISOLAR_MIN_RATIO = 0.85; // 实测反侧 1.004–1.028（n=3），留 18% 余量
+const ECLIPSE_FRAMES_PER_GROUP = 4;
+const ECLIPSE_SWEEP_STEP = 0.02;
+const ECLIPSE_SWEEP_END = 13;
+
+const v3 = {
+  sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  norm(a) {
+    const n = Math.hypot(a[0], a[1], a[2]);
+    return n > 1e-9 ? [a[0] / n, a[1] / n, a[2] / n] : null;
+  },
+};
+
+/** 与 shader 同源的覆盖度（**只用于分组**，判定用的是实测亮度） */
+function eclipseCover(pos, id, occId, radii) {
+  const S = v3.sub(pos.sun ?? pos.sol, pos[id]);
+  const E = v3.sub(pos[occId], pos[id]);
+  const dSun = Math.hypot(...S);
+  const dOcc = Math.hypot(...E);
+  const Su = v3.norm(S);
+  const Eu = v3.norm(E);
+  if (!Su || !Eu || !radii.sun || !radii[occId]) return null;
+  const sep = Math.hypot(...v3.cross(Su, Eu));
+  const aSun = radii.sun / dSun;
+  const aOcc = radii[occId] / dOcc;
+  return { dot: +v3.dot(Su, Eu).toFixed(3), cover: +((aOcc + aSun - sep) / (2 * aSun)).toFixed(3), aSunDeg: +((aSun * 180) / Math.PI).toFixed(2), aOccDeg: +((aOcc * 180) / Math.PI).toFixed(2) };
+}
+
+/** 机位：垂直于日向、背离地球；`|dot|>0.9` 退化时固定 +90（两侧都远离地球） */
+function eclipseCameraDir(pos, id, occId) {
+  const S = v3.norm(v3.sub(pos.sun ?? pos.sol, pos[id]));
+  const E = v3.norm(v3.sub(pos[occId], pos[id]));
+  if (!S || !E) return null;
+  const k = v3.dot(E, S);
+  const perp = [E[0] - k * S[0], E[1] - k * S[1], E[2] - k * S[2]];
+  let C = v3.norm([-perp[0], -perp[1], -perp[2]]);
+  if (Math.abs(k) > 0.9 || !C) C = v3.norm(v3.cross(S, [0, 1, 0]));
+  if (!C) return null;
+  const right = v3.norm(v3.cross(S, [0, 1, 0])) ?? [1, 0, 0];
+  return {
+    az: +((Math.atan2(v3.dot(C, right), v3.dot(C, S)) * 180) / Math.PI).toFixed(2),
+    el: +((Math.asin(Math.max(-1, Math.min(1, C[1]))) * 180) / Math.PI).toFixed(2),
+  };
+}
+
+async function runEclipseHemisphere(browser, base) {
+  const [id, occId] = ECLIPSE_PAIR;
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+  page.on("console", (m) => m.type() === "error" && errs.push(m.text()));
+  const out = { pair: `${id}:${occId}`, errors: errs };
+  try {
+    await page.goto(`${base}?diag=1`, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    await page.keyboard.press(" "); // 暂停：时间由脚本钉
+    await page.waitForTimeout(200);
+    const probes = await page.evaluate(() => ({
+      place: typeof window.__solarPlace === "function",
+      planes: typeof window.__solarOrbitPlanes === "function",
+      camera: typeof window.__solarCamera === "function",
+      pick: typeof window.__solarPick?.candidates === "function",
+    }));
+    out.probes = probes;
+    if (!probes.place || !probes.planes || !probes.camera || !probes.pick) return { ...out, available: false, reason: "探针缺失" };
+
+    const worldAt = (t) =>
+      page.evaluate(async (t) => {
+        window.__solarTime.set(t);
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+        const rows = window.__solarOrbitPlanes() ?? [];
+        const pos = { sol: [0, 0, 0], sun: [0, 0, 0] };
+        for (const r of rows) if (r.parent === "sun") pos[r.id] = r.rel.slice();
+        for (const r of rows) if (r.parent !== "sun") {
+          const p = pos[r.parent] ?? [0, 0, 0];
+          pos[r.id] = [p[0] + r.rel[0], p[1] + r.rel[1], p[2] + r.rel[2]];
+        }
+        return pos;
+      }, t);
+
+    const radii = await page.evaluate(({ ids }) => {
+      const cam = window.__solarCamera();
+      const H = document.querySelector("canvas").clientHeight;
+      const tanHalf = Math.tan((cam.fov * Math.PI) / 360);
+      const o = {};
+      for (const id of ids) {
+        const c = window.__solarPick.candidates().find((x) => x.id === id);
+        o[id] = c && c.depth > 0 ? (c.radiusPx * c.depth * tanHalf * 2) / H : null;
+      }
+      return o;
+    }, { ids: [id, occId, "sun"] });
+    out.radii = radii;
+
+    // 扫相位 → 按 (dot, cover) 分组
+    const samples = [];
+    for (let t = 0; t <= ECLIPSE_SWEEP_END + 1e-9; t += ECLIPSE_SWEEP_STEP) {
+      const tt = +t.toFixed(3);
+      const pos = await worldAt(tt);
+      const g = eclipseCover(pos, id, occId, radii);
+      if (g) samples.push({ t: tt, ...g });
+    }
+    const buckets = {
+      total: samples.filter((s) => s.dot > 0 && s.cover >= 1),
+      antisolar: samples.filter((s) => s.dot < 0),
+      none: samples.filter((s) => s.cover <= 0),
+    };
+    out.groupSizes = Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length]));
+
+    const measure = async (t) => {
+      const pos = await worldAt(t);
+      const dir = eclipseCameraDir(pos, id, occId);
+      if (!dir) return { available: false, reason: "算不出机位方向" };
+      /*
+       * 视距用**开头量一次的世界半径**（`radii[id]`），不在每帧重新从 candidates 反推。
+       * 前一版每帧轮询 candidates 求稳定，结果 antisolar / 参照组**全部被判"不稳定"**：
+       * 那些时刻相机还没摆过去、月球可能不在候选里，轮询永远等不到两次一致——
+       * 于是 n=0。半径是产品常量，量一次就够。
+       */
+      const rWorld = radii[id];
+      if (!(rWorld > 0)) return { available: false, reason: "量不到该天体的世界半径" };
+      const placed = await page.evaluate(({ id, dist, az, el }) => {
+        const r = window.__solarPlace(id, dist, az, el);
+        if (!r) return null;
+        const n = window.__solarCamera().nearest;
+        return { ok: true, nearest: n ?? null, inside: n && n.id !== id && n.dist < n.radius * 1.05 };
+      }, { id, dist: +(rWorld * 8.6).toFixed(5), az: dir.az, el: dir.el });
+      if (!placed) return { available: false, reason: "__solarPlace 返回 null" };
+      if (placed.inside) return { available: false, reason: "相机落在别的天体里" };
+      await page.waitForTimeout(320);
+      const mean = await page.evaluate((id) => {
+        const canvas = document.querySelector("canvas");
+        const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+        const W = canvas.width;
+        const H = canvas.height;
+        const c = window.__solarPick.candidates().find((x) => x.id === id);
+        if (!c) return null;
+        const box = Math.min(400, Math.max(48, Math.round(c.radiusPx * 2.2)));
+        const x0 = Math.max(0, Math.round(c.x * (W / canvas.clientWidth) - box / 2));
+        const y0 = Math.max(0, Math.round(H - c.y * (H / canvas.clientHeight) - box / 2));
+        const buf = new Uint8Array(box * box * 4);
+        gl.readPixels(x0, y0, box, box, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        const cc = box / 2;
+        let sum = 0;
+        let n = 0;
+        for (let y = 0; y < box; y++)
+          for (let x = 0; x < box; x++)
+            if (Math.hypot(x - cc, y - cc) <= c.radiusPx * 0.86) {
+              sum += 0.2126 * buf[(y * box + x) * 4] + 0.7152 * buf[(y * box + x) * 4 + 1] + 0.0722 * buf[(y * box + x) * 4 + 2];
+              n++;
+            }
+        return n ? +(sum / n).toFixed(2) : null;
+      }, id);
+      return { available: true, diskMean: mean, az: dir.az, el: dir.el };
+    };
+
+    out.groups = {};
+    for (const g of ["total", "antisolar", "none"]) {
+      const rows = [];
+      const fails = [];
+      for (const s of buckets[g].slice(0, ECLIPSE_FRAMES_PER_GROUP)) {
+        const m = await measure(s.t);
+        if (!m.available) fails.push({ t: s.t, reason: m.reason });
+        else rows.push({ t: s.t, dot: s.dot, cover: s.cover, aSunDeg: s.aSunDeg, aOccDeg: s.aOccDeg, diskMean: m.diskMean, el: m.el, az: m.az });
+      }
+      const v = rows.map((r) => r.diskMean).sort((a, b) => a - b);
+      out.groups[g] = {
+        n: rows.length,
+        min: v[0] ?? null,
+        max: v[v.length - 1] ?? null,
+        median: v.length ? v[Math.floor(v.length / 2)] : null,
+        dotRange: rows.length ? [Math.min(...rows.map((r) => r.dot)), Math.max(...rows.map((r) => r.dot))] : null,
+        rows,
+        failures: fails,
+      };
+    }
+    const ref = out.groups.none.median;
+    out.ratios = {
+      total: ref && out.groups.total.median !== null ? +(out.groups.total.median / ref).toFixed(3) : null,
+      totalMax: ref && out.groups.total.max !== null ? +(out.groups.total.max / ref).toFixed(3) : null,
+      antisolar: ref && out.groups.antisolar.median !== null ? +(out.groups.antisolar.median / ref).toFixed(3) : null,
+      antisolarMin: ref && out.groups.antisolar.min !== null ? +(out.groups.antisolar.min / ref).toFixed(3) : null,
+    };
+    out.thresholds = {
+      totalMaxRatio: ECLIPSE_TOTAL_MAX_RATIO,
+      antisolarMinRatio: ECLIPSE_ANTISOLAR_MIN_RATIO,
+      origin:
+        "定阈值时实测（沙盘压缩几何，aSun 12.72–16.44°、aOcc 22.33°）：正侧比 0.204–0.316（n=5）→ 取 0.5（余量 58%）；反侧比 1.004–1.028（n=3）→ 取 0.85（余量 18%）。两侧之间留空档：偏食不判。",
+    };
+    return { ...out, available: true };
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeEclipseHemisphere(res) {
+  const name = "eclipse-hemisphere";
+  if (!res.available) {
+    failures.push(`${name}: 夹具不成立（${res.reason ?? "未知"}）—— 没采到就不许报绿`);
+    return res;
+  }
+  const t = res.groups.total;
+  const a = res.groups.antisolar;
+  const ref = res.groups.none;
+  if (ref.n < 2) failures.push(`${name}: 参照组只采到 ${ref.n} 帧（需 ≥2）—— 没有参照就没有比值`);
+  if (t.n < 2) {
+    failures.push(`${name}: 正侧（dot>0 且 cover≥1）只采到 ${t.n} 帧 —— 窗口太窄或采样失败，**n=0 不许静默变成通过**`);
+  } else if (res.ratios.totalMax !== null && res.ratios.totalMax > ECLIPSE_TOTAL_MAX_RATIO) {
+    failures.push(
+      `${name}: 正侧（地球挡住太阳）没有变暗 —— 最亮一帧比值 ${res.ratios.totalMax} > ${ECLIPSE_TOTAL_MAX_RATIO}（中位 ${res.ratios.total}）。` +
+        `遮挡公式没生效，或相角/机位口径变了。`,
+    );
+  }
+  if (a.n < 2) {
+    failures.push(`${name}: 反侧（dot<0）只采到 ${a.n} 帧 —— 判据失去对象`);
+  } else if (res.ratios.antisolarMin !== null && res.ratios.antisolarMin < ECLIPSE_ANTISOLAR_MIN_RATIO) {
+    failures.push(
+      `${name}: 反侧（地球在月球**背后**，物理上挡不住太阳）也变暗了 —— 最暗一帧比值 ${res.ratios.antisolarMin} < ${ECLIPSE_ANTISOLAR_MIN_RATIO}（中位 ${res.ratios.antisolar}）。` +
+        `这就是 t50 那个 bug：\`sep=|sinθ|\` 是偶函数，缺 \`dot(sunDir,occDir) > 0\` 的半球判断。`,
+    );
+  }
+  if (res.errors?.length) failures.push(`${name}: 控制台/页面报错 ${res.errors.length} 条`);
+  return res;
+}
+
 // ——— 滚轮在 HUD 上必须仍然缩放（`hud-wheel`）———
 //
 // 为什么要有它：滚轮曾经在指针悬停 HUD 时**完全无效**（监听挂在 gl.domElement 上，
@@ -1829,6 +2078,15 @@ function judgeHudAutoHide(res) {
       results.push({ pass: "hud-wheel", 分类: "结构量（distTarget + elementFromPoint 留证）", ...judgeHudWheel(hw) });
     } catch (err) {
       failures.push(`hud-wheel: ${err.message}`);
+    }
+  }
+  // ——— 月食半球判据（正侧暗 / 反侧不暗）———
+  if (want("eclipse-hemisphere")) {
+    try {
+      const ec = await runEclipseHemisphere(browser, base);
+      results.push({ pass: "eclipse-hemisphere", 分类: "结构量（整盘平均亮度 + 几何分组）", ...judgeEclipseHemisphere(ec) });
+    } catch (err) {
+      failures.push(`eclipse-hemisphere: ${err.message}`);
     }
   }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
