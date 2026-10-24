@@ -1360,9 +1360,9 @@ const ONLY = (process.env.XG_ONLY ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 const want = (name) => ONLY.length === 0 || ONLY.includes(name);
-// XG_STRICT=1：把「已知缺陷」当红判。**只用于反向验证**（证明那条断言真有牙齿），
-// 常驻验收一律不带它——否则就回到「常红 → 没人看 → 有人加 || true」那条老路。
-const STRICT = process.env.XG_STRICT === "1";
+// 注：这里原来有一个 `XG_STRICT=1` 开关，作用是把「已知缺陷」当红判（反向验证用）。
+// t15 收尾时最后一条已知缺陷（过渡段穿地球）转成了硬断言，这个开关失去对象，已删除——
+// 留着一个没有作用的旋钮，比没有旋钮更坏：下一个人会以为它还在控制什么。
 const startedAt = Date.now();
 const results = [];
 const hudHeaders = [];
@@ -2412,9 +2412,14 @@ function judgeHudAutoHide(res) {
         let belowMs = 0;
         let belowFrames = 0;
         let worst = null;
+        let minRatio = Infinity; // 每个相位里「距离 ÷ 该天体半径」的最小值：硬断言判的就是它
         for (let i = 0; i < sample.length; i++) {
           const f = sample[i];
           const r = typeof f.radius === "number" ? f.radius : f.id === "earth" ? EARTH_RADIUS_WORLD : null;
+          if (r !== null && r > 0) {
+            const ratio = f.dist / r;
+            if (ratio < minRatio) minRatio = ratio;
+          }
           const inside = r !== null && f.dist < r;
           if (!inside) continue;
           belowFrames++;
@@ -2425,6 +2430,7 @@ function judgeHudAutoHide(res) {
           phase: +((k * 2.55) / 3).toFixed(2), // 钉住的相位（模拟秒偏移）
           frames: sample.length,
           belowFrames,
+          minRatio: Number.isFinite(minRatio) ? +minRatio.toFixed(3) : null,
           belowMs: +belowMs.toFixed(0),
           worstId: worst?.id ?? null,
           worstDist: worst ? +worst.dist.toFixed(3) : null,
@@ -2432,44 +2438,30 @@ function judgeHudAutoHide(res) {
         });
       }
       clearance.transition = transition;
-      // ⚠ **已知缺陷：记录但不判红。** 聚焦动画期间 clampOutsideParent 不跑，机位插值可能穿过
-      // 地球。不进 failures —— 一条修不了的 bug 不该让每次 `npm run verify` 都红（本仓库的
-      // 帧时间墓志铭就是这么写下的）。明细与**到期条件**只有一个住处：
-      // scripts/README.md「已知缺陷（记录但不判红）」。
-      const worstCase = transition
-        .filter((t) => t.belowFrames > 0)
-        .sort((a, b) => (a.worstDist ?? 9) - (b.worstDist ?? 9))[0];
-      clearance.knownBug = worstCase
-        ? {
-            knownBug: "transition-penetration",
-            minDist: worstCase.worstDist,
-            minBody: worstCase.worstId,
-            bodyRadius: worstCase.worstRadius,
-            framesBelow: worstCase.belowFrames,
-            windowMs: worstCase.belowMs,
-            phase: worstCase.phase,
-            // 三次钉相位里每次的 最差距离 ÷ 该天体半径（<1 就是穿进去了）
-            ratios: transition
-              .filter((t) => t.worstDist != null)
-              .map((t) => ({ phase: t.phase, ratio: +(t.worstDist / (t.worstRadius || 1)).toFixed(3) })),
+      /*
+       * t15 收尾：**到期条件已满足，这条从「只记录」转成硬断言。**
+       *
+       * 到期条件（原写在 README「已知缺陷」里）：过渡段插值改为每帧钳制在父天体半径之外后，
+       * 本条转为硬断言，最小值 ≥ 1.0 × 地球半径。t19 已落地：地心最近距离 0.8067 → **1.12**，
+       * 0 帧 <1。所以这里不再有「记录但不判红」的分支——**它红了就是钳制退了**。
+       */
+      const ratios = transition.filter((t) => t.minRatio != null);
+      clearance.minRatio = ratios.length ? +Math.min(...ratios.map((t) => t.minRatio)).toFixed(3) : null;
+      clearance.minRatioThreshold = 1.0;
+      if (!ratios.length) {
+        failures.push("camera-clearance(过渡): 三个相位都读不到「距离 ÷ 半径」—— 判据失去对象，必须红");
+      } else {
+        for (const t of transition) {
+          if (t.minRatio != null && t.minRatio < 1.0) {
+            failures.push(
+              `camera-clearance(过渡): 相位 +${t.phase} 相机进入 ${t.worstId ?? "某天体"} 球体 —— ` +
+                `最小距离 ${t.minRatio}× 半径 < 1.0（${t.belowFrames} 帧 / ${t.belowMs}ms）。` +
+                `过渡段钳制退了？看 focusPose 之后的 clampAnimationPath。`,
+            );
           }
-        : null;
-      if (clearance.knownBug) {
-        const k = clearance.knownBug;
-        console.log(
-          `\n【已知缺陷】camera-clearance(过渡): 相机进入 ${k.minBody} 球体 —— 最低 ${k.minDist} < 半径 ${k.bodyRadius}` +
-            `（${k.framesBelow} 帧 / ${k.windowMs}ms，相位 +${k.phase}）\n` +
-            `           **不算回归**；明细与到期条件见 scripts/README.md「已知缺陷（记录但不判红）」。`,
-        );
+        }
       }
-      if (clearance.knownBug && STRICT) {
-        // 反向验证入口：XG_STRICT=1 时把已知缺陷按红判。
-        // 它是「这条断言有没有牙齿」的一次性证明，不是常驻状态——常驻验收必须保持绿。
-        failures.push(
-          `camera-clearance(过渡): 相机进入 ${clearance.knownBug.minBody} 球体（距球心 ${clearance.knownBug.minDist} < 半径 ${clearance.knownBug.bodyRadius}，` +
-            `${clearance.knownBug.framesBelow} 帧 / ${clearance.knownBug.windowMs}ms）`,
-        );
-      }
+      clearance.knownBug = null; // 已转硬断言；字段保留为 null 以免归档读取方炸
     } catch (err) {
       failures.push(`camera-clearance: ${err.message}`);
     }
@@ -2508,7 +2500,6 @@ console.log(`耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s（${results
           viewports: [...new Set(results.map((r) => r?.viewport).filter(Boolean))],
           elapsedSeconds: +((Date.now() - startedAt) / 1000).toFixed(1),
           only: ONLY.length ? ONLY : "all",
-          strict: STRICT,
         },
       });
       const rel = (p) => path.relative(process.cwd(), p).replace(/\\/g, "/");
