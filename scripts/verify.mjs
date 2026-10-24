@@ -2422,7 +2422,8 @@ function judgeHudAutoHide(res) {
           try {
             const hist = readIndex().slice(-4); // 前 4 次 + 本次 = 最近 5 次
             const una = hist.filter((e) => Array.isArray(e.unaligned) && e.unaligned.includes("sun-occlusion")).length;
-            return +((4 - una) / 5).toFixed(2); // 本次已对齐 → 计入 1 次
+            // 本次已对齐 → 对齐数 = 5 - (历史未对齐数)；写成 (4-una) 会系统性少算 20%，别再用
+            return +((5 - una) / 5).toFixed(2);
           } catch {
             return null;
           }
