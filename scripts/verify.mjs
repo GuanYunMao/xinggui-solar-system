@@ -474,6 +474,292 @@ async function sampleSkyLuma(page, bgLuma, maxRatio) {
   );
 }
 
+// ——— 手机 HUD 交互五条：把「全都工作但 0/5 被守」补成 5/5 ————————
+// 病根（2026-10-24 实测）：下面这五条交互在当时都工作，但 verify 里一条断言都没有——
+// 删掉 `skipClick`、把 `SHEET_MAX.bar` 从 7rem 改回 28dvh、把 `.eyebrow` 放出来，
+// verify 和 CI 都会全绿。所以它们补的是一类"静默回归"。
+//
+// 判据分类：**全部是结构量**（DOM 属性 / 精确计数 / 同一次运行内自比），没有一条读观测量
+// 或绝对毫秒。唯一**只记录不判**的是「松手后浏览器补发的 click 次数」——那是浏览器行为，
+// 不是产品设计值，判它等于给 Chrome 版本上锁。
+//
+// 两条踩过的坑（别重新踩）：
+//   1. 触摸必须走 CDP `Input.dispatchTouchEvent`。`page.mouse` 是鼠标，touchEnd 之后浏览器
+//      不会补发 click，第二条判据的靶子（skipClick 吃掉补发 click）就消失了；
+//      `page.evaluate` 里 `dispatchEvent` 不是可信事件，同样不补发。
+//   2. 每步都要**重新量把手坐标**：详情卡收起后把手从 y≈351 挪到 y≈604，复用旧坐标会点在
+//      画布上（第一次写这个夹具时就这么点空了）。
+//
+// 挂载点：`run()` 里 `page.screenshot()` **之后**。既有那四张图是人工复核的基准，
+// 夹具会把卡片停在「收起」档，放在截图前会把基准改掉。
+const HUD_HANDLE = 'article button[aria-label^="详情卡高度"]';
+const hudTier = (state) => (state?.tier ?? "").replace(/^详情卡高度：/, ""); // 全屏 / 半屏 / 收起
+
+async function touchOf(context, page) {
+  const cdp = await context.newCDPSession(page);
+  const pt = (x, y) => [{ x, y, id: 1, radiusX: 5, radiusY: 5, force: 1 }];
+  return {
+    tap: async (x, y) => {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: pt(x, y) });
+      await page.waitForTimeout(40);
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+      await page.waitForTimeout(200);
+    },
+    drag: async (x0, y0, x1, y1, steps = 8) => {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: pt(x0, y0) });
+      await page.waitForTimeout(30);
+      for (let i = 1; i <= steps; i++) {
+        const k = i / steps;
+        await cdp.send("Input.dispatchTouchEvent", {
+          type: "touchMove",
+          touchPoints: pt(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k),
+        });
+        await page.waitForTimeout(16);
+      }
+      await page.waitForTimeout(60);
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+      await page.waitForTimeout(320);
+    },
+  };
+}
+
+// 把手随档位上下移动 —— 每次调用都重新量，不缓存
+async function centerOf(page, sel) {
+  const box = await page.locator(sel).first().boundingBox();
+  if (!box) throw new Error(`量不到 ${sel} 的位置`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+const readHeaderState = (page) =>
+  page.evaluate(() => {
+    const box = (el) => {
+      const r = el.getBoundingClientRect();
+      return { left: +r.left.toFixed(1), right: +r.right.toFixed(1), width: +r.width.toFixed(1) };
+    };
+    const header = document.querySelector("header");
+    const epoch = document.querySelector("header p.text-lg");
+    const leftGroup = header?.children?.[0] ?? null;
+    const version = document.querySelector("header .eyebrow");
+    return {
+      epoch: epoch
+        ? { text: epoch.innerText.trim(), ...box(epoch), display: getComputedStyle(epoch).display }
+        : null,
+      leftRight: leftGroup ? box(leftGroup).right : null,
+      versionDisplay: version ? getComputedStyle(version).display : null,
+      headerOverX: header ? header.scrollWidth - header.clientWidth : null,
+      innerW: innerWidth,
+    };
+  });
+
+const readLayerState = (page) =>
+  page.evaluate(() => ({
+    overlay: document.querySelectorAll('[data-overlay-open="true"]').length,
+    expanded: document.querySelector('button[aria-label="图层"]')?.getAttribute("aria-expanded") ?? null,
+  }));
+
+const readCardState = (page) =>
+  page.evaluate(() => {
+    const card = document.querySelector("article");
+    const handle = document.querySelector('article button[aria-label^="详情卡高度"]');
+    if (!card || !handle) return null;
+    const dl = card.querySelector("dl");
+    return {
+      tier: handle.getAttribute("aria-label"),
+      h: +card.getBoundingClientRect().height.toFixed(1),
+      maxH: getComputedStyle(card).maxHeight,
+      cols: dl ? getComputedStyle(dl).gridTemplateColumns.split(" ").length : null,
+      h2: card.querySelector("h2")?.innerText?.trim() ?? null,
+    };
+  });
+
+const readChipsState = (page) =>
+  page.evaluate(() => {
+    const row = document.querySelector("#chip-row");
+    const btn = document.querySelector('button[aria-label="天体列表"]');
+    if (!row || !btn) return null;
+    return {
+      h: +row.getBoundingClientRect().height.toFixed(1),
+      overX: row.scrollWidth - row.clientWidth,
+      wrap: getComputedStyle(row).flexWrap,
+      expanded: btn.getAttribute("aria-expanded"),
+      text: btn.textContent.trim(),
+      count: row.querySelectorAll('button[id^="chip-"]').length,
+    };
+  });
+
+/**
+ * 跑手机 HUD 五条夹具。
+ * mode="locked"：390 全新 context（localStorage 空，徽标是锁态），跑完整五条。
+ * mode="unlocked"：调用方已注入 gate 的 3 槽，只补「抬头」这一格样本——
+ *   它是 390 下最紧的已校准态（徽标更宽），所以抬头押在最紧处。
+ */
+async function runMobileHud(page, context, mode) {
+  const header = await readHeaderState(page);
+  if (mode === "unlocked") return { mode, header };
+
+  const touch = await touchOf(context, page);
+  const hud = { mode, header };
+
+  // ① 图层浮层：开 → 再点一次必须收回（守的是「开得出来但收不回去」）
+  await page.locator('button[aria-label="图层"]').tap();
+  await page.waitForTimeout(200);
+  hud.layerOpen = await readLayerState(page);
+  await page.locator('button[aria-label="图层"]').tap();
+  await page.waitForTimeout(200);
+  hud.layerClosed = await readLayerState(page);
+
+  // ⑤ 星球列表：收起 ⇄ 展开 ⇄ 收起。放在选天体之前（此时 chip 是初始那一批）
+  hud.chipsCollapsed0 = await readChipsState(page);
+  await page.locator('button[aria-label="天体列表"]').tap();
+  await page.waitForTimeout(250);
+  hud.chipsExpanded = await readChipsState(page);
+  await page.locator('button[aria-label="天体列表"]').tap();
+  await page.waitForTimeout(250);
+  hud.chipsCollapsed1 = await readChipsState(page);
+
+  // ② 详情卡手势：前置是选中地球（卡片才出现，停在半屏）
+  await page.locator("#chip-earth").tap();
+  await page.waitForSelector("article h2", { timeout: 10000 });
+  await page.waitForTimeout(1500); // 等镜头聚焦动画走完
+  // 只记录：浏览器会在 touchEnd 后补发 click。数它，不判它。
+  await page.evaluate(() => {
+    window.__xgHudClicks = 0;
+    document.addEventListener(
+      "click",
+      (e) => {
+        const t = e.target instanceof Element ? e.target.closest('[aria-label^="详情卡高度"]') : null;
+        if (t) window.__xgHudClicks++;
+      },
+      true,
+    );
+  });
+
+  const card0 = await readCardState(page);
+  let hp = await centerOf(page, HUD_HANDLE);
+  let clicks = await page.evaluate(() => window.__xgHudClicks);
+  await touch.drag(hp.x, hp.y, hp.x, hp.y - 15, 5); // 小位移：死区，不动
+  const card15 = await readCardState(page);
+  const synthesizedClicks = (await page.evaluate(() => window.__xgHudClicks)) - clicks;
+
+  hp = await centerOf(page, HUD_HANDLE);
+  await touch.drag(hp.x, hp.y, hp.x + 30, hp.y, 6); // 横滑：这是一张竖抽屉，不动
+  const card30 = await readCardState(page);
+
+  hp = await centerOf(page, HUD_HANDLE);
+  await touch.drag(hp.x, hp.y, hp.x, hp.y - 80, 8); // 上拖：只走一档到全屏
+  const cardFull = await readCardState(page);
+
+  hp = await centerOf(page, HUD_HANDLE);
+  await touch.drag(hp.x, hp.y, hp.x, hp.y + 80, 8); // 下拖：只走一档回半屏
+  const cardBack = await readCardState(page);
+
+  hud.card = { start: card0, small: card15, side: card30, full: cardFull, back: cardBack, synthesizedClicks };
+
+  // ③ 收起高度：tap（无位移）从半屏落到「收起」
+  hp = await centerOf(page, HUD_HANDLE);
+  await touch.tap(hp.x, hp.y);
+  await page.waitForTimeout(250);
+  hud.bar = await readCardState(page);
+  // 7rem 要按**运行时**根字号换算：用户改浏览器字号时 rem 会变，写死 112 会误红
+  hud.rootPx = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize));
+  return hud;
+}
+
+// P4 抬头：每条都是二值/精确比较，没有经验阈值。
+// ⚠ 盲区（写进 README，别以为它守住了更多）：把 1.2.1 之前的样式注回去，390 下模拟历
+// **也**不会越界（实测间距仍有 32.5–52.5px），所以这条抓不住「顶部重排被整体回滚」；
+// 「版本号让位」只能靠 .eyebrow display 那一条单独守。它真正会红的是「抬头又变宽到装不下」。
+function judgeHudHeader(sample, mode) {
+  const p = `hud-header（${mode}）`;
+  if (!sample) return failures.push(`${p}: 读不到抬头`);
+  if (!sample.epoch) return failures.push(`${p}: 抬头里没有模拟历（header p.text-lg）`);
+  if (!sample.epoch.text) failures.push(`${p}: 模拟历是空文本`);
+  if (sample.epoch.display === "none") failures.push(`${p}: 模拟历 display=none（被隐藏）`);
+  if (sample.epoch.left < -0.5 || sample.epoch.right > sample.innerW + 0.5) {
+    failures.push(`${p}: 模拟历跑出视口（[${sample.epoch.left}..${sample.epoch.right}] vs 视口宽 ${sample.innerW}）`);
+  }
+  if (sample.leftRight !== null && sample.leftRight > sample.epoch.left + 0.5) {
+    failures.push(`${p}: 模拟历被左侧品牌组压住（品牌组右缘 ${sample.leftRight} > 模拟历左缘 ${sample.epoch.left}）`);
+  }
+  if (sample.headerOverX > 1) failures.push(`${p}: 抬头自身横向溢出 ${sample.headerOverX}px`);
+  if (sample.innerW < 640 && sample.versionDisplay !== "none") {
+    failures.push(`${p}: 窄屏 ${sample.innerW}px 下版本号没让位（header .eyebrow display=${sample.versionDisplay}）`);
+  }
+}
+
+function judgeHudLocked(hud) {
+  // ① 图层浮层（P1）
+  if (!hud.layerOpen || !hud.layerClosed) {
+    failures.push("hud-layer: 读不到浮层状态");
+  } else {
+    if (hud.layerOpen.overlay !== 1) failures.push(`hud-layer: 点开后 [data-overlay-open="true"] 计数 ${hud.layerOpen.overlay} ≠ 1`);
+    if (hud.layerOpen.expanded !== "true") failures.push(`hud-layer: 点开后 aria-expanded=${hud.layerOpen.expanded}，期望 true`);
+    if (hud.layerClosed.overlay !== 0) {
+      failures.push(`hud-layer: 第二次点开后没收起（[data-overlay-open="true"] 计数 ${hud.layerClosed.overlay}，期望 0）`);
+    }
+    if (hud.layerClosed.expanded !== "false") failures.push(`hud-layer: 收起后 aria-expanded=${hud.layerClosed.expanded}，期望 false`);
+  }
+
+  // ② 详情卡手势（P2）
+  const c = hud.card;
+  if (!c?.start || !c.small || !c.side || !c.full || !c.back) {
+    failures.push("hud-gesture: 量不到详情卡状态");
+  } else {
+    if (hudTier(c.small) !== hudTier(c.start)) {
+      failures.push(`hud-gesture: 竖向蹭 15px 就换档（${hudTier(c.start)} → ${hudTier(c.small)}）—— 死区/skipClick 被改坏了？`);
+    }
+    if (Math.abs(c.small.h - c.start.h) > 1) {
+      failures.push(`hud-gesture: 竖向蹭 15px 后卡片高度变了 ${c.start.h} → ${c.small.h}px（应 ≤1px）`);
+    }
+    if (hudTier(c.side) !== hudTier(c.start)) {
+      failures.push(`hud-gesture: 横向蹭 30px 换了档（${hudTier(c.start)} → ${hudTier(c.side)}）—— 这是一张竖抽屉`);
+    }
+    if (hudTier(c.full) !== "全屏") failures.push(`hud-gesture: 上拖 80px 后档位是「${hudTier(c.full)}」，期望「全屏」（只走一档）`);
+    if (c.full.cols !== 1) failures.push(`hud-gesture: 全屏档 dl 是 ${c.full.cols} 列，期望 1 列`);
+    if (hudTier(c.back) !== "半屏") failures.push(`hud-gesture: 下拖 80px 后档位是「${hudTier(c.back)}」，期望「半屏」（只走一档）`);
+  }
+
+  // ③ 收起高度（P3）
+  const b = hud.bar;
+  if (!b) {
+    failures.push("hud-card-bar: 量不到收起态");
+  } else {
+    if (hudTier(b) !== "收起") failures.push(`hud-card-bar: 档位是「${hudTier(b)}」，期望「收起」`);
+    if (!(b.h <= hud.rootPx * 7 + 1)) {
+      failures.push(`hud-card-bar: 收起后 article 高 ${b.h}px > 7rem(${(hud.rootPx * 7).toFixed(1)}px)+1 —— SHEET_MAX.bar 被改大了？`);
+    }
+    if (Math.abs(parseFloat(b.maxH) - hud.rootPx * 7) > 0.5) {
+      failures.push(`hud-card-bar: computed max-height ${b.maxH} ≠ 7rem(${(hud.rootPx * 7).toFixed(1)}px)`);
+    }
+    if (b.h2 !== "地球") failures.push(`hud-card-bar: 收起后卡片标题是「${b.h2}」，期望「地球」—— 收起不等于消失`);
+  }
+
+  // ⑤ 星球列表（P5）
+  const c0 = hud.chipsCollapsed0;
+  const c1 = hud.chipsExpanded;
+  const c2 = hud.chipsCollapsed1;
+  if (!c0 || !c1 || !c2) {
+    failures.push("hud-chips: 读不到星球列表状态");
+  } else {
+    if (c0.expanded !== "false") failures.push(`hud-chips: 初始 aria-expanded=${c0.expanded}，期望 false`);
+    if (!/^全部 \d+$/.test(c0.text)) {
+      failures.push(`hud-chips: 初始按钮文本「${c0.text}」不匹配 /^全部 \\d+$/`);
+    } else if (Number(c0.text.match(/\d+/)[0]) !== c0.count) {
+      failures.push(`hud-chips: 按钮写「${c0.text}」但行里只有 ${c0.count} 颗 chip`);
+    }
+    if (c0.overX <= 20) {
+      failures.push(`hud-chips: 收起态横向只溢出 ${c0.overX}px（≤20）—— 本来就不该溢出，这条判据失去了前提`);
+    }
+    if (c1.expanded !== "true") failures.push(`hud-chips: 展开后 aria-expanded=${c1.expanded}，期望 true`);
+    if (c1.text !== "收起") failures.push(`hud-chips: 展开后按钮文本「${c1.text}」，期望「收起」`);
+    if (c1.wrap !== "wrap") failures.push(`hud-chips: 展开后 flex-wrap=${c1.wrap}，期望 wrap`);
+    if (c1.overX > 1) failures.push(`hud-chips: 展开后仍横向溢出 ${c1.overX}px`);
+    if (!(c1.h > c0.h + 20)) failures.push(`hud-chips: 展开后行高 ${c1.h}px 没比收起态 ${c0.h}px 高 20px 以上`);
+    if (c2.expanded !== "false") failures.push(`hud-chips: 再点一次没收起（aria-expanded=${c2.expanded}）`);
+    if (Math.abs(c2.h - c0.h) > 1) failures.push(`hud-chips: 再收起后行高 ${c2.h}px ≠ 初始 ${c0.h}px`);
+  }
+}
+
 async function run(browser, spec) {
   const context = await browser.newContext({
     viewport: spec.viewport,
@@ -490,6 +776,16 @@ async function run(browser, spec) {
 
   const result = { pass: spec.name, url: spec.url, errors };
   try {
+    // 已校准态（gate 三槽）是 390 下最紧的布局：徽标更宽，模拟历与品牌组的余量最小。
+    // 所以抬头那一格样本押在最紧处。必须在 goto **之前**注入，晚了页面已经渲染完。
+    if (spec.hud === "unlocked") {
+      await context.addInitScript(() => {
+        localStorage.setItem(
+          "xinggui-gate-v1",
+          JSON.stringify({ v: 1, lit: ["time", "target", "layer"], unlockedAt: Date.now() }),
+        );
+      });
+    }
     // ?diag=1：只为打开 preserveDrawingBuffer（画布像素体检要用），不改产品行为
     await page.goto(withDiag(spec.url), { waitUntil: "load", timeout: 30000 });
     await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
@@ -517,6 +813,18 @@ async function run(browser, spec) {
     result.quality = await readQuality(page);
 
     await page.screenshot({ path: path.join(SHOTS, `${spec.name}.png`) });
+
+    // 手机 HUD 五条夹具：放在 screenshot **之后**（它会把卡片停在「收起」档，
+    // 放在前面会改掉人工复核用的那几张基准图）。
+    if (spec.hud) {
+      try {
+        result.hud = await runMobileHud(page, context, spec.hud);
+        if (result.hud.mode === "locked") judgeHudLocked(result.hud);
+        judgeHudHeader(result.hud.header, spec.hud);
+      } catch (err) {
+        failures.push(`hud: ${spec.name}（${spec.hud}）的交互夹具抛错：${err.message}`);
+      }
+    }
   } catch (err) {
     errors.push(`fatal: ${err.message}`);
   }
@@ -543,29 +851,59 @@ const browser = await chromium.launch({
 });
 
 const base = `http://127.0.0.1:${port}/`;
+// XG_ONLY=mobile,mobile-selected：只跑指定的 page pass。**不设这个变量时行为与以前逐字相同。**
+// 存在理由和 check-shape 的 --selftest 相同：要证明一条断言真的会红，得能在改坏的产物上单跑它，
+// 而不是每次都等十几条 pass 跑完再看那一行。
+const ONLY = (process.env.XG_ONLY ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const want = (name) => ONLY.length === 0 || ONLY.includes(name);
+// XG_STRICT=1：把「已知缺陷」当红判。**只用于反向验证**（证明那条断言真有牙齿），
+// 常驻验收一律不带它——否则就回到「常红 → 没人看 → 有人加 || true」那条老路。
+const STRICT = process.env.XG_STRICT === "1";
+const startedAt = Date.now();
 const results = [];
+const hudHeaders = [];
 try {
-  results.push(
-    await run(browser, {
-      name: "desktop",
-      url: base,
-      viewport: { width: 1280, height: 720 },
-      interact: true,
-      expectSelected: "地球",
-    }),
-  );
-  results.push(
-    await run(browser, {
+  if (want("desktop")) {
+    results.push(
+      await run(browser, {
+        name: "desktop",
+        url: base,
+        viewport: { width: 1280, height: 720 },
+        interact: true,
+        expectSelected: "地球",
+      }),
+    );
+  }
+  if (want("mobile")) {
+    const r = await run(browser, {
       name: "mobile",
       url: base,
       viewport: { width: 390, height: 844 },
       dpr: 3,
       isMobile: true,
       hasTouch: true,
-    }),
-  );
-  results.push(
-    await run(browser, {
+      hud: "locked", // 锁态：正常新 context，localStorage 空
+    });
+    results.push(r);
+    if (r.hud?.mode === "locked") {
+      // 五条里的四条从这一格出（抬头那一格两态共用一条 record）
+      results.push({ pass: "hud-layer", open: r.hud.layerOpen, closed: r.hud.layerClosed });
+      results.push({ pass: "hud-gesture", ...r.hud.card });
+      results.push({ pass: "hud-card-bar", bar: r.hud.bar, rootPx: r.hud.rootPx });
+      results.push({
+        pass: "hud-chips",
+        collapsed0: r.hud.chipsCollapsed0,
+        expanded: r.hud.chipsExpanded,
+        collapsed1: r.hud.chipsCollapsed1,
+      });
+      hudHeaders.push({ mode: "locked", ...r.hud.header });
+    }
+  }
+  if (want("mobile-selected")) {
+    const r = await run(browser, {
       name: "mobile-selected",
       url: base,
       viewport: { width: 390, height: 844 },
@@ -574,16 +912,27 @@ try {
       hasTouch: true,
       interact: true,
       expectSelected: "地球",
-    }),
-  );
-  results.push(
-    await run(browser, {
-      name: "single-file",
-      url: pathToFileURL(SINGLE).href,
-      viewport: { width: 1280, height: 720 },
-    }),
-  );
+      hud: "unlocked", // 已校准：init script 预置 gate 三槽
+    });
+    results.push(r);
+    if (r.hud?.header) hudHeaders.push({ mode: "unlocked", ...r.hud.header });
+  }
+  if (hudHeaders.length) results.push({ pass: "hud-header", samples: hudHeaders });
+  if (want("single-file")) {
+    results.push(
+      await run(browser, {
+        name: "single-file",
+        url: pathToFileURL(SINGLE).href,
+        viewport: { width: 1280, height: 720 },
+      }),
+    );
+  }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
+  // XG_ONLY 设了就不再往下跑：反向测试只关心某条 page pass 会不会红，数值段是最费时的部分。
+  // 用带标签的块 + break，而不是整体包一层 if —— 后者要把下面几百行整体缩进一层，
+  // 那种 diff 没人能审。所以块里缩进保持原样，这是有意的。
+  numeric: {
+    if (ONLY.length && !ONLY.includes("numeric")) break numeric;
   // 基线 A：遥测页开起来之前量一次。基线 B：遥测页关掉之后量一次。
   // 两次夹住场景采样，分母取两者较大值 —— 机器状态在这段里漂了也能吃掉一部分。
   let baselineA = null;
@@ -849,7 +1198,7 @@ try {
   // 与「画布不是全黑」那条的关系：那条在全画布取 25 块、meanLum ≥ 2（判「画出来没有」）；
   // 这条取**边缘 12 块**（跳过中央 2×2，避开天体）、判「星星有没有过曝」。
   // 区域与统计目的都不同，所以 14.12（边缘均值）与 23.56（全画布均值）不是一个量，互不迁就。
-  const SUN_RADIUS_WORLD = 3.8; // src/solar/data.ts 的 sun.radius（TEAM.md:16：天体数值改动须 captain 批）
+  const SUN_RADIUS_WORLD = 3.8; // src/solar/data.ts 的 sun.radius（天体数值改动须 captain 批，别跟着读数改这一行）
   const ZOOM_TARGET_RATIO = 3; // 「太阳占画面约一半」的设计目标：视距 = 3R
   const ZOOM_STEP_BUDGET = 15; // 设计预算：≤15 次 wheel 必须到位（改前约 80 格 / 改后实测 11 格）
   const NO_CLIP_RATIO = 1.2; // 相机到太阳中心 ≥ 1.2R 才算没穿模
@@ -1195,23 +1544,30 @@ try {
       if (hasMoonChip) await page.locator("#chip-moon").click();
       await page.waitForTimeout(2800);
       const before = await candidatesOf(page, ["moon", "earth"]);
-      // 按**模拟时间**跑满一个公转周期，不按帧数：
-      // 无 vsync 时 rAF 能飙到上千帧/秒（实测 260 帧只推进 0.24 个模拟单位，而同一段代码
-      // 在 60fps 下 260 帧走 4.33 个单位）。按帧数采样会让"跑满一个周期"变成随缘。
-      const series = await page.evaluate(async () => {
+      // 采 ≥3 个公转周期、**分窗口报**。第 1 个窗口是切换残差（实测 0.944–0.983），
+      // 第 2 个窗口起才稳定（1.023–1.026）。混在一起取 min，会让同一份代码三次给出
+      // 0.94 / 0.98 / 1.03，被当成产品回归——基线的采样纪律就是这么长出来的。
+      // 按**模拟时间**分段、不按帧数：无 vsync 时 rAF 能飙到上千帧/秒，按帧数采样会让
+      // 「跑满 3 个周期」变成随缘。
+      const EARTH_PERIOD_SIM = 2.55; // 一个公转周期的模拟秒数（实测 2.61 略超一个周期）
+      const series = await page.evaluate(async (period) => {
         const out = [];
         const t = window.__solarTime;
         const t0 = t.now();
         const wall0 = performance.now();
-        while (out.length < 3000) {
+        while (out.length < 8000) {
           await new Promise((r) => requestAnimationFrame(r));
           const cs = window.__solarPick?.candidates?.() ?? [];
           const earth = cs.find((c) => c.id === "earth");
-          out.push({ d: earth ? earth.depth : null, t: t.now() - t0 });
-          if (t.now() - t0 >= 2.6 || performance.now() - wall0 > 25000) break; // ≥ 一个周期 / 或超时
+          out.push({
+            d: earth ? earth.depth : null, // candidates 口径：地球在相机背后时是 null（会静默跳过）
+            cam: window.__solarCamera?.()?.nearest ?? null, // 全方向口径：不受 candidates 剔除影响
+            t: t.now() - t0,
+          });
+          if (t.now() - t0 >= period * 3.3 || performance.now() - wall0 > 70000) break;
         }
         return out;
-      });
+      }, EARTH_PERIOD_SIM);
       const depths = series.map((s) => s.d).filter((d) => d !== null);
       const simSpan = series.at(-1)?.t ?? 0;
       const jumpPerFrame = [];
@@ -1228,32 +1584,173 @@ try {
       const sortedJ = [...jumpPerFrame].sort((x, y) => x - y);
       const medianJ = sortedJ[Math.floor(sortedJ.length / 2)] ?? 0;
       const minDepth = depths.length ? Math.min(...depths) : null;
+
+      // 亏口径统一：天体半径优先用探针给的 radius（t10 起 __solarCamera().nearest 带这个字段），
+      // 没有就只对地球回退到 EARTH_RADIUS_WORLD。**判「在不在球内」就是 dist < radius，不减半径。**
+      const radiusOf = (near) =>
+        near == null ? null : typeof near.radius === "number" ? near.radius : near.id === "earth" ? EARTH_RADIUS_WORLD : null;
+      const insideAny = series.filter((s) => {
+        const r = radiusOf(s.cam);
+        return r !== null && s.cam.dist < r;
+      });
+
+      // 分窗口：floor(模拟时间 / 一个周期)
+      const PERIODS = Math.max(1, Math.ceil(simSpan / EARTH_PERIOD_SIM));
+      const windows = [];
+      for (let w = 0; w < PERIODS; w++) {
+        const slice = series.filter((s) => Math.floor(s.t / EARTH_PERIOD_SIM) === w && s.d !== null);
+        if (!slice.length) continue;
+        const ds = slice.map((s) => s.d);
+        windows.push({
+          window: w + 1,
+          frames: slice.length,
+          min: +Math.min(...ds).toFixed(3),
+          max: +Math.max(...ds).toFixed(3),
+          judged: w >= 1, // 第 1 个窗口只记录（切换残差），第 2 个起才判
+        });
+      }
+      // 只压第 2 个周期起的 min（engineer 的 t4 口径：稳态 1.023–1.026，阈值 1.0 留 2.5% 余量）
+      const steadyWindows = windows.filter((x) => x.judged);
+      const steadyMin = steadyWindows.length ? Math.min(...steadyWindows.map((x) => x.min)) : null;
+
       const clearance = {
         pass: "camera-clearance",
         moonChip: hasMoonChip,
         frames: series.length,
-        simSpan: +simSpan.toFixed(2), // 应 ≥2.55（一个公转周期）
+        simSpan: +simSpan.toFixed(2), // 应 ≥ 7.65（3 个周期）
+        windows,
+        steadyMin, // 判据只看这个：第 2 个周期起的最小地心距离
         moonRadiusPx: before.moon?.r ?? null,
         moonDepth: before.moon?.d ?? null,
-        earthDepthMin: minDepth === null ? null : +minDepth.toFixed(3),
+        earthDepthMin: minDepth === null ? null : +minDepth.toFixed(3), // 全帧 min（含第 1 窗口，仅记录）
         earthDepthMax: depths.length ? +Math.max(...depths).toFixed(3) : null,
         jumpMaxPerFrame: jumpPerFrame.length ? +Math.max(...jumpPerFrame).toFixed(4) : null,
         jumpP95PerFrame: +(sortedJ[Math.floor(sortedJ.length * 0.95)] ?? 0).toFixed(4),
         jumpMedianPerFrame: +medianJ.toFixed(4),
         jumpMaxPerSimUnit: jumpPerSim.length ? +Math.max(...jumpPerSim).toFixed(4) : null, // 与帧率无关
-        insideEarth: minDepth === null ? null : minDepth < EARTH_RADIUS_WORLD,
-        clampLine: +(EARTH_RADIUS_WORLD * 1.35).toFixed(3), // 产品当前的钳制半径（SolarCanvas clampOutsideParent）
-        note: "只测量不判红：t47 落地后再定阈值；jumpMaxPerSimUnit 是换算到同一模拟时间尺度的跳变",
+        insideAnyBody: insideAny.length,
+        insideAnyBodyId: insideAny[0]?.cam?.id ?? null,
+        insideAnyBodyMin: insideAny.length ? +Math.min(...insideAny.map((s) => s.cam.dist)).toFixed(3) : null,
+        clampLine: +(EARTH_RADIUS_WORLD * 1.35).toFixed(3), // 产品软滑出的目标半径（SolarCanvas clampOutsideParent）
+        note: "判据只压第 2 个周期起、min ≥ 1.0；第 1 个周期是切换残差，只记录。稳态口径同时看 candidates 与全方向 nearest。",
       };
       results.push(clearance);
       if (!hasMoonChip) console.error("（注意）camera-clearance: 选中地球后没有 chip-moon，测的是未聚焦状态");
       if (series.length < 10) console.error("（注意）camera-clearance: 没采到样本");
-      else if (clearance.simSpan < 2.5) {
-        console.error(`（注意）camera-clearance: 只推进了 ${clearance.simSpan} 个模拟单位（不足一个周期），基线不完整`);
-      } else if (clearance.insideEarth) {
-        // 虽然"只测量"，但「相机进到地球内部」是硬伤（画面上整颗地球会消失），记成失败更诚实
+      else if (clearance.simSpan < EARTH_PERIOD_SIM * 2.9) {
+        console.error(`（注意）camera-clearance: 只推进了 ${clearance.simSpan} 个模拟单位（不足 3 个周期），基线不完整`);
+      }
+      if (steadyWindows.length === 0) {
+        failures.push("camera-clearance: 只采到 1 个周期，没有稳态窗口可判（采样不足，不是产品问题）");
+      }
+      for (const w of steadyWindows) {
+        if (w.min < 1.0) {
+          failures.push(
+            `camera-clearance: 第 ${w.window} 个周期地心距离 min ${w.min} < 1.0（钳制线 ${clearance.clampLine}，留 2.5% 余量）`,
+          );
+        }
+      }
+      if (insideAny.length) {
+        // 「相机进到天体内」是硬伤（画面上那颗天体会消失），稳态里出现就算失败
         failures.push(
-          `camera-clearance: 跟随月球时相机进到地球内部（地心距离 ${clearance.earthDepthMin} < 半径 ${EARTH_RADIUS_WORLD}）`,
+          `camera-clearance: 稳态采样里相机进到天体内（${clearance.insideAnyBodyId} 距球心 ${clearance.insideAnyBodyMin} 帧数 ${insideAny.length}）`,
+        );
+      }
+
+      // ——— 过渡段（点 #chip-moon 后 0–3s）：这条**现在会红，红得对** ——————————
+      // 聚焦动画期间 clampOutsideParent 不跑（动画分支提前 return），插值路径可能穿过地球，
+      // 动画结束后才被软滑出。实测地心 min 0.528 / 0.570 / 0.977（地球半径 0.76）。
+      // 相位决定穿不穿（三次独立加载：红/红/绿），所以用 __solarTime.set() 钉三个相位各跑一次、
+      // 取最差的那次判 —— 否则这条断言在 CI 里 2/3 概率红，比不红还糟。
+      const transition = [];
+      for (const k of [0, 1, 2]) {
+        await page.goto(withDiag(base), { waitUntil: "load" });
+        await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+        await page.evaluate((kk) => {
+          const t = window.__solarTime;
+          t.set(t.now() + (kk * 2.55) / 3);
+        }, k);
+        await page.locator("#chip-earth").click();
+        await page.waitForTimeout(1200);
+        if ((await page.locator("#chip-moon").count()) === 0) {
+          transition.push({ phase: k, error: "没有 chip-moon" });
+          continue;
+        }
+        // 采样必须在**点击那一刻**开始：在页面里先起 rAF 循环，再由同一个脚本点下去
+        const sample = await page.evaluate(async () => {
+          const frames = [];
+          const wall0 = performance.now();
+          const loop = (async () => {
+            while (performance.now() - wall0 < 3000) {
+              await new Promise((r) => requestAnimationFrame(r));
+              const near = window.__solarCamera?.()?.nearest ?? null;
+              if (near) frames.push({ id: near.id, dist: near.dist, radius: near.radius ?? null, wall: performance.now() - wall0 });
+            }
+          })();
+          document.querySelector("#chip-moon")?.click();
+          await loop;
+          return frames;
+        });
+        // 墙钟毫秒用逐帧差求和（实测墙钟），不是「帧数 × 16.7」——后者在 30fps 的机器上会少算一半
+        let belowMs = 0;
+        let belowFrames = 0;
+        let worst = null;
+        for (let i = 0; i < sample.length; i++) {
+          const f = sample[i];
+          const r = typeof f.radius === "number" ? f.radius : f.id === "earth" ? EARTH_RADIUS_WORLD : null;
+          const inside = r !== null && f.dist < r;
+          if (!inside) continue;
+          belowFrames++;
+          if (i > 0) belowMs += f.wall - sample[i - 1].wall;
+          if (!worst || f.dist < worst.dist) worst = { id: f.id, dist: f.dist, radius: r };
+        }
+        transition.push({
+          phase: +((k * 2.55) / 3).toFixed(2), // 钉住的相位（模拟秒偏移）
+          frames: sample.length,
+          belowFrames,
+          belowMs: +belowMs.toFixed(0),
+          worstId: worst?.id ?? null,
+          worstDist: worst ? +worst.dist.toFixed(3) : null,
+          worstRadius: worst ? +worst.radius.toFixed(3) : null,
+        });
+      }
+      clearance.transition = transition;
+      // ⚠ **已知缺陷：记录但不判红。** 聚焦动画期间 clampOutsideParent 不跑，机位插值可能穿过
+      // 地球。不进 failures —— 一条修不了的 bug 不该让每次 `npm run verify` 都红（本仓库的
+      // 帧时间墓志铭就是这么写下的）。明细与**到期条件**只有一个住处：
+      // scripts/README.md「已知缺陷（记录但不判红）」。
+      const worstCase = transition
+        .filter((t) => t.belowFrames > 0)
+        .sort((a, b) => (a.worstDist ?? 9) - (b.worstDist ?? 9))[0];
+      clearance.knownBug = worstCase
+        ? {
+            knownBug: "transition-penetration",
+            minDist: worstCase.worstDist,
+            minBody: worstCase.worstId,
+            bodyRadius: worstCase.worstRadius,
+            framesBelow: worstCase.belowFrames,
+            windowMs: worstCase.belowMs,
+            phase: worstCase.phase,
+            // 三次钉相位里每次的 最差距离 ÷ 该天体半径（<1 就是穿进去了）
+            ratios: transition
+              .filter((t) => t.worstDist != null)
+              .map((t) => ({ phase: t.phase, ratio: +(t.worstDist / (t.worstRadius || 1)).toFixed(3) })),
+          }
+        : null;
+      if (clearance.knownBug) {
+        const k = clearance.knownBug;
+        console.log(
+          `\n【已知缺陷】camera-clearance(过渡): 相机进入 ${k.minBody} 球体 —— 最低 ${k.minDist} < 半径 ${k.bodyRadius}` +
+            `（${k.framesBelow} 帧 / ${k.windowMs}ms，相位 +${k.phase}）\n` +
+            `           **不算回归**；明细与到期条件见 scripts/README.md「已知缺陷（记录但不判红）」。`,
+        );
+      }
+      if (clearance.knownBug && STRICT) {
+        // 反向验证入口：XG_STRICT=1 时把已知缺陷按红判。
+        // 它是「这条断言有没有牙齿」的一次性证明，不是常驻状态——常驻验收必须保持绿。
+        failures.push(
+          `camera-clearance(过渡): 相机进入 ${clearance.knownBug.minBody} 球体（距球心 ${clearance.knownBug.minDist} < 半径 ${clearance.knownBug.bodyRadius}，` +
+            `${clearance.knownBug.framesBelow} 帧 / ${clearance.knownBug.windowMs}ms）`,
         );
       }
     } catch (err) {
@@ -1261,6 +1758,7 @@ try {
     }
     await ctx.close();
   }
+  } // ← numeric 块结束
 } finally {
   await browser.close();
   server.close();
@@ -1268,4 +1766,5 @@ try {
 
 console.log(JSON.stringify({ results, failures }, null, 2));
 console.log(failures.length ? `\n✗ ${failures.length} 项未通过` : "\n✓ 全部通过");
+console.log(`耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s（${results.length} 条 pass 记录）`);
 process.exit(failures.length ? 1 : 0);
