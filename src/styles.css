@@ -221,9 +221,174 @@ main[data-real-veil="1"] .real-controls {
   box-shadow: 0 0 0 1px var(--color-line);
 }
 
+/*
+ * t28 彩蛋门：光遇式悬浮感。
+ *
+ * 硬约束（写在这里给下一个人看）：**只用 transform / opacity / filter**。
+ * 不动 top/left/width，不起 rAF、不每帧写 DOM —— 我们正在量微卡顿，这个面板
+ * 不许变成新的帧预算消耗。reduced-motion 在文件底部统一关掉。
+ */
+.gate-panel {
+  position: relative;
+}
+
+.gate-glow {
+  animation: gate-float 6s ease-in-out infinite;
+  will-change: transform;
+}
+
+@keyframes gate-float {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -2px, 0);
+  }
+}
+
+.gate-mote {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--color-accent);
+  opacity: 0.3;
+  filter: drop-shadow(0 0 4px rgb(231 237 245 / 0.8));
+  animation: gate-drift 7s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.gate-mote-a {
+  left: 8%;
+  top: 34%;
+}
+
+.gate-mote-b {
+  right: 12%;
+  top: 16%;
+  animation-delay: -2.3s;
+}
+
+.gate-mote-c {
+  left: 46%;
+  bottom: 8%;
+  animation-delay: -4.1s;
+}
+
+@keyframes gate-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+    opacity: 0.22;
+  }
+  50% {
+    transform: translate3d(6px, -8px, 0);
+    opacity: 0.8;
+  }
+}
+
+/* 解锁那一刻：三个点连成一条轨道线（纯 CSS，2600ms 由组件收起） */
+.gate-celebrate {
+  animation: gate-in var(--motion-slow) var(--ease-smooth-out);
+  box-shadow: 0 0 40px rgb(231 237 245 / 0.12);
+}
+
+@keyframes gate-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.gate-orbit-line {
+  position: relative;
+  height: 18px;
+}
+
+.gate-orbit-line::before {
+  content: "";
+  position: absolute;
+  left: 6%;
+  right: 6%;
+  top: 50%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--color-accent), transparent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: gate-line 900ms var(--ease-smooth-out) forwards;
+}
+
+.gate-node {
+  position: absolute;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 999px;
+  background: var(--color-accent);
+  box-shadow: 0 0 8px rgb(231 237 245 / 0.9);
+  opacity: 0;
+  animation: gate-node 600ms var(--ease-smooth-out) forwards;
+}
+
+.gate-node:nth-child(1) {
+  left: 6%;
+  animation-delay: 200ms;
+}
+
+.gate-node:nth-child(2) {
+  left: 50%;
+  animation-delay: 500ms;
+}
+
+.gate-node:nth-child(3) {
+  left: 94%;
+  animation-delay: 800ms;
+}
+
+@keyframes gate-line {
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes gate-node {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .panel-in {
     animation: none;
+  }
+
+  /* t28：光遇感在 reduced-motion 下必须完全静止（不是变慢） */
+  .gate-glow,
+  .gate-mote,
+  .gate-celebrate,
+  .gate-orbit-line::before,
+  .gate-node {
+    animation: none;
+  }
+
+  .gate-orbit-line::before {
+    transform: scaleX(1);
+  }
+
+  .gate-node {
+    opacity: 1;
+    transform: none;
   }
 
   .chrome-in,

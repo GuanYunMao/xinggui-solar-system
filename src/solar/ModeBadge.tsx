@@ -1,6 +1,6 @@
 import { ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { GATE_REQUIRED, encodeGate } from "./gate";
+import { GATE_REQUIRED, encodeGate, type GateSlot } from "./gate";
 import { isGateUnlocked, useSim } from "./store";
 
 /**
@@ -64,6 +64,12 @@ const COPY = {
   importFail: "码无效，核对后重填", // gate.import.fail
   importVersion: "这个码来自别的版本。", // TODO(copy) gate.import.version（唯一"核对"解决不了的错，单独一句）
   saveWarn: "这次能进，下次未必记得住。", // gate.save.warn（writeGate 失败时）
+  // —— t28：三条门从「摸过控件」改成「可判定的观察」——
+  // 面板只给方向，不给答案。答案在卡片里（见 Hud 的 CARD_CLUES）。
+  hintTime: "把时间拨快", // gate.hint.time
+  hintTarget: "比较两颗星", // gate.hint.target
+  hintLayer: "关掉名称与轨道，只看天体", // gate.hint.layer
+  celebrateLine: "你测出来了：越远的走得越慢。要不要去看看真的？", // gate.celebrate
   // —— 非文案：格式样例，不翻译、不进表 ——
   importPlaceholder: "XG1-ABCDE-FG",
 };
@@ -89,6 +95,29 @@ export function ModeBadge() {
   const [status, setStatus] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const codeRef = useRef<HTMLElement>(null);
+  /**
+   * t28：解锁那一刻只播一次「三点连成轨道线」。**纯 CSS 动画**，这里只负责
+   * 开/关一个状态 —— 不起 rAF、不每帧写 DOM（正在量微卡顿，面板不许进帧预算）。
+   * 2600ms 到点自动收起；`prefers-reduced-motion` 时动画静止但文案照样出现。
+   */
+  const [celebrate, setCelebrate] = useState(false);
+  const wasUnlocked = useRef(unlocked);
+  useEffect(() => {
+    if (unlocked && !wasUnlocked.current) {
+      wasUnlocked.current = true;
+      setCelebrate(true);
+      const timer = window.setTimeout(() => setCelebrate(false), 2600);
+      return () => window.clearTimeout(timer);
+    }
+    wasUnlocked.current = unlocked;
+    return undefined;
+  }, [unlocked]);
+  /** 三条门各自的方向提示（面板只给方向，答案在卡片里）。 */
+  const hints: { slot: GateSlot; label: string }[] = [
+    { slot: "time", label: COPY.hintTime },
+    { slot: "target", label: COPY.hintTarget },
+    { slot: "layer", label: COPY.hintLayer },
+  ];
 
   useEffect(() => {
     if (!open) return;
@@ -229,9 +258,37 @@ export function ModeBadge() {
           aria-label={COPY.panelTitle}
           className="panel-in absolute top-full right-0 z-20 mt-2 w-72 rounded-xl border border-line bg-elevated p-3 shadow-lg"
         >
-          <p className="text-xs leading-relaxed text-muted">
-            {unlocked ? COPY.panelLedeRevealed : COPY.panelLede}
-          </p>
+          <div className="gate-panel">
+            <div className="gate-glow">
+              <p className="text-xs leading-relaxed text-muted">
+                {unlocked ? COPY.panelLedeRevealed : COPY.panelLede}
+              </p>
+              {/* 三条门的方向提示：只给"做什么"，不给答案（答案在卡片里） */}
+              <ul className="mt-2 grid gap-1 text-xs">
+                {hints.map((hint) => {
+                  const lit = gateLit.includes(hint.slot);
+                  return (
+                    <li
+                      key={hint.slot}
+                      data-gate-hint={hint.slot}
+                      data-lit={lit ? "true" : "false"}
+                      className={`flex items-center gap-2 ${lit ? "text-fg" : "text-subtle"}`}
+                    >
+                      <span
+                        className={`size-1.5 shrink-0 rounded-full ${lit ? "bg-accent" : "border border-line"}`}
+                        aria-hidden
+                      />
+                      <span>{hint.label}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+            {/* 点光粒：纯 CSS 的 transform/opacity，不占帧预算 */}
+            <span className="gate-mote gate-mote-a" aria-hidden />
+            <span className="gate-mote gate-mote-b" aria-hidden />
+            <span className="gate-mote gate-mote-c" aria-hidden />
+          </div>
 
           {/*
             点数是「本次校准要求几格」，所以跟 GATE_REQUIRED，不跟 GATE_SLOTS（12 槽是短码的容量）。
@@ -311,6 +368,22 @@ export function ModeBadge() {
             </div>
             {status && <p className="mt-1 text-xs text-subtle">{status}</p>}
           </form>
+        </div>
+      )}
+
+      {/* t28：解锁那一刻——三个点连成一条轨道线，一句话把两条观察接起来。纯 CSS，2600ms 自收 */}
+      {celebrate && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="gate-celebrate pointer-events-none absolute top-full right-0 z-30 mt-2 w-72 rounded-xl border border-accent bg-elevated p-4"
+        >
+          <div className="gate-orbit-line" aria-hidden>
+            <span className="gate-node" />
+            <span className="gate-node" />
+            <span className="gate-node" />
+          </div>
+          <p className="mt-3 text-center text-sm leading-relaxed text-fg">{COPY.celebrateLine}</p>
         </div>
       )}
     </div>

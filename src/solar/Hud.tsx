@@ -4,7 +4,7 @@ import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
 import { APP_ERA_NAME, formatDistanceMeters, snapshotTag, versionLabel } from "./brand";
 import type { Body } from "./data";
-import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
+import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, isGateUnlocked, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
 import { useSystem } from "./system-context";
 
 /**
@@ -702,6 +702,26 @@ function Moons() {
 /* ────────────────────────────── 共用：详情卡 ────────────────────────────── */
 
 /**
+ * t28：未解锁时，每颗天体的卡片底部给一句**观察线索**（答案藏在卡片里）。
+ * 是疑问句不是答案句——它的作用是点火，不是讲课；解锁后整段不渲染。
+ * 守卫（门）只认「最后选中水星 / 时间走满一年 / 名称与轨道同时关过」，
+ * 这些线索是通往那三个观察的路标。
+ */
+const CARD_CLUES: Record<string, string> = {
+  sun: "它不动，别的都在动。为什么？",
+  mercury: "它跑完一圈要多久？",
+  venus: "它的一天，比它的一年长吗？",
+  earth: "一年是多久？",
+  mars: "为什么它比地球慢？",
+  jupiter: "为什么它走得比火星慢？",
+  saturn: "它跑完一圈要多少年？",
+  uranus: "它为什么躺着转？",
+  neptune: "最远的那颗，是不是最慢的？",
+  moon: "它绕地球一圈要多久？",
+  default: "它跑完一圈要多久？",
+};
+
+/**
  * 卡片外壳。手机端是底部抽屉（原来贴在顶部，选中行星时正好盖住星球）；
  * 竖屏时镜头会把星球抬到上半屏。
  *
@@ -859,6 +879,7 @@ function CardHandle({
 function SandboxCard({ compact }: { compact: boolean }) {
   const selectedId = useSim((state) => state.selectedId);
   const requestReset = useSim((state) => state.requestReset);
+  const unlocked = useSim((state) => isGateUnlocked(state));
   const { byId } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
   /*
@@ -1009,6 +1030,15 @@ function SandboxCard({ compact }: { compact: boolean }) {
       <CardHead body={selected} close={<CloseButton className="md:hidden" />} />
       {/* 全屏档把事实改成单列：这是"全屏"真正做的事，不然它只是和半屏一样高 */}
       <CardBody body={selected} stackFacts={compact && stop === "full"} />
+      {/* t28：未解锁时给一句观察线索；解锁后整段不渲染（它的作用是点火，不是常驻文案） */}
+      {!unlocked && (
+        <p
+          data-card-clue
+          className="mt-3 rounded-md border border-line bg-bg px-3 py-2 text-xs leading-relaxed text-subtle"
+        >
+          {CARD_CLUES[selected.id] ?? CARD_CLUES.default}
+        </p>
+      )}
       {/* 「做过压缩」是沙盘的免责声明 —— 实境恰恰没有压缩，所以这句只活在这里 */}
       <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
         大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。

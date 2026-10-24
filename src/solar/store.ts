@@ -285,16 +285,6 @@ function mergeSlots(current: readonly GateSlot[], incoming: readonly string[]): 
 }
 
 export const useSim = create<SimStore>((set, get) => {
-  /*
-   * 「看过三颗并且回得去」这一条要在两个时刻都判：
-   * 第 3 次切换目标那一刻，以及按 Esc 回总览那一刻——顺序反过来也得算数。
-   */
-  const maybeHitTarget = () => {
-    const s = get();
-    if (s.gateLit.includes("target")) return;
-    if (s.hops >= 3 && s.everReset) get().hitGate("target");
-  };
-
   return {
   paused: false,
   /*
@@ -334,28 +324,34 @@ export const useSim = create<SimStore>((set, get) => {
   togglePaused: () => {
     if (get().switching) return;
     set((s) => ({ paused: !s.paused }));
-    // 门·time：碰过时间就算（暂停/继续都算一次"我动过时间了"）
-    get().hitGate("time");
+    // 注意：暂停/继续**不再点门**（t28）。门·time 现在判的是「时间真的走完一年」，
+    // 不是"碰过时间控件"。
   },
   setSpeed: (speed) => {
     if (get().switching) return;
-    const next = clampSpeed(speed);
-    set({ speed: next });
-    // 门·time：拖到两端才算。hydrate() 直接 set speed，不走这里，所以进游戏不会白送。
-    if (next >= 4 || next <= 0.5) get().hitGate("time");
+    set({ speed: clampSpeed(speed) });
+    // 同理：调速只是手段，门看的是 `advanceSim` 里累计出来的模拟日。
   },
-  // 门·layer：关掉任意一层拐仗（名称/轨道/尾迹）就算；打开不算。
+  /*
+   * 门·符号（t28）：**名称与轨道同时关掉过**才算。
+   *
+   * 旧口径是"关掉任意一层拐仗就算"——那是"摸过控件"，不是"看见了符号本身"。
+   * 尾迹不算：它不是导航符号，关掉它证明不了任何事。
+   * 一起关（同时为 false）才算：这才是"只看天体，不看那层壳"。
+   */
   toggleLabels: () => {
     set((s) => ({ showLabels: !s.showLabels }));
-    if (!get().showLabels) get().hitGate("layer");
+    const s = get();
+    if (!s.showLabels && !s.showOrbits) s.hitGate("layer");
   },
   toggleOrbits: () => {
     set((s) => ({ showOrbits: !s.showOrbits }));
-    if (!get().showOrbits) get().hitGate("layer");
+    const s = get();
+    if (!s.showLabels && !s.showOrbits) s.hitGate("layer");
   },
   toggleTrails: () => {
+    // 尾迹不点门：它既不是时间也不是符号（t28）
     set((s) => ({ showTrails: !s.showTrails }));
-    if (!get().showTrails) get().hitGate("layer");
   },
   // t12：自动收起的开关。不记门、不算进度——它是无障碍/习惯偏好，不是玩法。
   toggleHudAutoHide: () => set((s) => ({ hudAutoHide: !s.hudAutoHide })),
@@ -369,12 +365,16 @@ export const useSim = create<SimStore>((set, get) => {
       return;
     }
     if (selectedId && selectedId !== s.selectedId) {
-      // 门·target：只数"真的换了目标"，同一颗点两次不算
       set({ selectedId, hops: s.hops + 1 });
-      maybeHitTarget();
-      return;
+    } else {
+      set({ selectedId });
     }
-    set({ selectedId });
+    /*
+     * 门·规律（t28）：**最后选中水星**才算。
+     * 水星是周期最短的那颗（data.ts 里 0.24 年），"找出跑得最快的那颗"就是它。
+     * 旧口径数的是"换过几次目标 + 回没回过总览"，那测的是操作次数，不是观察。
+     */
+    if (selectedId === "mercury") get().hitGate("target");
   },
   /*
    * 时间推进：唯一的生产端。**实境的冻结不在这里**（store 不知道系统单位），
@@ -387,15 +387,22 @@ export const useSim = create<SimStore>((set, get) => {
     // 时间基准：`dt`（实秒）× speed × SECONDS_PER_SIM_SECOND（t44 定的 1.0× = 1 天/秒）
     const next = s.simSeconds + dt * s.speed * SECONDS_PER_SIM_SECOND;
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    let wrote = false;
     if (now - lastDaysWrite >= 250) {
       lastDaysWrite = now;
       const d = daysOf(next);
       if (Math.abs(d - s.days) > 0.2) {
         set({ simSeconds: next, days: d });
-        return;
+        wrote = true;
       }
     }
-    set({ simSeconds: next });
+    if (!wrote) set({ simSeconds: next });
+    /*
+     * 门·时间（t28）：**模拟时间真的走满一年**才算，不再看"摸没摸过时间控件"。
+     * `daysOf` 是唯一的换算处（t44），门也走它，不另写一份 365。
+     * `hitGate` 自己会去重，这里不必提前判（但留了 `includes` 省一次 set）。
+     */
+    if (!s.gateLit.includes("time") && daysOf(next) >= DAYS_PER_YEAR) get().hitGate("time");
   },
 
   setSimTime: (when) => {
@@ -448,8 +455,8 @@ export const useSim = create<SimStore>((set, get) => {
   // 兼容老调用点（Hud 的 Esc / 关闭详情 / 返回总览 / 底栏总览）：语义一字未变。
   requestReset: () => {
     get().returnTo(null);
+    // 只留统计：`everReset` 不再参与门（t28 的门看的是"最后选中水星"）
     set({ everReset: true });
-    maybeHitTarget();
   },
 
   setMode: (mode) => {
