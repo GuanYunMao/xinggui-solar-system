@@ -92,7 +92,9 @@ npm run shoot      # 逐颗星聚焦截图，肉眼查贴图
 
 `npm run check` 单独存在是有原因的：CI 在 Linux 构建，产物和本机 Windows 的差几十字节（Tailwind 扫描候选类名时的平台差异，多一条没人用的规则，不会缺样式）。所以「本地验过了」不等于「你下载的那份能跑」。
 
-**改源码只用 edit/write 工具。** 不用 PowerShell 的 `-replace` / `Set-Content`、不用 `sed`、不用脚本批量改源码：本仓库源码里全是中文注释，PowerShell 默认按系统编码写盘，一次回写就能把整片注释变成乱码（连 `>` 重定向默认也是 UTF-16，导出的文本用别的工具一读就是 binary）。这个坑已经反复踩过——`package.json` 的 description、`store.ts` 整文件、`SolarCanvas.tsx` 的注释，都是同一种死法。
+**改源码只用 edit/write 工具。** 不用 PowerShell 的 `-replace` / `Set-Content`、不用 `sed`、不用脚本批量改源码：本仓库源码里全是中文注释，PowerShell 默认按系统编码写盘，一次回写就能把整片注释变成乱码（连 `>` 重定向默认也是 UTF-16，导出的文本用别的工具一读就是 binary）。这个坑已经反复踩过——`package.json` 的 description、`store.ts` 整文件、`SolarCanvas.tsx` 的注释，都是同一种死法。**撤回改动同样只用 edit 改确切文本**，不要脚本按模式切割——它切错的方向比切对的多。
+
+**共享工作树上先自保再动手。** 要改三个以上文件，先 commit 一次，这样撤回只需 `git checkout -- <单个文件>`；而 `git checkout -- <文件>` 会连**别人**的未提交改动一起抹掉，所以撤之前先 `git diff` 看清里面有没有不是你的东西。
 
 ### 调试与深链
 
