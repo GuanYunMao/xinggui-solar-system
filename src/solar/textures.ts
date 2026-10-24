@@ -250,6 +250,11 @@ function paintRocky(
     craters?: number;
     capSize?: number;
     capColor?: [number, number, number];
+    /**
+     * 大尺度暗区强度（t43，火星专用）：火星近看最显眼的不是陨石坑，是
+     * 大流沙暗区（Syrtis Major 那一片）。用 2 周期的低频噪声压暗，贴脸时有明暗分区。
+     */
+    maria?: number;
   },
 ): RowPaint {
   const broad = makeSampler(opts.seed);
@@ -263,7 +268,13 @@ function paintRocky(
         const u = x / w;
         const n = broad(u, v, 3); // 大尺度明暗分区
         const f = fine(u, v, 16, 4); // 细微颗粒
-        const albedo = clamp01(n * 0.75 + 0.14 + (f - 0.5) * 0.2);
+        let albedo = clamp01(n * 0.75 + 0.14 + (f - 0.5) * 0.2);
+
+        // 大流沙暗区（t43）：只在火星这类传了 maria 的星球上生效
+        if (opts.maria) {
+          const mar = broad(u + 0.37, v * 1.0, 2);
+          if (mar < 0.52) albedo = clamp01(albedo - (0.52 - mar) * opts.maria);
+        }
 
         let r = mix(opts.base[0], opts.alt[0], albedo);
         let g = mix(opts.base[1], opts.alt[1], albedo);
@@ -278,7 +289,9 @@ function paintRocky(
 
         if (opts.capSize && opts.capColor) {
           const lat = Math.abs(v * 2 - 1);
-          const edge = 1 - opts.capSize;
+          // 极冠边缘用噪声打碎（t43）：真实火星极冠不是一刀切的圆边
+          const jitter = (fine(u, v, 40, 2) - 0.5) * 0.04;
+          const edge = 1 - opts.capSize + jitter;
           const k = smoothstep(edge, edge + 0.06, lat);
           if (k > 0) {
             const cap = opts.capColor;
@@ -424,8 +437,135 @@ function paintBands(
   };
 }
 
-/** 木卫二那种冰壳裂缝：细而分岔的暗红纹路。 */
-function paintIceCracks(w: number, h: number, seed: number): RowPaint {
+// —— 气态巨行星的细节版画笔（t43） ——
+
+/**
+ * 大红斑这类斑点：外圈色 → 内核色 → 内部纬向条纹，边界被噪声扰动。
+ * 旧版是一个平涂椭圆 + smoothstep 边，贴脸看就是"一坨"。
+ */
+type GasGiantSpot = {
+  u: number;
+  v: number;
+  rx: number;
+  ry: number;
+  /** 外圈（边缘）颜色 */
+  rim: [number, number, number];
+  /** 内核颜色 */
+  core: [number, number, number];
+  /** 边界扰动强度（0 = 光滑椭圆，0.5 左右像真的涡旋） */
+  warp: number;
+};
+
+/**
+ * 木星/土星专用的细节版画笔。
+ *
+ * 为什么不让 `paintBands` 改通用：金星/天王/海王/土卫六在总览档只需要"带子就够了"，
+ * 换画笔会连带改掉它们的观感（t43 只要三颗）。木星/土星的问题也不是"带子不够"，
+ * 是点选后相机会飞到贴脸，那里能看出三件事：
+ *   1. 条带是纯正弦：等宽、边界柔、没有纬向剪切；
+ *   2. 细节只有 3 octave 低频噪声：近看是一片平滑过渡，没有纤维；
+ *   3. 大红斑是一个平涂椭圆：一坨。
+ * 所以这个画笔把「结构」和「细节」拆开：
+ *   - 结构：两组频率的条带叠加（主带 7~11 条 + 细带 33~44 条），并用低频噪声做纬向整体位移；
+ *   - 细节：噪声在**经向**拉长（u 乘 8 再采样 = 8 倍 x 频率、y 不变）= 沿纬向铺开的云带纤维；
+ *     u 乘整数倍不破坏环绕接缝（周期仍是整数格）。
+ *   - 斑点：三层叠加 + 边界噪声 + 内部纬向条纹。
+ *
+ * 成本：每像素 4 次噪声（比旧版多约一倍）。贴图是分帧生成的（pump 每帧 6ms），
+ * 变慢只体现在"聚焦升档多花几帧"，不占首屏 —— 实测见 t43 交付。
+ */
+function paintGasGiant(
+  w: number,
+  h: number,
+  cfg: {
+    seed: number;
+    /** 纬向色带：主带在两组色之间往返 */
+    belts: [number, number, number][];
+    /** 主带：绕球一圈几条起伏 */
+    bandFreq: number;
+    /** 细带：叠在主带上的二级结构 */
+    fineBandFreq: number;
+    /** 纬向整体位移强度（大涡旋） */
+    shear: number;
+    /** 纤维细节强度 */
+    filaments: number;
+    spots?: GasGiantSpot[];
+  },
+): RowPaint {
+  const eddy = makeSampler(cfg.seed);
+  const mid = makeSampler(cfg.seed + 11);
+  const fiber = makeSampler(cfg.seed + 23);
+  const grain = makeSampler(cfg.seed + 31);
+
+  return (data, y0, y1) => {
+    const n = cfg.belts.length;
+    for (let y = y0; y < y1; y++) {
+      const v = y / (h - 1);
+      for (let x = 0; x < w; x++) {
+        const u = x / w;
+        const e = eddy(u, v, 4); // 大涡旋
+        const m = mid(u, v, 14); // 中尺度扰动
+        const f = fiber(u * 8, v, 26, 3); // 纬向纤维
+        const g2 = grain(u * 3, v, 60, 2); // 高频细纹
+
+        // 1) 结构：两组条带 + 纬向整体位移
+        //    位移只取低频（e/m），高频噪声留在"细节"里 —— 让色带边界保持连贯，
+        //    否则贴脸看是一锅乱麻（t43 第一版就是 0.18 的位移 + 大颗粒，调回 0.07/小颗粒）
+        const warp = (e - 0.5) * 0.13 * cfg.shear;
+        // 相位扰动用**很低**的频率（m 只占 0.3）：木星的色带大体是笔直的，
+        // 只在带边缘有起伏；0.9~1.3 会把它画成大理石纹（t43 前两版就是）
+        const bandMain = Math.sin((v + warp) * cfg.bandFreq * Math.PI * 2 + m * 0.3) * 0.5 + 0.5;
+        const bandFine = Math.sin((v + warp * 1.7) * cfg.fineBandFreq * Math.PI * 2 + m * 0.22) * 0.5 + 0.5;
+        const banded = bandMain * 0.74 + bandFine * 0.26;
+
+        // 2) 细节：纤维只轻微扰动色带位置，主要作用是带内暗丝
+        const fib = (f - 0.5) * cfg.filaments;
+        const pos = clamp01(banded + fib * 0.04) * (n - 1);
+        const i0 = Math.floor(pos);
+        const t = pos - i0;
+        const c0 = cfg.belts[Math.min(n - 1, i0)]!;
+        const c1 = cfg.belts[Math.min(n - 1, i0 + 1)]!;
+        let r = mix(c0[0], c1[0], t);
+        let g = mix(c0[1], c1[1], t);
+        let b = mix(c0[2], c1[2], t);
+
+        // 中尺度亮暗 + 高频细纹：贴脸时能看出"云在流"，退到总览又自然糊掉
+        const tex = (m - 0.5) * 6 + (g2 - 0.5) * 3.5 * cfg.filaments;
+        r += tex;
+        g += tex * 0.97;
+        b += tex * 0.92;
+
+        // 3) 斑点：三层 + 边界噪声 + 内部纬向条纹
+        if (cfg.spots) {
+          for (const sp of cfg.spots) {
+            const du = (u - sp.u) / sp.rx + (m - 0.5) * sp.warp;
+            const dv = (v - sp.v) / sp.ry + (e - 0.5) * sp.warp;
+            const d = Math.hypot(du, dv);
+            if (d >= 1.15) continue;
+            const rim = smoothstep(1.12, 0.72, d);
+            const core = smoothstep(0.78, 0.24, d);
+            const edge = (g2 - 0.5) * 16 * core;
+            r = mix(r, sp.rim[0] + edge, rim * 0.7);
+            g = mix(g, sp.rim[1] + edge * 0.8, rim * 0.7);
+            b = mix(b, sp.rim[2] + edge * 0.7, rim * 0.7);
+            r = mix(r, sp.core[0], core);
+            g = mix(g, sp.core[1], core);
+            b = mix(b, sp.core[2], core);
+            // 斑内的纬向条纹：大红斑不是一块平涂
+            const stripe = Math.sin((v - sp.v) * 140 + g2 * 6) * 8 * core;
+            r += stripe;
+            g += stripe * 0.7;
+            b += stripe * 0.6;
+          }
+        }
+
+        setPx(data, (y * w + x) * 4, r, g, b);
+      }
+    }
+  };
+}
+
+/** 木卫二那种冰壳裂缝：细而分岔的暗红纹路。 */function paintIceCracks(w: number, h: number, seed: number): RowPaint {
   const warp = makeSampler(seed);
   const tint = [150, 106, 84];
   return (data, y0, y1) => {
@@ -470,45 +610,63 @@ function makeBodyPainter(body: Body, w: number, h: number): RowPaint {
     case "earth":
       return paintEarth(w, h);
     case "mars":
+      // t43：加了大流沙暗区与打碎的极冠边缘（原来是一片均匀锈红 + 几个坑）
       return paintRocky(w, h, {
         seed: 21,
-        base: [116, 56, 38],
-        alt: [198, 118, 76],
-        craters: 22,
+        base: [112, 52, 34],
+        alt: [202, 122, 78],
+        craters: 30,
+        maria: 0.55,
         capSize: 0.14,
         capColor: [232, 226, 218],
       });
     case "jupiter":
-      return paintBands(
-        w,
-        h,
-        [
-          [226, 208, 184],
-          [176, 130, 92],
-          [238, 222, 200],
-          [146, 100, 72],
-          [206, 178, 146],
-          [186, 148, 112],
+      // t43：换细节版画笔（条带剪切 + 纬向纤维 + 三层大红斑）
+      return paintGasGiant(w, h, {
+        seed: 6,
+        belts: [
+          [232, 214, 190],
+          [170, 124, 88],
+          [242, 224, 198],
+          [140, 96, 70],
+          [214, 186, 152],
+          [178, 140, 106],
+          [236, 220, 196],
+          [150, 106, 78],
         ],
-        {
-          seed: 6,
-          freq: 46,
-          turbulence: 1.6,
-          spot: { u: 0.63, v: 0.63, rx: 0.085, ry: 0.05, color: [166, 72, 54] },
-        },
-      );
+        bandFreq: 7.5,
+        fineBandFreq: 22,
+        shear: 1.6,
+        filaments: 0.55,
+        spots: [
+          {
+            u: 0.63,
+            v: 0.66,
+            rx: 0.085,
+            ry: 0.042,
+            rim: [190, 122, 94],
+            core: [156, 66, 48],
+            warp: 0.55,
+          },
+        ],
+      });
     case "saturn":
-      return paintBands(
-        w,
-        h,
-        [
-          [236, 216, 176],
-          [214, 188, 142],
-          [242, 226, 194],
-          [200, 172, 128],
+      // t43：土星的带子比木星细腻但对比更强；北极圈带一点冷色（真实土星极区偏蓝绿）
+      return paintGasGiant(w, h, {
+        seed: 8,
+        belts: [
+          [246, 230, 198],
+          [214, 188, 146],
+          [250, 238, 212],
+          [198, 170, 128],
+          [238, 216, 180],
+          [206, 178, 136],
         ],
-        { seed: 8, freq: 34, turbulence: 1.2 },
-      );
+        bandFreq: 11,
+        fineBandFreq: 44,
+        shear: 0.9,
+        filaments: 0.55,
+      });
     case "uranus":
       return paintBands(
         w,
