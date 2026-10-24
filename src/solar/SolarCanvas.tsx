@@ -1755,21 +1755,51 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
        * 实地取景：地月同框，站在日向一侧（太阳在相机背后，两颗都正面受光）。
        * 之前这里用的是「系统外缘 2.4 倍」的全景位，地球在 7.2e11 m 外只是亚像素 ——
        * 那不是实境，是一张星图。取景距离的推导见 systems.frameEarthMoon。
+       *
+       * t23：三种取景（store.realFocus）由这台相机独占：
+       *  - wide  = frameEarthMoon（地月同框，默认）
+       *  - earth = 地球特写，target=地心，距离=body.focus（3e7 m）
+       *  - moon  = 月球特写，target=月心，距离=body.focus（1e7 m）
+       * 特写与宽景共用同一条受光逻辑：相机站在「目标→太阳」方向、抬 12° 俯视，
+       * 这样球面是正面受光（原因见上面那段 0.98 的注释），不是黑球。
+       *
+       * **切换取景是立即跳，不插值**：本帧直接把相机摆到新 pose 上。平滑过渡归 t19 的
+       * 过渡系统，这里不重复造一套缓动 —— 两套缓动叠加会互相打架。
        */
       const moon = reg.groups.get("moon");
       const earthR = byId.earth?.radius ?? 6.371e6;
       if (moon) moon.getWorldPosition(scratch.pos);
-      const pose = frameEarthMoon(
-        { x: scratch.dest.x, y: scratch.dest.y, z: scratch.dest.z },
-        moon ? { x: scratch.pos.x, y: scratch.pos.y, z: scratch.pos.z } : null,
-        earthR,
-      );
-      dist = pose.dist;
-      scratch.target.set(pose.target[0], pose.target[1], pose.target[2]);
-      scratch.camDir.set(pose.dir[0], pose.dir[1], pose.dir[2]);
-      camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
-      controls.target.copy(scratch.target);
-      camera.lookAt(scratch.target);
+      const focus = useSim.getState().realFocus;
+      const focusBody = focus === "earth" ? byId.earth : focus === "moon" ? byId.moon : undefined;
+      const focusTarget = focus === "earth" ? scratch.dest : scratch.pos;
+      if (focusBody && (focus === "earth" || moon)) {
+        scratch.target.copy(focusTarget);
+        // 目标→太阳方向，再抬 12°：整面受光，轮廓才不是"半黑"
+        scratch.sunDir.copy(scratch.target).negate().normalize();
+        scratch.camDir.copy(scratch.sunDir).applyAxisAngle(perpAxis(scratch.sunDir), 0.2126);
+        dist = focusBody.focus;
+        camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
+        controls.target.copy(scratch.target);
+        camera.lookAt(scratch.target);
+      } else {
+        const pose = frameEarthMoon(
+          { x: scratch.dest.x, y: scratch.dest.y, z: scratch.dest.z },
+          moon ? { x: scratch.pos.x, y: scratch.pos.y, z: scratch.pos.z } : null,
+          earthR,
+        );
+        dist = pose.dist;
+        scratch.target.set(pose.target[0], pose.target[1], pose.target[2]);
+        scratch.camDir.set(pose.dir[0], pose.dir[1], pose.dir[2]);
+        camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
+        controls.target.copy(scratch.target);
+        camera.lookAt(scratch.target);
+      }
+      /*
+       * t23：把「相机到当前取景目标」的真实距离喂给 HUD。
+       * 节流在 store 里（10Hz / NaN 不写 / 切目标先置 null），这里每帧喂一次就行 ——
+       * 这里再判一次节流就等于把同一份规则写两处。
+       */
+      useSim.getState().setRealDistance(dist);
     }
 
     /*
