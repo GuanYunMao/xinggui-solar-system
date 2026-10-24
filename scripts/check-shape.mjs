@@ -411,14 +411,21 @@ const CHECKS = [
   },
   {
     id: 7,
-    title: "压缩策略的四条比率（data.ts ↔ README 的「比例压缩是设计，不是欠账」）",
+    title: "压缩策略的四条比率（data.ts ↔ README 双向：代码改了红，故事改了也红）",
     // 为什么要有这条：README 里写着「太阳/地球画成 5:1，真实 109:1」「月球/地球 0.263（真值 0.273）」
     // 「月球角径只有太阳的 0.417，日面最多遮 17.4%」——这些是**叙事的一部分**，改一个数就是改故事。
-    // 但它们只活在散文里，谁动了 data.ts 的半径都不会红。这条把它们变成可判红的算式：
-    // 四个数全部从 data.ts 现算，与设计值比，偏差 >1% 就红。改了设计就同时改这里和 README——那正是重点。
+    // 所以两边都要判：
+    //   ① 从 data.ts 现算四个比率，与设计值比；
+    //   ② 再去根 README.md 里找那四个 token（只认「数 + 单位」，不认整句——措辞可以改，数不许漂）。
+    // 只做 ① 的话，判据守的是「代码没变味」；README 是手最容易动的那一份，必须一起守。
+    // ±1% 的来历：文档里这四个数只印到 2–3 位有效数字（5:1 / 0.263 / 0.417 / 17.4%），
+    // ±1% 就是「印出来的数按四舍五入换算回来」的误差上限，**不是观测容差**。
+    // 要改精度就同时改这句话与 README 的印刷位数，别只动其中之一。
+    // 口径：角径与遮挡都按「从地球轨道半径看太阳」算（angSun = atan(sunR / earthOrbit)）。
+    // 将来若要做「从火星看日食」，这里是唯一要改的地方——它把观测者写死在算式里，不藏在注释里。
     // 占位：周期一致性（开普勒 T²∝a³ 在压缩比例下必然不成立）**不在这里判**，等行为断言那层。
     expect:
-      "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%（各 ±1%）；周期一致性待行为断言",
+      "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%（各 ±1%），且 README.md 里同样印着这四个数；周期一致性待行为断言",
     run(loaded) {
       const f = loaded.find((x) => x.file === "src/solar/data.ts");
       if (!f) {
@@ -461,9 +468,40 @@ const CHECKS = [
       for (const id of dupes) {
         dev.push(`data.ts 里 id: "${id}" 出现了 ${count(id)} 次 —— 同一个天体两份定义，比率会变成「取第一个」，必须删掉多余的`);
       }
+
+      // ② 根 README 里那五个数：**找不到就红**。
+      // 不写成「找不到就跳过」——那等于给一条会静默失效的判据，正是这份脚本一直在防的东西。
+      // 只匹配「数 + 单位」这种最紧的 token，不匹配整句：措辞可以改，数不许漂。
+      let md = "";
+      try {
+        md = readFileSync(path.join(ROOT, "README.md"), "utf8");
+      } catch {
+        md = "";
+      }
+      const docNums = [
+        ["太阳/地球 5:1", "5:1"],
+        ["太阳/地球 真值 109:1", "109:1"],
+        ["月球/地球 0.263", "0.263"],
+        ["月球/太阳 角径 0.417", "0.417"],
+        ["日面遮挡 17.4%", "17.4%"],
+      ];
+      for (const [label, token] of docNums) {
+        if (md.includes(token)) {
+          rows.push({ file: "README.md", line: 0, text: `${label} = ${token}（README 里在）` });
+        } else {
+          dev.push(
+            `README.md 里找不到「${label}」（${token}）—— 那句被改写或删掉了：要么恢复，要么同步改本判据（改数就两边一起改）`,
+          );
+        }
+      }
       return {
-        hits: dev.length ? dev.map((text) => ({ file: "src/solar/data.ts", line: 0, text })) : rows,
-        observed: dev.length ? `${dev.length} 处偏离（四条比率 + 重复定义）` : "四条比率与设计一致（周期一致性未纳入，等行为断言那层）",
+        // 诊断语里已经指明是哪个文件，hits 的文件名跟着走——别把 README 的问题报成 data.ts
+        hits: dev.length
+          ? dev.map((text) => ({ file: text.startsWith("README.md") ? "README.md" : "src/solar/data.ts", line: 0, text }))
+          : rows,
+        observed: dev.length
+          ? `${dev.length} 处偏离（四条比率 / 重复定义 / README 里的数）`
+          : "四条比率与设计一致，README 里的五个数也都在（周期一致性未纳入，等行为断言那层）",
         ok: dev.length === 0,
         // raw 必须随「发现的东西」单调增长：selftest 用它证明「注入后真的被数到了」。
         // 只写 dev.length 会让「4 条比率 → 1 处偏离」在数值上变小，selftest 判成没红。
