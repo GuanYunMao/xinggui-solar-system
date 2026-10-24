@@ -2115,6 +2115,13 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
    *
    * 比例尺：2π·dx / height × orbitGain（与旧 rotateSpeed 同一语义），gain 只随**视距**变
    * （见 ROTATE_DIST_GAIN），不再看"离 target 最近的那颗天体半径"。
+   *
+   * **接管一个库之前，把它每帧顺手做的事逐条列出来，不只列"看得见的手势"。**
+   * 这次漏掉的是 `OrbitControls.update()` 每帧那行 `camera.lookAt(target)`：手势归我们了，
+   * 可"每帧重瞄目标"没人做 —— 跟随 + `clampOutsideParent` 把相机单独推出去之后，
+   * 朝向就停在动画结束那一刻（camera-clearance 实测地球 depth 整段 null 1097/1205 帧）。
+   * 现在跟随分支每帧 `camera.lookAt(target)`（见 follow 段）。同一课也覆盖到
+   * `minPolarAngle` 这类"库自己还会再夹一次"的隐式行为。
    */
   const applyOrbit = (yawRad: number, pitchRad: number) => {
     const controls = controlsRef.current;
@@ -2379,9 +2386,14 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
           /*
            * t34：缩放**不得改写 target**（它是相机的唯一主人：选中天体 / 总览原点）。
            * 旧写法沿"相机→指针"的射线推相机，再把 target 放回旧视轴 —— 连续缩放后
-           * target 落在鼠标最后停的地方，旋转速度也随它漂。现在相机只沿视轴走，
-           * 朝向不变，目标始终在画面中心；target 一个字节都不动。
-           * （代价：t10 的"朝指针缩放"不做了 —— 那个交互和"中心点固定"互斥。）
+           * target 落在鼠标最后停的地方。实测（指针停在画面右下、放大缩小各 3 格跑 10 轮）：
+           * target 漂 2.72、太阳屏幕偏 307.48px；**指针恰好在画面中心时漂移是 0**，
+           * 所以只测中心的探针会误判"没事"。
+           * 现在相机只沿视轴走、朝向不变，目标始终在画面中心；target 一个字节都不动。
+           *
+           * **t10 的「朝指针缩放」已移除，别再当回归修回来。** 它靠改写 `controls.target`
+           * 实现，而 target 必须唯一归选中天体 / 原点所有。真要恢复"朝指针缩放"，
+           * 正确做法是**只改相机位置、不改 target**（或做成 pan），不是让 target 跟着鼠标跑。
            */
           scratch.zoomFwd.copy(controls.target).sub(camera.position).normalize();
           camera.position.addScaledVector(scratch.zoomFwd, dist - next);
