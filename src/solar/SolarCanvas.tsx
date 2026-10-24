@@ -600,7 +600,14 @@ function SunSurface({ body }: { body: Body }) {
       transparent: true,
       blending: THREE.AdditiveBlending,
       depthWrite: false,
-      depthTest: false,
+      /*
+       * 必须 depthTest：这是日冕光晕层，尺寸 11× 太阳半径，中心正好压在太阳圆心。
+       * 以前写 `depthTest: false`（"光晕永远盖在最上面"），结果**隔着木星也能看到那颗亮核** ——
+       * 天体把它挡住时，深度测试是唯一能把它裁掉的东西。
+       * 打开之后：盖住太阳本体的那部分被太阳球面自己挡掉（本来就该如此，那里是光球不是日冕），
+       * 落在盘面之外的光晕照常透出；被前方天体挡住的整块也一起没了（t42 bug 1）。
+       */
+      depthTest: true,
       toneMapped: false,
       opacity: 0.72,
     });
@@ -944,9 +951,30 @@ function Labels() {
   return null;
 }
 
+/**
+ * 小行星带（t42 bug 2）。
+ *
+ * 压缩比例把互相不该碰的两件事挤到了一起：带子铺在 23.2~26.8，木星在 32、木卫四轨道 6.15 →
+ * 木卫四的公转轨道内缘（25.85）正好从带子外缘扫过，石头就从卫星身上穿过去了。真实太阳系里
+ * 小行星带 2.1–3.3 AU、木星 5.2 AU，根本不相交 —— 所以**不改物理，只让重叠不像穿模**。
+ *
+ * 选「按到最近天体的距离淡出」，不选另外两条方向：
+ *  - 「局部挖洞（不生成）」做不到：带子整体在自转（0.015 rad/s），行星公转更快，洞必须在
+ *    世界坐标里跟着行星走，静态洞是错的；而"动态挖洞"和"淡出"是同一份计算，淡出还不用重建几何。
+ *  - 「压扁高度」治不了根：木卫四的轨道倾斜很小，本来就和带子几乎共面，压扁只会让重叠更整齐。
+ *
+ * 实现走 CPU 改实例矩阵（缩放到 0），**不新增 shader program** —— t41 量过：SwiftShader 上
+ * 每个新 program 首编译 20–40ms，为一个视觉细节付这个启动成本不划算。
+ * 每 2 帧算一次：带子自转 0.015 rad/s、行星角速度也慢，两帧的位移远小于淡出带宽（0.8~1.8）。
+ */
+const BELT_FADE = { near: 0.8, far: 1.8 } as const;
+
 function Asteroids() {
   const reg = useRegistry();
+  const { bodies } = useSystem();
   const mesh = useRef<THREE.InstancedMesh>(null);
+  const fade = useRef(new Float32Array(520).fill(1));
+  const tick = useRef(0);
   const rocks = useMemo(() => {
     let s = 99;
     const rand = () => {
@@ -997,6 +1025,120 @@ function Asteroids() {
     current.instanceMatrix.needsUpdate = true;
     if (current.instanceColor) current.instanceColor.needsUpdate = true;
   }, [rocks]);
+  /*
+   * 每 2 帧按「到最近天体的距离」把小行星缩到 0（=淡出），让石头不穿过行星与卫星。
+   * 位置换算：带子整体只绕 Y 自转（Simulation 里写的 reg.belt.rotation.y），
+   * 所以世界坐标 = 绕 Y 转 rot 后的局部坐标，不必每颗去 getWorldPosition。
+   */
+  const scratch = useMemo(
+    () => ({
+      dummy: new THREE.Object3D(),
+      bodyPos: new THREE.Vector3(),
+      pts: [] as { x: number; y: number; z: number; near: number; far: number }[],
+    }),
+    [],
+  );
+  useFrame(() => {
+    const current = mesh.current;
+    const belt = reg.belt;
+    if (!current || !belt) return;
+    if (tick.current++ % 2 !== 0) return;
+    // 天体世界坐标 + 各自的淡出带宽（半径越大，清出的空域越大）
+    const pts = scratch.pts;
+    pts.length = 0;
+    for (const b of bodies) {
+      const g = reg.groups.get(b.id);
+      if (!g) continue;
+      g.getWorldPosition(scratch.bodyPos);
+      const near = Math.max(BELT_FADE.near, b.radius * 1.2);
+      const far = Math.max(BELT_FADE.far, b.radius * 2.6);
+      pts.push({ x: scratch.bodyPos.x, y: scratch.bodyPos.y, z: scratch.bodyPos.z, near, far });
+    }
+    if (!pts.length) return;
+    const rot = belt.rotation.y;
+    const cos = Math.cos(rot);
+    const sin = Math.sin(rot);
+    const fadeArr = fade.current;
+    let changed = false;
+    for (let i = 0; i < rocks.length; i++) {
+      const rock = rocks[i]!;
+      // 局部 (x,z) 绕 Y 转 rot → 世界
+      const wx = rock.x * cos + rock.z * sin;
+      const wz = -rock.x * sin + rock.z * cos;
+      let k = 1;
+      for (const p of pts) {
+        const dx = wx - p.x;
+        const dy = rock.y - p.y;
+        const dz = wz - p.z;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < p.far) {
+          const t = (d - p.near) / (p.far - p.near);
+          const f = t <= 0 ? 0 : t >= 1 ? 1 : t * t * (3 - 2 * t);
+          if (f < k) k = f;
+          if (k === 0) break;
+        }
+      }
+      if (Math.abs(fadeArr[i]! - k) < 0.02) continue;
+      fadeArr[i] = k;
+      changed = true;
+      scratch.dummy.position.set(rock.x, rock.y, rock.z);
+      scratch.dummy.rotation.set(rock.rx, rock.ry, rock.rz);
+      scratch.dummy.scale.setScalar(rock.s * k);
+      scratch.dummy.updateMatrix();
+      current.setMatrixAt(i, scratch.dummy.matrix);
+    }
+    if (changed) current.instanceMatrix.needsUpdate = true;
+  });
+  /*
+   * 验收探针（t42 bug 2）：任意一颗小行星到任意天体的最近距离，以及当前淡出中的颗数。
+   * 判据：改前最近距离 ~0.1（能穿进卫星），改后应 ≥ 最近天体自己的近带（约 0.8）。
+   * 只有被点开时才现算，不参与每帧。
+   */
+  useEffect(() => {
+    const probe = () => {
+      const belt = reg.belt;
+      if (!belt) return null;
+      const rot = belt.rotation.y;
+      const cos = Math.cos(rot);
+      const sin = Math.sin(rot);
+      const pts: { x: number; y: number; z: number }[] = [];
+      const pos = new THREE.Vector3();
+      for (const b of bodies) {
+        const g = reg.groups.get(b.id);
+        if (!g) continue;
+        g.getWorldPosition(pos);
+        pts.push({ x: pos.x, y: pos.y, z: pos.z });
+      }
+      let min = Infinity;
+      let minVisible = Infinity;
+      let faded = 0;
+      for (let i = 0; i < rocks.length; i++) {
+        const rock = rocks[i]!;
+        const wx = rock.x * cos + rock.z * sin;
+        const wz = -rock.x * sin + rock.z * cos;
+        let dRock = Infinity;
+        for (const p of pts) {
+          const dx = wx - p.x;
+          const dy = rock.y - p.y;
+          const dz = wz - p.z;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (d < dRock) dRock = d;
+        }
+        if (dRock < min) min = dRock;
+        const k = fade.current[i]!;
+        if (k < 0.99) faded++;
+        // 判据看的是**看得见的**石头：淡到 0.5 以下的已经不构成"石头穿过星星"
+        if (k > 0.5 && dRock < minVisible) minVisible = dRock;
+      }
+      return {
+        count: rocks.length,
+        minBodyDist: +min.toFixed(3),
+        minVisibleBodyDist: Number.isFinite(minVisible) ? +minVisible.toFixed(3) : Infinity,
+        faded,
+      };
+    };
+    (window as unknown as { __solarBelt?: typeof probe }).__solarBelt = probe;
+  }, [bodies, reg, rocks]);
   return (
     <group
       ref={(node) => {
