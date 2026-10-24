@@ -61,6 +61,7 @@ const SCAN_FILES = [
   "src/solar/clock.ts",
   "src/solar/data.ts",
   "src/solar/gate.ts",
+  "src/solar/kepler.ts",
   "src/solar/pick.ts",
   "src/solar/progress.ts",
   "src/solar/quality.ts",
@@ -411,7 +412,7 @@ const CHECKS = [
   },
   {
     id: 7,
-    title: "压缩策略的四条比率（data.ts ↔ README 双向：代码改了红，故事改了也红）",
+    title: "压缩策略的七条不变量（比率 + 倾角；data.ts ↔ README 双向，代码改了红、故事改了也红）",
     // 为什么要有这条：README 里写着「太阳/地球画成 5:1，真实 109:1」「月球/地球 0.263（真值 0.273）」
     // 「月球角径只有太阳的 0.417，日面最多遮 17.4%」——这些是**叙事的一部分**，改一个数就是改故事。
     // 所以两边都要判：
@@ -425,7 +426,7 @@ const CHECKS = [
     // 将来若要做「从火星看日食」，这里是唯一要改的地方——它把观测者写死在算式里，不藏在注释里。
     // 占位：周期一致性（开普勒 T²∝a³ 在压缩比例下必然不成立）**不在这里判**，等行为断言那层。
     expect:
-      "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%（各 ±1%），且 README.md 里同样印着这四个数；周期一致性待行为断言",
+      "太阳/地球 5.0×、月球/地球 0.263、月球÷太阳角径 0.417、日面遮挡 17.4%、moon.inclination 5.145°、mercury.inclination 7.004°（各 ±5%），且 README.md 里同样印着前四个数；本影/偏移 与 周期一致性 明确未纳入（原因见输出）",
     run(loaded) {
       const f = loaded.find((x) => x.file === "src/solar/data.ts");
       if (!f) {
@@ -441,33 +442,79 @@ const CHECKS = [
         const m = new RegExp(`\\b${field}:\\s*([0-9.]+)`).exec(seg);
         return m ? Number(m[1]) : null;
       };
+      // inclination 存的是弧度、写成 `deg(7)` / `deg(5.1)`，所以要剥掉这层包装换算回**度**。
+      // 判据要的是「写进 data.ts 的那个真值」，不是运行时的弧度——写成弧度判定会让诊断语没法读。
+      const grabDeg = (id) => {
+        const at = text.indexOf(`id: "${id}"`);
+        if (at < 0) return null;
+        const seg = text.slice(at, at + 1500);
+        const m = /\binclination:\s*(?:deg\(\s*([0-9.]+)\s*\)|([0-9.]+))/.exec(seg);
+        if (!m) return null;
+        return Number(m[1] ?? m[2]);
+      };
       const sunR = grab("sun", "radius");
       const earthR = grab("earth", "radius");
       const moonR = grab("moon", "radius");
       const earthOrbit = grab("earth", "orbitRadius");
       const moonOrbit = grab("moon", "orbitRadius");
-      const dupes = ["sun", "earth", "moon"].filter((id) => count(id) > 1);
+      const moonInc = grabDeg("moon");
+      const mercuryInc = grabDeg("mercury");
+      const dupes = ["sun", "earth", "moon", "mercury"].filter((id) => count(id) > 1);
 
       const rows = [];
       const dev = [];
       if (!sunR || !earthR || !moonR || !earthOrbit || !moonOrbit) {
         return { hits: [{ file: "src/solar/data.ts", line: 0, text: "取不到 sun/earth/moon 的 radius 或 orbitRadius" }], observed: "缺数据", ok: false, raw: 1 };
       }
-      const ratio = (label, got, want, unit = "×") => {
+      // 宽容 ±5%：这些是**设计决定的量**，不是随机量，所以容忍的是取整/设计微调，
+      // 不是"观测抖动"。±1% 曾用于纯印刷误差推理，但倾角这类值允许工程上小幅调整，
+      // 统一到 ±5% 才不会把合规的微调判成红（判据要能长期活下去）。
+      const TOL = 0.05;
+      const ratio = (label, got, want, unit = "×", why = "") => {
         const off = Math.abs(got - want) / want;
-        const text = `${label} = ${got.toFixed(4)}${unit}（设计 ${want}${unit}，偏差 ${(off * 100).toFixed(2)}%）`;
+        const text = `${label} = ${got.toFixed(4)}${unit}（设计 ${want}${unit}，偏差 ${(off * 100).toFixed(2)}%）${why}`;
         rows.push({ file: "src/solar/data.ts", line: 0, text });
-        if (off > 0.01) dev.push(text);
+        if (off > TOL) dev.push(text);
       };
       const angMoon = Math.atan(moonR / moonOrbit);
       const angSun = Math.atan(sunR / earthOrbit);
-      ratio("太阳/地球 半径比", sunR / earthR, 5.0);
-      ratio("月球/地球 半径比", moonR / earthR, 0.263);
-      ratio("月球÷太阳 角径比（从地球看）", angMoon / angSun, 0.417);
-      ratio("日面最大遮挡比例（角径比²）", (angMoon / angSun) ** 2, 0.174, "");
+      ratio("太阳/地球 半径比", sunR / earthR, 5.0, "×", "——动了 sun.radius 或 earth.radius？这会连带把日全食做成/做没（真实是 109:1）");
+      ratio("月球/地球 半径比", moonR / earthR, 0.263, "×", "——真值 0.273，这个比值本来是准的，别为了「月球好看」动它");
+      ratio("月球÷太阳 角径比（从地球看）", angMoon / angSun, 0.417, "×", "——它决定沙盘里只有偏食（最大遮 17.4%）");
+      ratio("日面最大遮挡比例（角径比²）", (angMoon / angSun) ** 2, 0.174, "", "——超过 1 就意味着有人把月食做出来了，那是压缩策略的反面");
+
+      // 倾角必须钉**真值**，不是钉「看起来对」。前四条比率全都不约束倾角，
+      // 所以「把 moon.inclination 从 5.1 改成 11 让月食发生」是最便宜的假修法：
+      // 前四条全绿、月食被"修好"，而值假了一倍。临界值（写在这里当解释，免得后人猜）：
+      //   月食要救回来需 i > 10.9°；水星要错过日面需 i > 13.9°。
+      // 与 t24 不冲突：t24 让沙盘**不用**倾角，这里守的是 data.ts 里存的**真值**。
+      const degCheck = (label, got, want, why) => {
+        if (got === null) {
+          dev.push(`${label}：data.ts 里读不到 inclination —— 判据失去对象，必须修`);
+          return;
+        }
+        const off = Math.abs(got - want) / want;
+        const text = `${label} = ${got}°（真值 ${want}°，偏差 ${(off * 100).toFixed(2)}%）${why}`;
+        rows.push({ file: "src/solar/data.ts", line: 0, text });
+        if (off > TOL) dev.push(text);
+      };
+      degCheck("moon.inclination", moonInc, 5.145, "——有人为了让月食发生而写了假倾角？月食要救回来需 i > 10.9°，那不是调参是改故事");
+      degCheck("mercury.inclination", mercuryInc, 7.004, "——水星要错过日面需 i > 13.9°，别用倾角去躲凌日");
       for (const id of dupes) {
         dev.push(`data.ts 里 id: "${id}" 出现了 ${count(id)} 次 —— 同一个天体两份定义，比率会变成「取第一个」，必须删掉多余的`);
       }
+
+      // 两条**明确不判**的（写清原因而不是留空，否则下一个人以为漏了）：
+      rows.push({
+        file: "src/solar/data.ts",
+        line: 0,
+        text: "未纳入 · 本影 0.370 vs 偏移 0.173：算式在观察位那五条物理推导里，我不在这里重写一份——重写出来的阈值就是这轮一直在打的东西（猜的阈值）",
+      });
+      rows.push({
+        file: "src/solar/data.ts",
+        line: 0,
+        text: "未纳入 · 周期一致性（1.00×–37.8×）：它需要「展示周期 vs 开普勒真周期」的压缩函数作为对照，那层还没定；现在判它只能是猜",
+      });
 
       // ② 根 README 里那五个数：**找不到就红**。
       // 不写成「找不到就跳过」——那等于给一条会静默失效的判据，正是这份脚本一直在防的东西。
@@ -506,6 +553,45 @@ const CHECKS = [
         // raw 必须随「发现的东西」单调增长：selftest 用它证明「注入后真的被数到了」。
         // 只写 dev.length 会让「4 条比率 → 1 处偏离」在数值上变小，selftest 判成没红。
         raw: rows.length + dev.length + dupes.length,
+      };
+    },
+  },
+  {
+    id: 8,
+    title: "物理常数只有一处出处（开普勒那组 μ / c / 月质量比）",
+    // 为什么加这条：`src/solar/kepler.ts` 带来了新的一类「叙事数字」——物理常数。
+    // 它和 data.ts 的压缩比率同类：会被散文引用、会被第二个人再抄一份，而抄一份之后
+    // 两个数字就开始各自漂。第 1–6 条守的是符号与约定，这条守的是常数本身。
+    // 只认**字面量**：字面量出现在别处 = 有人又写了一份，直接红；用 import 引用则不红。
+    expect: "μ_sun / μ_earth / c / 月质量比只以字面量出现在 src/solar/kepler.ts",
+    run(loaded) {
+      const OWNER = "src/solar/kepler.ts";
+      const constants = [
+        ["μ_sun", "1.32712440018e20"],
+        ["μ_earth", "3.986004418e14"],
+        ["c（光速）", "2.99792458e8"],
+        ["月质量比分母", "81.3006"],
+      ];
+      const hits = [];
+      for (const [label, literal] of constants) {
+        for (const h of hitsIn(loaded, new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "code")) {
+          if (h.file === OWNER) continue;
+          hits.push({ ...h, text: `${label} 的字面量 ${literal} 出现在 ${h.file}（唯一出处应是 ${OWNER}）` });
+        }
+      }
+      const owned = loaded.some((f) => f.file === OWNER);
+      // 通过时也要有命中行：空命中会被外层判成 VACUOUS，而 VACUOUS 的含义是
+      // 「判据在当前代码上失效」——本条 0 处越界恰恰是**通过**，不是失效。别让显示说谎。
+      const rows = constants.map(([label, literal]) => ({
+        file: OWNER,
+        line: 0,
+        text: `${label} = ${literal}（唯一出处，别处未见字面量）`,
+      }));
+      return {
+        hits: hits.length ? hits : rows,
+        observed: owned ? `4 个常数，越界 ${hits.length} 处` : `找不到 ${OWNER}（常数搬走了？这条要跟着改）`,
+        ok: owned && hits.length === 0,
+        raw: 4 + hits.length, // 4 = 通过态「四个常数各一处」的取证数，注入后单调增长
       };
     },
   },
@@ -627,6 +713,19 @@ const SELFTEST_CASES = [
     file: "src/solar/data.ts",
     inject: '\n  { id: "earth", name: "地球二号", radius: 1.2, orbitRadius: 15.2, period: 18 },\n',
   },
+  {
+    // 第 7 条的第二副牙齿：把月球倾角从真值 5.1° 改成 11°——那正是「为了让月食发生
+    // 而写一个假一倍的倾角」的假修法。前四条比率全都不约束倾角，所以这条只能靠倾角判据自己抓。
+    id: 7,
+    file: "src/solar/data.ts",
+    replace: ["inclination: deg(5.1)", "inclination: deg(11)"],
+  },
+  {
+    // 第 8 条的牙齿：把 μ_earth 的字面量抄到别处 —— 同一个常数两份出处。
+    id: 8,
+    file: "src/solar/store.ts",
+    inject: "\nconst __mu = 3.986004418e14;\n",
+  },
 ];
 
 function selftest() {
@@ -644,7 +743,18 @@ function selftest() {
         cpSync(src, dst);
       }
       const target = path.join(dir, test.file);
-      writeFileSync(target, readFileSync(target, "utf8") + test.inject);
+      // 两种注入方式：
+      //   inject  —— 往文件末尾追加（适合"在别处再写一份"这类第二真相）
+      //   replace —— 就地改一个常数（适合"把 5.1° 改成 11°"这类，追加改不动第一次出现的值）
+      // replace 找不到目标时**直接抛错**：否则注入悄悄没生效、判据照样绿，selftest 就变成了假证明。
+      if (test.replace) {
+        const before = readFileSync(target, "utf8");
+        const after = before.replace(test.replace[0], test.replace[1]);
+        if (after === before) throw new Error(`[${test.id}] 注入无效：找不到 ${test.replace[0]}`);
+        writeFileSync(target, after);
+      } else {
+        writeFileSync(target, readFileSync(target, "utf8") + test.inject);
+      }
       const after = runChecks(dir, SCAN_FILES);
       const b = base.results.find((r) => r.check.id === test.id);
       const a = after.results.find((r) => r.check.id === test.id);
