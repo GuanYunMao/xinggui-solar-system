@@ -47,6 +47,7 @@ npm run check          # = 单文件冒烟（起真浏览器，要 Edge）+ 形�
 | `hud-chips` | 星球列表收起⇄展开⇄收起：`aria-expanded` 三态、文本「全部 N」⇄「收起」、`flex-wrap` nowrap⇄wrap、展开后横向溢出 ≤1px、行高增量 >20px | **结构量**（同次自比，不写死 48/148） | 展开不换行 → 仍 nowrap；行高没变 → `open` 状态没接上 |
 | `hud-header` | 模拟历：非空、未 `display:none`、**完整在视口内**、不被左侧品牌组压住；抬头自身横向溢出 ≤1px；**窄屏(<640) 版本号必须让位**（`.eyebrow` display:none）。两格样本：390 锁态 + 390 已校准 | **结构量**（几何关系 + 二值） | 越界/被压 → 抬头里又塞了宽控件；版本号可见 → `hidden` 被摘 |
 | `pointer-misselection` | Space 暂停后，找「小天体盘外 6px、`elementFromPoint===CANVAS`、`__solarPick.at()` 命中同一 id」的点 → 按住 `#chip-jupiter` 拖到该点松手 → **`?body=` 不变、无 `aria-pressed=true` 芯片、无 `article`**。两条对照：正常点地球必须选中；画布拖 40px 必须不选 | **结构量**（URL 参数 + DOM 存在性，无阈值） | 若红：`PickLayer.onUp` 的 `pressed` 守卫（`if (!wasPressed) return`）失效了——「按下在 HUD、抬起在画布」被当成点击（t11 D1 复发） |
+| `orbit-planes` | `__solarOrbitPlanes()` 在**三个模拟时刻**各读一次「天体相对母天体的世界偏移」，三点叉积得轨道平面法向量：**沙盘**（parent=sun 的 8 颗行星）两两夹角 **< 0.01°**；**实境**（`?proto=1`）反过来判——月球法向量对黄道法向量的倾角 **≈5.145°（±0.5°）**，压平了就红 | **结构量**（几何角度，与帧率/相位无关） | 沙盘红了 → `look.flatOrbits` 或轨道倾角公式被改；实境红了 → `flatOrbits=false` 没接对（实境被压平）。探针缺失**直接红**，不 `available:false` 放行 |
 | `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏）、**画布不是全黑**、dpr 红线 | 结构性 + 像素 | 该条 `errors`；漏资源会在控制台报 404 |
 | `frame-time` | 稳态帧时间相对**本次运行的机器基线**的比值 | **数值** | `results[frame-time].normalized`，见下节 |
 | `hit-matrix` | 探针投影出的天体数（判）；屏幕重叠对数（**只记录**） | **数值** | 见下面「哪些数字不许当判据」 |
@@ -63,7 +64,9 @@ npm run check          # = 单文件冒烟（起真浏览器，要 Edge）+ 形�
 > 把 `.eyebrow` 放出来，verify 和 CI 都会全绿；而「在芯片上按下、拖到画布空白松手」这条误选手势
 > 从 t11 查出根因到 t18 修好，**全程没有一条断言会红**。
 > 现在每一条都做过反向验证：在产物副本里把被测行为打坏，对应断言必须红。
-> 反向验证入口：`XG_ONLY=mobile,mobile-selected`（两条手机页）与 `XG_ONLY=pointer-misselection`（误选那条）。
+> 反向验证入口：`XG_ONLY=mobile,mobile-selected`（两条手机页）、`XG_ONLY=pointer-misselection`（误选那条）、`XG_ONLY=orbit-planes`（共面那条）。
+> `orbit-planes` 也属于这一类：**沙盘共面这个性质此前 19 条 pass 一条都不守**——`overlapping` 明令禁止加阈值、
+> `meanLum` 是松判据。所以它红了，不是"多了一条断言"，而是「这一类回归终于会有人喊」。
 
 数值断言一共 9 条 —— `frame-time` / `hit-matrix` / `follow-jitter` / `proto-real` / `proto-jitter` /
 `zoom-budget` / `sun-occlusion` / `boot-stage` / `camera-clearance`

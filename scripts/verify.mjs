@@ -797,6 +797,157 @@ const pickerState = (page) =>
     pressedChips: document.querySelectorAll('#chip-row button[aria-pressed="true"]').length,
   }));
 
+// ——— 轨道共面（沙盘）/ 不共面（实境）：`__solarOrbitPlanes()` 的三点求法向量 ————
+// 为什么要有这条：`t24` 让沙盘行星回到共面，而当时 19 条 pass **一条都不守它**——
+// `overlapping` 明令禁止加阈值、`meanLvl`/`meanLum` 是松判据。所以这条是唯一守卫。
+//
+// 采样方式：把模拟时间推到三个时刻，各读一次「天体相对母天体的世界偏移」，
+// 三点求叉积得轨道平面法向量。共面 = 各行星法向量两两夹角 ≈ 0。
+//
+// ⚠ **只约束行星（parent = sun），不约束卫星**：t31 刻意让卫星挂在母行星的赤道面
+//   （木卫 3.1°、土卫六 26.7°）——那是用户点名要的效果（土卫六必须在环面里，否则环和卫星错开）。
+//   所以卫星保留各自的 orbitFrame 倾角；这条断言不覆盖它们，**这不是漏写**。
+//
+// ⚠ 反过来也要判：实境（`?proto=1`，flatOrbits=false）不许被压平——月球的法向量倾角应当
+//   接近真值 5.145°。如果实境也平了，说明 `look.flatOrbits` 没接对，这条同样要红。
+const PLANE_EPS_DEG = 0.01; // 共面判据：两两夹角 < 0.01°（实测 0.000000°）
+const MOON_INC_WANT_DEG = 5.145; // 真值；实境若被压平会读到 0
+const MOON_INC_TOL_DEG = 0.5;
+
+/** 三个时刻各读一次偏移，返回 {id, parent, normal:[x,y,z]} */
+async function sampleOrbitNormals(page, stepSim = 0.4) {
+  return page.evaluate(async (step) => {
+    const t = window.__solarTime;
+    const t0 = t.now();
+    const samples = [];
+    for (let k = 0; k < 3; k++) {
+      t.set(t0 + k * step);
+      // 位置在渲染循环里更新；等两帧确保读到的不是上一时刻的缓存
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      await new Promise((r) => requestAnimationFrame(() => r()));
+      samples.push(window.__solarOrbitPlanes?.() ?? []);
+    }
+    const first = samples[0];
+    const out = [];
+    for (const row of first) {
+      const p0 = samples[0].find((r) => r.id === row.id)?.rel;
+      const p1 = samples[1].find((r) => r.id === row.id)?.rel;
+      const p2 = samples[2].find((r) => r.id === row.id)?.rel;
+      if (!p0 || !p1 || !p2) continue;
+      const a = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+      const b = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+      const n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+      const len = Math.hypot(...n);
+      if (!(len > 1e-9)) continue; // 三点共线 → 求不出法向量，跳过（下一条断言会因缺天体暴露）
+      out.push({ id: row.id, parent: row.parent, normal: n.map((v) => v / len) });
+    }
+    return out;
+  }, stepSim);
+}
+
+const angleDegBetween = (u, v) => {
+  const dot = Math.abs(u[0] * v[0] + u[1] * v[1] + u[2] * v[2]);
+  return (Math.acos(Math.min(1, Math.max(-1, dot))) * 180) / Math.PI;
+};
+
+async function runOrbitPlanes(browser, base) {
+  const out = { sandbox: null, real: null };
+  // 1) 沙盘：行星必须共面
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    try {
+      await page.goto(base, { waitUntil: "load", timeout: 30000 });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      await page.waitForTimeout(1200);
+      const hasProbe = await page.evaluate(() => typeof window.__solarOrbitPlanes === "function");
+      if (!hasProbe) {
+        out.sandbox = { available: false, reason: "__solarOrbitPlanes 不存在" };
+      } else {
+        const normals = await sampleOrbitNormals(page);
+        const planets = normals.filter((n) => n.parent === "sun");
+        let worst = 0;
+        let worstPair = null;
+        for (let i = 0; i < planets.length; i++) {
+          for (let j = i + 1; j < planets.length; j++) {
+            const d = angleDegBetween(planets[i].normal, planets[j].normal);
+            if (d > worst) {
+              worst = d;
+              worstPair = [planets[i].id, planets[j].id];
+            }
+          }
+        }
+        out.sandbox = {
+          available: true,
+          planets: planets.map((p) => p.id),
+          maxAngleDeg: +worst.toFixed(6),
+          worstPair,
+          count: planets.length,
+        };
+      }
+    } finally {
+      await ctx.close();
+    }
+  }
+  // 2) 实境：月球不许被压平
+  {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    try {
+      await page.goto(`${base}?proto=1`, { waitUntil: "load", timeout: 30000 });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      await page.waitForTimeout(1200);
+      const hasProbe = await page.evaluate(() => typeof window.__solarOrbitPlanes === "function");
+      if (!hasProbe) {
+        out.real = { available: false, reason: "__solarOrbitPlanes 不存在（?proto=1）" };
+      } else {
+        const normals = await sampleOrbitNormals(page);
+        const moon = normals.find((n) => n.id === "moon") ?? null;
+        // 倾角 = 月球轨道法向量与黄道面法向量 (0,1,0) 的夹角
+        const inc = moon ? angleDegBetween(moon.normal, [0, 1, 0]) : null;
+        out.real = {
+          available: true,
+          bodies: normals.map((n) => `${n.id}@${n.parent}`),
+          moonInclinationDeg: inc === null ? null : +inc.toFixed(4),
+        };
+      }
+    } finally {
+      await ctx.close();
+    }
+  }
+  return out;
+}
+
+function judgeOrbitPlanes(res) {
+  const name = "orbit-planes";
+  const sb = res.sandbox;
+  // 探针没了 = 判不了 → 判红，不许 available:false 静默放行（与 zoom-budget 依赖 __solarPick 同理）
+  if (!sb || !sb.available) {
+    failures.push(`${name}: 读不到 __solarOrbitPlanes（${sb?.reason ?? "未知"}）—— 共面判据会失去守卫，必须红`);
+  } else {
+    if (sb.count < 8) failures.push(`${name}: 沙盘只采到 ${sb.count} 条行星轨道（应 8）—— 采样不足，判据不成立`);
+    if (!(sb.maxAngleDeg < PLANE_EPS_DEG)) {
+      failures.push(
+        `${name}: 沙盘行星轨道不共面 —— 最大两两夹角 ${sb.maxAngleDeg}° ≥ ${PLANE_EPS_DEG}°` +
+          `（${sb.worstPair ? sb.worstPair.join(" × ") : "?"}）。` +
+          `有人动了 \`look.flatOrbits\` 或轨道倾角公式？沙盘必须回到共面。`,
+      );
+    }
+  }
+  const real = res.real;
+  if (!real || !real.available) {
+    failures.push(`${name}: 读不到实境的 __solarOrbitPlanes（${real?.reason ?? "未知"}）—— 压平判据会失去守卫，必须红`);
+  } else if (real.moonInclinationDeg === null) {
+    failures.push(`${name}: 实境里找不到月球（采到 ${real.bodies.join(", ") || "空"}）—— 判据失去对象`);
+  } else if (Math.abs(real.moonInclinationDeg - MOON_INC_WANT_DEG) > MOON_INC_TOL_DEG) {
+    failures.push(
+      `${name}: 实境月球的轨道倾角是 ${real.moonInclinationDeg}°，真值 ${MOON_INC_WANT_DEG}°` +
+        `（容差 ±${MOON_INC_TOL_DEG}°）—— 实境被压平了？\`look.flatOrbits\` 没接对。`,
+    );
+  }
+  return res;
+}
+
 async function runPickerGesture(page, context) {
   // 先移动指针把 chrome 唤醒（t12 自动收起会在静置 2s 后把芯片行从 DOM 拿掉）
   await page.mouse.move(300, 40);
@@ -1077,6 +1228,15 @@ try {
       failures.push(`pointer-misselection: ${err.message}`);
     } finally {
       await ctx.close();
+    }
+  }
+  // ——— 轨道共面（沙盘）/ 不共面（实境）———
+  if (want("orbit-planes")) {
+    try {
+      const planes = await runOrbitPlanes(browser, base);
+      results.push({ pass: "orbit-planes", 分类: "结构量", ...judgeOrbitPlanes(planes) });
+    } catch (err) {
+      failures.push(`orbit-planes: ${err.message}`);
     }
   }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
