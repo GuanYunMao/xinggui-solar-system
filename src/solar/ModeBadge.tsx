@@ -76,6 +76,14 @@ const COPY = {
   importPlaceholder: "XG1-ABCDE-FG",
 };
 
+/** 庆祝层时长（t28：三点连成轨道线）。 */
+const CELEBRATE_MS = 2600;
+/**
+ * 实境入口的自证高亮时长（t54）：**只出现一次**，到点无条件回常态。
+ * 观察位实测：解锁后实境段位 44×28、底色 transparent、`animationName=null` —— 可点但零提示。
+ */
+const CTA_HINT_MS = 1500;
+
 export function ModeBadge() {
   const mode = useSim((state) => state.mode);
   const switching = useSim((state) => state.switching);
@@ -101,15 +109,32 @@ export function ModeBadge() {
    * t28：解锁那一刻只播一次「三点连成轨道线」。**纯 CSS 动画**，这里只负责
    * 开/关一个状态 —— 不起 rAF、不每帧写 DOM（正在量微卡顿，面板不许进帧预算）。
    * 2600ms 到点自动收起；`prefers-reduced-motion` 时动画静止但文案照样出现。
+   *
+   * t54：庆祝层退场时，实境入口再来一次 1.5s 的**自证高亮**（观察位的头条：
+   * 解锁后 `realMentions=1 / hintMentions=0 / animationName=null`，入口可点却零提示）。
+   * 同样只是开关一个状态，动画全在 CSS：`transform / filter / opacity`，不动布局。
    */
   const [celebrate, setCelebrate] = useState(false);
+  const [ctaHint, setCtaHint] = useState(false);
+  const ctaTimer = useRef<number | null>(null);
   const wasUnlocked = useRef(unlocked);
   useEffect(() => {
     if (unlocked && !wasUnlocked.current) {
       wasUnlocked.current = true;
       setCelebrate(true);
-      const timer = window.setTimeout(() => setCelebrate(false), 2600);
-      return () => window.clearTimeout(timer);
+      const celebrateTimer = window.setTimeout(() => {
+        setCelebrate(false);
+        // 庆祝层退场的那一拍开始指路：1.5s 后无条件回到常态（不许常驻动画）
+        setCtaHint(true);
+        ctaTimer.current = window.setTimeout(() => {
+          setCtaHint(false);
+          ctaTimer.current = null;
+        }, CTA_HINT_MS);
+      }, CELEBRATE_MS);
+      return () => {
+        window.clearTimeout(celebrateTimer);
+        if (ctaTimer.current) window.clearTimeout(ctaTimer.current);
+      };
     }
     wasUnlocked.current = unlocked;
     return undefined;
@@ -182,15 +207,16 @@ export function ModeBadge() {
     }
   };
 
-  const segment = (target: typeof mode, label: string) => (
+  const segment = (target: typeof mode, label: string, highlight = false) => (
     <button
       key={target}
       type="button"
       className={`hud-btn inline-flex h-7 items-center rounded-full px-2.5 text-xs ${
         mode === target ? "bg-accent text-accent-fg" : "text-muted"
-      }`}
+      } ${highlight ? "gate-cta" : ""}`}
       aria-pressed={mode === target}
       disabled={Boolean(switching)}
+      data-cta-hint={highlight ? "true" : undefined}
       onClick={() => setMode(target)}
     >
       {label}
@@ -211,7 +237,7 @@ export function ModeBadge() {
           aria-label={COPY.toggleAria}
         >
           {segment("sandbox", COPY.badgeSandbox)}
-          {segment("real", COPY.badgeReal)}
+          {segment("real", COPY.badgeReal, ctaHint)}
           {/*
             key 必须给：上面两段是带 key 的（segment 里 key={target}），这个折角如果没 key，
             同一个 children 列表里就混了「带 key」和「不带 key」两种身份。React 在两支之间

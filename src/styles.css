@@ -368,6 +368,41 @@ main[data-real-veil="1"] .real-controls {
   }
 }
 
+/*
+ * t54：解锁庆祝层退场时，实境入口的一次自证高亮（1.5s）。
+ *
+ * 只用 transform / filter / opacity —— 不动布局、不起 rAF；类名由 ModeBadge 的
+ * CTA_HINT_MS 计时器移除，所以**不存在常驻动画**（1.5s 后 computed animationName 回 none）。
+ * reduced-motion 下不抖：不给脉动，直接给一个静止的高亮态（见文件底部 media 块），
+ * 1.5s 后类名移除即回常态 —— "直接给终态"不等于"什么都不给"，否则这批玩家又回到零提示。
+ */
+.gate-cta {
+  animation: gate-cta 1500ms var(--ease-smooth-out) 1 both;
+}
+
+@keyframes gate-cta {
+  0% {
+    transform: scale(1);
+    filter: none;
+    opacity: 1;
+  }
+  18% {
+    transform: scale(1.06);
+    filter: drop-shadow(0 0 10px rgb(231 237 245 / 0.85)) brightness(1.2);
+    opacity: 1;
+  }
+  62% {
+    transform: scale(1.01);
+    filter: drop-shadow(0 0 5px rgb(231 237 245 / 0.45)) brightness(1.08);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    filter: none;
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .panel-in {
     animation: none;
@@ -389,6 +424,12 @@ main[data-real-veil="1"] .real-controls {
   .gate-node {
     opacity: 1;
     transform: none;
+  }
+
+  /* t54：不脉动，但提示仍在 —— 静止的高亮态，类名由计时器移除后回常态 */
+  .gate-cta {
+    animation: none;
+    filter: drop-shadow(0 0 6px rgb(231 237 245 / 0.9)) brightness(1.18);
   }
 
   .chrome-in,
