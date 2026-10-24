@@ -449,22 +449,75 @@ function applyHome(camera: THREE.PerspectiveCamera, width: number, height: numbe
   camera.lookAt(0, 0, 0);
 }
 
-function easeInOut(t: number) {
-  return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-}
+/**
+ * t40：聚焦过渡**按世界弧长推进**（不再按 u 的等份推进，也不再套缓动曲线）。
+ *
+ * 为什么：路径是「target 线性搬运 + 视距对数收缩 + 朝向球面插值」三条同时走，
+ * 1 个 u 在不同位置的**世界弧长差 2.6 倍** —— 外侧半径大，同样的转角扫出更长的弧。
+ * 于是无论缓动取什么形状，单帧位移都会被那段"斜向管道"放大：
+ * easeOutCubic（t=0 斜率 3，t19 用的）实测单帧 22.28%、smoothstep 仍有 5.69%（判据 ≤5%），
+ * 用户看到的就是「先往一个方向移动，然后突变到目标上」——前半段在扫大弧，后半段才对上目标。
+ *
+ * 现在：每帧按**世界弧长**给出推进量（rate × 路程 × dt），再用一张 u↔弧长表反查 u。
+ * 位置/朝向/视距仍然是同一个 u（t19 的三条曲线同相位不变），只是 u 的推进速度按弧长算，
+ * 于是世界里的速度接近常值：没有"扫大弧的那几帧"。
+ *
+ * 数字都是手感值：
+ *  - FOCUS_RATE 1.5/s ⇒ 一段 124 单位的路程约 0.85s；
+ *  - 起步 0.12s 线性加速（第一帧就有位移，但加速度有限，不会像斜率 3 那样第一帧吃掉 6%）；
+ *  - 尾段按剩余路程的 16% 线性减速（≈0.08 个路程的刹车距离，抵达不顿）；
+ *  - 单帧硬上限 4.5%（判据是 ≤5%）：**帧抖动**（headless 实测有 32ms 的帧）也不许跳，
+ *    代价是卡顿时整段动画按帧延长一点，而不是让镜头瞬移。
+ */
+const FOCUS_RATE = 1.5;
+const FOCUS_RAMP_IN = 0.12;
+const FOCUS_RAMP_OUT = 0.16;
+const FOCUS_STEP_CAP = 0.045;
+/** 弧长表的采样段数（32 段 = 33 个点）。查表是二分 + 线性插值。 */
+const FOCUS_LUT_STEPS = 32;
 
 /**
- * t19：聚焦过渡的缓动 —— 起步就得有速度。
- *
- * 旧 `easeInOut` 在 t=0 的导数是 0（4t³），等于切换那一帧先把镜头刹停；用户的原话
- * 「要半天才有反应」就是这一段。t55 当年靠"中途换目标把 dur 缩到 0.55"绕过，
- * 但没解决起点速度为 0。
- *
- * easeOutCubic：t=0 斜率 3（100ms/750ms 已走 ~35%），到 1 时斜率 0（抵达不顿）。
- * 位置/朝向/距离共用这一个 u —— 三条曲线同相位。
+ * 一次聚焦过渡的全部状态（t40 起 `t`/`s`/`pathLen`/`lut` 取代了原来的 `t`/`dur`）。
+ * `s` 是**归一化世界弧长**，不是时间比例；`lut` 把 s 反查成路径参数 u。
  */
-function easeFocus(t: number) {
-  return 1 - (1 - t) ** 3;
+type FocusAnim = {
+  t: number;
+  s: number;
+  pathLen: number;
+  lut: Float32Array;
+  instant: boolean;
+  rampIn: number;
+  fromPos: THREE.Vector3;
+  fromTarget: THREE.Vector3;
+  fromDir: THREE.Vector3;
+  fromDist: number;
+  toDist: number;
+  toId: string | null;
+  home: boolean;
+};
+
+/**
+ * 弧长比例 s∈[0,1] → 路径参数 u∈[0,1]。
+ *
+ * 表里存的是**归一化累计弧长**（lut[i] = 从 0 走到 u=i/N 走过的路程 / 总路程），
+ * 单调递增，所以反查就是一次二分 + 段内线性插值。表在建动画时采样一次（见 startFocus）：
+ * 路径取决于目标天体当时的位置，目标在动时表会稍微旧一点，但坏不到哪去
+ * （只是"速度略不均匀"，而终点由 u=1 精确决定，抵达机位不受影响）。
+ */
+function lutU(lut: Float32Array, s: number) {
+  if (s <= 0) return 0;
+  if (s >= 1) return 1;
+  const last = lut.length - 1;
+  let lo = 0;
+  let hi = last;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (lut[mid] < s) lo = mid;
+    else hi = mid;
+  }
+  const span = lut[hi] - lut[lo];
+  const f = span > 1e-9 ? (s - lut[lo]) / span : 0;
+  return (lo + f) / last;
 }
 
 /**
@@ -2216,18 +2269,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
   // 注意力放在 ref 上时聚焦 effect 的依赖永远不变，等于永不重跑（深链就白选了）。
   const [posed, setPosed] = useState(returning);
-  const anim = useRef<{
-    t: number;
-    dur: number;
-    fromPos: THREE.Vector3;
-    fromTarget: THREE.Vector3;
-    /** 起始的「目标→相机」单位方向（t19 起它是 slerp 的起点，不再是全程常量） */
-    fromDir: THREE.Vector3;
-    fromDist: number;
-    toDist: number;
-    toId: string | null;
-    home: boolean;
-  } | null>(null);
+  const anim = useRef<FocusAnim | null>(null);
   const followId = useRef<string | null>(null);
   const prevPlanet = useRef(new THREE.Vector3());
   const diagTick = useRef(0);
@@ -2243,6 +2285,24 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       zoomDir: new THREE.Vector3(),
       zoomFwd: new THREE.Vector3(),
       /** t19 过渡：当前朝向 / 抵达朝向 / 球面插值的两个四元数 / 太阳位置 */
+      dirNow: new THREE.Vector3(),
+      dirTo: new THREE.Vector3(),
+      sun: new THREE.Vector3(),
+      q: new THREE.Quaternion(),
+      q2: new THREE.Quaternion(),
+    }),
+    [],
+  );
+  /*
+   * 过渡路径求值器自己的暂存（t40）。不能借上面的 scratch：建弧长表时每帧要求值两次，
+   * 而 scratch.pos/target 在同一帧里还要装最终机位，共用会互相踩。
+   */
+  const poseScratch = useMemo(
+    () => ({
+      dest: new THREE.Vector3(),
+      target: new THREE.Vector3(),
+      pos: new THREE.Vector3(),
+      home: new THREE.Vector3(),
       dirNow: new THREE.Vector3(),
       dirTo: new THREE.Vector3(),
       sun: new THREE.Vector3(),
@@ -2283,6 +2343,57 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   wantReset.current = resetToken;
   const appliedKey = useRef<string | null>(returning ? RETURNING_KEY : null);
 
+  /**
+   * 过渡路径在参数 u∈[0,1] 上的机位（t40 起用它同时做两件事：采样弧长、算每帧机位）。
+   *
+   * 位置/朝向/视距**共用这一个 u**（t19 的不变式：三条曲线同相位，抵达那一刻不会再有
+   * 一次"对齐"动作）：
+   *  - target：从起点 target 线性搬到天体中心（竖屏再下移半屏，详情卡是底部抽屉）；
+   *  - 视距：对数插值（视觉大小 ∝ 1/dist，线性插值会"先转过去再突然放大"）；
+   *  - 朝向：从起点方向球面插值到抵达朝向（目标→太阳再抬 12°，正面受光）。
+   */
+  function focusPose(
+    cur: FocusAnim,
+    u: number,
+    out: { pos: THREE.Vector3; target: THREE.Vector3 },
+  ) {
+    const ps = poseScratch;
+    const w = sizeRef.current.width;
+    const h = sizeRef.current.height;
+    if (cur.home) {
+      homeVector(w, h, ps.home);
+      ps.target.set(0, 0, 0);
+      out.target.copy(cur.fromTarget).lerp(ps.target, u);
+      out.pos.copy(cur.fromPos).lerp(ps.home, u);
+      return;
+    }
+    const obj = cur.toId ? reg.groups.get(cur.toId) : undefined;
+    if (obj) obj.getWorldPosition(ps.dest);
+    else ps.dest.set(0, 0, 0);
+    if (h > w) {
+      const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
+      // 半高 = focalPx 的反解，和拾取器/标签用同一条 fov 约定（pick.ts 的 halfSpanAt）
+      ps.dest.y -= halfSpanAt(cur.toDist, fov) * 0.55;
+    }
+    out.target.copy(cur.fromTarget).lerp(ps.dest, u);
+    const dist = Math.exp(
+      THREE.MathUtils.lerp(
+        Math.log(Math.max(cur.fromDist, 1e-3)),
+        Math.log(Math.max(cur.toDist, 1e-3)),
+        u,
+      ),
+    );
+    const sun = reg.groups.get("sun");
+    if (sun) sun.getWorldPosition(ps.sun);
+    else ps.sun.set(0, 0, 0);
+    ps.dirTo.copy(ps.sun).sub(ps.dest).normalize();
+    ps.dirTo.applyAxisAngle(perpAxis(ps.dirTo), 0.2126);
+    ps.q.setFromUnitVectors(cur.fromDir, ps.dirTo);
+    ps.q2.identity().slerp(ps.q, u);
+    ps.dirNow.copy(cur.fromDir).applyQuaternion(ps.q2).normalize();
+    out.pos.copy(out.target).addScaledVector(ps.dirNow, dist);
+  }
+
   const startFocus = (controls: OrbitControlsImpl, id: string | null) => {
     const reduced =
       typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -2293,15 +2404,16 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     offset.multiplyScalar(1 / fromDist);
     const body = id ? byId[id] : undefined;
     /*
-     * 中途换目标时 dur 缩短（t55 B2）。fromPos/fromTarget 本来就取"此刻"，位置连续；
-     * 卡顿来自 `t=0` + easeInOut 的起点速度为 0 —— 等于在切换那一帧把镜头刹停。
-     * 这一段更短，让那次"顿一下"短到看不出来。
+     * 中途换目标（t55 B2）：fromPos/fromTarget 取"此刻"，位置连续；起步不减速
+     * （起步斜坡只给"从静止开始"的那一次，否则打断动画会先刹一下）。
      */
     const continuing = anim.current !== null;
-    anim.current = {
+    const cur: FocusAnim = {
       t: 0,
-      /* t19：0.95 → 0.75（continuing 0.55 → 0.45）。easeFocus 起步就有速度，短一点才不"拖"。 */
-      dur: reduced ? 0.01 : continuing ? 0.45 : 0.75,
+      s: 0,
+      pathLen: 0,
+      lut: new Float32Array(FOCUS_LUT_STEPS + 1),
+      instant: reduced,
       fromPos,
       fromTarget,
       fromDir: offset.clone(),
@@ -2309,7 +2421,30 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       toDist: body?.focus ?? 1,
       toId: id,
       home: !id,
+      /** 打断时的起步斜坡跳过（见上）*/
+      rampIn: continuing ? 1 : 0,
     };
+    anim.current = cur;
+    /*
+     * 建弧长表：采样 33 个 u，累加**世界位移**。这就是 t40 的核心 ——
+     * 后面每帧按"走了多少路"推进 s，再反查 u，于是世界速度是常值，
+     * 不再出现"外侧转角扫大弧"那几帧（那正是用户看到的"突变"）。
+     */
+    const a = poseScratch;
+    const prev = new THREE.Vector3();
+    focusPose(cur, 0, { pos: prev, target: a.target });
+    for (let i = 1; i <= FOCUS_LUT_STEPS; i++) {
+      focusPose(cur, i / FOCUS_LUT_STEPS, { pos: a.pos, target: a.target });
+      cur.lut[i] = cur.lut[i - 1] + prev.distanceTo(a.pos);
+      prev.copy(a.pos);
+    }
+    cur.pathLen = cur.lut[FOCUS_LUT_STEPS];
+    if (cur.pathLen > 1e-6) {
+      for (let i = 0; i <= FOCUS_LUT_STEPS; i++) cur.lut[i] /= cur.pathLen;
+    } else {
+      // 原地重聚焦（路径长度 0）：直接到位，别在 0 长度上积分数值噪声
+      cur.instant = true;
+    }
     followId.current = null;
     /*
      * t34：动画期间用我们自己的 `camLocked` 静音输入（旋转/滚轮都看它）。
@@ -2497,56 +2632,34 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const current = anim.current;
     if (current) {
       current.t += delta;
-      const u = easeFocus(Math.min(1, current.t / current.dur));
-      if (current.home) {
-        homeVector(sizeRef.current.width, sizeRef.current.height, scratch.home);
-        scratch.target.lerpVectors(current.fromTarget, scratch.origin, u);
-        scratch.pos.lerpVectors(current.fromPos, scratch.home, u);
-      } else {
-        const obj = current.toId ? reg.groups.get(current.toId) : undefined;
-        if (obj) obj.getWorldPosition(scratch.dest);
-        else scratch.dest.set(0, 0, 0);
-        // 竖屏时详情卡是底部抽屉：把镜头目标下移，星球就被顶到上半屏
-        if (sizeRef.current.height > sizeRef.current.width) {
-          const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
-          // 半高 = focalPx 的反解，和拾取器/标签用同一条 fov 约定（pick.ts 的 halfSpanAt）
-          const halfHeight = halfSpanAt(current.toDist, fov);
-          scratch.dest.y -= halfHeight * 0.55;
-        }
-        scratch.target.lerpVectors(current.fromTarget, scratch.dest, u);
-        /*
-         * 距离用**对数**插值（t55 B2）。
-         *
-         * 根因：屏幕上星球的视觉大小 ∝ 1/dist。线性插值 118 → 4.8 时，前 90% 的时间
-         * dist 只从 118 掉到 16（球几乎没变大），最后 10% 才从 16 冲到 4.8 ——
-         * 观感就是「先转过去，再突然放大」。取对数后每帧的视觉放大倍率恒定，
-         * 缩放和朝向（由 target 平移带来的转动）从头到尾同步。
-         */
-        const dist = Math.exp(
-          THREE.MathUtils.lerp(
-            Math.log(Math.max(current.fromDist, 1e-3)),
-            Math.log(Math.max(current.toDist, 1e-3)),
-            u,
-          ),
-        );
-        /*
-         * t19（3/3）：转动与缩放同轨 —— 朝向也从 fromDir 球面插值到**抵达朝向**，
-         * 与 dist 共用同一个 u。旧的 `dir` 是常量：相机只会平移过去，
-         * 于是永远从同一个方位看目标；抵达时目标背面朝相机就是"点开一颗星看到黑球"。
-         *
-         * 抵达朝向 = 「目标→太阳」方向再抬 12°（太阳在相机背后，正面受光）。
-         * 每帧现算：目标在动（公转/冻结历元都一样），到达那一刻的日向才是对的。
-         */
-        const sun = reg.groups.get("sun");
-        if (sun) sun.getWorldPosition(scratch.sun);
-        else scratch.sun.set(0, 0, 0);
-        scratch.dirTo.copy(scratch.sun).sub(scratch.dest).normalize();
-        scratch.dirTo.applyAxisAngle(perpAxis(scratch.dirTo), 0.2126);
-        scratch.q.setFromUnitVectors(current.fromDir, scratch.dirTo);
-        scratch.q2.identity().slerp(scratch.q, u);
-        scratch.dirNow.copy(current.fromDir).applyQuaternion(scratch.q2).normalize();
-        scratch.pos.copy(scratch.target).addScaledVector(scratch.dirNow, dist);
-      }
+      /*
+       * t40：先决定"这一帧走多少**路**"，再反查 u。
+       *
+       * 旧写法 `u = ease(t/dur)` 里 u 是等份的，而路径上 1 个 u 对应的世界位移
+       * 在不同位置差 2.6 倍（外侧半径大，同样转角扫出更长的弧）—— 于是无论缓动怎么调，
+       * 单帧位移都会被放大（easeOutCubic 22.28%、smoothstep 5.69%，判据 ≤5%），
+       * 用户看到「先往一个方向移动，然后突变到目标上」。
+       *
+       * 现在 s 是**归一化世界弧长**：每帧推进 rate×dt（起步/尾段各有一段斜坡），
+       * 再用弧长表反查 u。世界速度因此接近常值：没有"扫大弧的那几帧"。
+       * 单帧硬上限 FOCUS_STEP_CAP 兜住帧抖动（headless 有 32ms 的帧，rate×dt 会超 5%）。
+       */
+      const remaining = Math.max(0, 1 - current.s);
+      const rampIn = current.rampIn > 0 ? 1 : Math.min(1, current.t / FOCUS_RAMP_IN);
+      /*
+       * 尾段减速用 sqrt：v ∝ √剩余路程 ⇒ **匀减速**（2D/R 秒刹停，D=FOCUS_RAMP_OUT）。
+       * 线性 `remaining/D` 那版是"速度 ∝ 剩余路程"= 指数逼近，s 永远到不了 1（动画永不结束、
+       * 输入锁永远不放：实测点完地球滚轮整段失效）。sqrt 版在有限时间内真的把剩余量走成 0。
+       */
+      const rampOut = Math.min(1, Math.sqrt(remaining / FOCUS_RAMP_OUT));
+      const step = current.instant
+        ? 1
+        : Math.min(FOCUS_RATE * rampIn * rampOut * delta, FOCUS_STEP_CAP);
+      // 收尾：剩下的不到万分之一就一次走完（否则 s 会停在 0.9999 上）
+      current.s = remaining <= 1e-4 ? 1 : Math.min(1, current.s + step);
+      const u = lutU(current.lut, current.s);
+      // 到位那一帧精确摆到 u=1（弧长表的分段线性化会留一点点残差）
+      focusPose(current, current.s >= 1 ? 1 : u, { pos: scratch.pos, target: scratch.target });
       controls.target.copy(scratch.target);
       camera.position.copy(scratch.pos);
       /*
