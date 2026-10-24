@@ -414,7 +414,7 @@ function Stars() {
   );
 }
 
-function Simulation() {
+function Simulation({ ready = true }: { ready?: boolean }) {
   const reg = useRegistry();
   // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
   const { bodies, spec } = useSystem();
@@ -459,7 +459,8 @@ function Simulation() {
       if (clouds) clouds.rotation.y = t * body.spin * 1.35;
     }
     if (look.spins && reg.belt) reg.belt.rotation.y = t * 0.015;
-    if (!window.__solarReady) window.__solarReady = true;
+    // `ready` 要等启动分期挂满（第 3 期）：否则截图/验收可能拍到"还没有星空"的那一帧
+    if (ready && !window.__solarReady) window.__solarReady = true;
   }, -3);
   return null;
 }
@@ -2221,6 +2222,39 @@ function CamTrace({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | 
   return null;
 }
 
+/**
+ * 启动分期（1.2.0 / t41）。
+ *
+ * 为什么：SwiftShader 上首帧要编译约 10 个 shader，实测一个长期任务 280~485ms；
+ * `?proto=1`（不挂装饰、没有程序化贴图）同机启动段 0 次 >50ms 卡顿 —— 说明大头是
+ * 装饰体的首编译，不是贴图（贴图 t24 已切到 106,496 px 并分帧）。
+ *
+ * 做法：**只改出现顺序，不删东西**。第 1 帧就有太阳、行星、轨道线、标签（用户看到的仍是
+ * 完整太阳系），星空/银河带放第 2 帧，小行星带与尾迹放第 3 帧，把首编译摊到三帧。
+ * 每帧一次的 rAF 推进，不做超时兜底：rAF 不跑说明页面根本不可见，那时推迟也无害。
+ *
+ * `?bootstage=1|2|3` 是诊断覆盖（1=只有太阳行星，2=加星空，3=全量=默认），
+ * 用来量每一期各自的编译成本。
+ */
+/**
+ * `?bootstage=1|2|3` 是诊断覆盖：**钉住**开局期数（不再往后长），用来量每一期各自的编译成本。
+ * 不带参数时开局 1 期、随后每帧长一期。
+ */
+const BOOT_STAGE_FULL = 3;
+
+function pinnedBootStage(): number | null {
+  if (typeof window === "undefined") return null;
+  const raw = new URLSearchParams(window.location.search).get("bootstage");
+  if (raw === null) return null;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > BOOT_STAGE_FULL) {
+    if (typeof console !== "undefined") console.log(`[boot] ?bootstage=${raw} 无效（1..${BOOT_STAGE_FULL}），走默认分期`);
+    return null;
+  }
+  if (typeof console !== "undefined") console.log(`[boot] ?bootstage=${n} → 钉在第 ${n} 期（诊断用，不往后长）`);
+  return n;
+}
+
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
@@ -2235,6 +2269,17 @@ function Scene() {
   const { byId, spec } = useSystem();
   // 观感声明（R3）：装饰、轨道线、标签、用哪台相机，全部由系统的 look 决定
   const look = spec.look;
+  /*
+   * 启动分期：开局先只有太阳/行星（stage 1），随后每帧加一期，把首编译摊开。
+   * `?bootstage=` 可以钉住开局期数，量每一期的编译成本。
+   */
+  const pin = useRef(pinnedBootStage()).current;
+  const [stage, setStage] = useState(() => pin ?? 1);
+  useEffect(() => {
+    if (pin !== null || stage >= BOOT_STAGE_FULL) return;
+    const id = requestAnimationFrame(() => setStage((s) => Math.min(BOOT_STAGE_FULL, s + 1)));
+    return () => cancelAnimationFrame(id);
+  }, [pin, stage]);
   const sun = byId.sun;
   if (!sun) return null;
   /*
@@ -2247,19 +2292,22 @@ function Scene() {
    */
   return (
     <RegistryContext.Provider value={registry.current}>
-      {look.decor && <Stars />}
+      {/* 第 2 帧：星空 + 银河带（STAR / BAND 两个 program） */}
+      {look.decor && stage >= 2 && <Stars />}
       <Probe />
       <PickLayer />
       <Labels />
-      <Simulation />
+      {/* ready 只有到全量才置位：验收与首帧截图看到的必须是完整场景（钉住期数时按期数算） */}
+      <Simulation ready={pin !== null || stage >= BOOT_STAGE_FULL} />
       <BodyNode
         body={sun}
         showOrbits={showOrbits && look.orbitLines}
         showLabels={showLabels && look.labels}
         selectedId={selectedId}
       />
-      {look.decor && <Asteroids />}
-      {look.decor && <Trails />}
+      {/* 第 3 帧：小行星带 + 尾迹（InstancedMesh / LineBasic 各自的 program） */}
+      {look.decor && stage >= 3 && <Asteroids />}
+      {look.decor && stage >= 3 && <Trails />}
       {/*
         相机由 look.camera 二选一挂载，不是运行时 if：米制与沙盘是两套完全不同的相机，
         同一时刻只有一台存在。这样切模式就等于「卸载一台 + 挂载另一台」，各自只在自己
