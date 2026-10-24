@@ -48,9 +48,9 @@ const COPY = {
   // 哪天出现「锁态 + 实境」的组合，这里要拆成模板，别硬改字。
   lockedAria: "沙盘 · 未对齐，打开校准面板", // gate.badge.lockedAria
   panelTitle: "校准", // gate.panel.title
-  panelLede: "现在这套是压缩过的。另一套等校准做完。", // gate.panel.lede
-  panelLedeRevealed: "校准已完成。", // gate.panel.lede.revealed
-  // 注意：t2 的 gate.unlock.line（定稿「校准完成。」）目前**没有渲染点**——
+  panelLede: "当前为压缩视图。真实视图待校准归档。", // gate.panel.lede
+  panelLedeRevealed: "校准已归档。真实视图可用。", // gate.panel.lede.revealed
+  // 注意：t2 的 gate.unlock.line（旧稿那条一句话开启语，已随 t46 换成日志体）目前**没有渲染点**——
   // 它属于「三点全实时面板换形态」那一刻，那个形态还没做。将来做的时候，
   // lede.revealed 要让位给它，否则同一句话会在一屏里出现两遍。
   dotsAria: "校准进度", // gate.dots.aria（数值由 aria-valuenow 念，label 不重复数字）
@@ -65,11 +65,13 @@ const COPY = {
   importVersion: "这个码来自别的版本。", // TODO(copy) gate.import.version（唯一"核对"解决不了的错，单独一句）
   saveWarn: "这次能进，下次未必记得住。", // gate.save.warn（writeGate 失败时）
   // —— t28：三条门从「摸过控件」改成「可判定的观察」——
-  // 提示必须和判定一一对应（玩家不能分不清"我做错了"和"功能没做"）；答案在卡片里。
-  hintTime: "让地球走完一年", // gate.hint.time（判定：daysOf(simSeconds) ≥ 365.25）
-  hintTarget: "找出跑得最快的那颗", // gate.hint.target（判定：最后选中水星）
-  hintLayer: "关掉名称和轨道", // gate.hint.layer（判定：两者同时为 false）
-  celebrateLine: "你测出来了：越远的走得越慢。要不要去看看真的？", // gate.celebrate
+  // t46：整组改成**航行日志腔**（B）：无人称、仪器记录口吻、术语精确（公转/距日/名称/轨道
+  // 与卡片、底栏同名），提示保留动作所以仍然可执行。
+  hintTime: "时间 · 推进一年", // gate.hint.time（判定：daysOf(simSeconds) ≥ 365.25）
+  hintTarget: "轨道 · 锁定公转最短者", // gate.hint.target（判定：最后选中水星；术语「公转」同卡片）
+  hintLayer: "图层 · 关闭名称与轨道", // gate.hint.layer（判定：两者同时为 false；术语同底栏）
+  // 记录体：无人称、不表扬、不替玩家念长篇；「归档」= 观测被记下，不是考试通过
+  celebrateLine: "日志 · 三次校准已归档。距日愈远，公转愈缓。", // gate.celebrate
   // —— 非文案：格式样例，不翻译、不进表 ——
   importPlaceholder: "XG1-ABCDE-FG",
 };
@@ -279,8 +281,8 @@ export function ModeBadge() {
                         aria-hidden
                       />
                       <span>{hint.label}</span>
-                      {/* 一眼看出"做到没做到"：完成的行右对齐 ✓ 与「已完成」 */}
-                      <span className="ml-auto shrink-0 text-[10px]">{lit ? "✓ 已完成" : "未完成"}</span>
+                      {/* 一眼看出"记下没记下"：日志腔用「已归档 / 待观测」，不用游戏化套话 */}
+                      <span className="ml-auto shrink-0 text-[10px]">{lit ? "✓ 已归档" : "待观测"}</span>
                     </li>
                   );
                 })}
