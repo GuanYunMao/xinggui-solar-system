@@ -2023,7 +2023,8 @@ function judgeHudAutoHide(res) {
   //  · 启动分期 = 半结构：`__solarReady` 只在全量置位（用 belt 可观测），长任务**只记录**
   //    ——那台机器上长任务判据分不出启动和稳态（已有结论），拿它判红就是重犯 26ms 的错。
   //  · 相机避让 = **只测量**：t47 还没落地，现在还没有"多少算跳变"的依据，先攒基线。
-  const SUN_JUP_ALIGN_PX = 12; // 太阳中心落进木星盘面中心的判据（盘半径 r≈171px，很宽松）
+  // 注：这里原来有个 `SUN_JUP_ALIGN_PX = 12` 的 px 容差，已删。它按旧几何标定、与缩放/dpr 绑定，
+  //     而「太阳盘被木星挡住」本来就能用几何直接判：`delta + 太阳屏半径 ≤ 木星屏半径`（见对齐循环）。
   const OCCLUSION_LUM_MAX = 60; // 设计口径：被挡住时中心亮度应明显低于"透亮核"（改前 171.3）
   const EARTH_RADIUS_WORLD = 0.76; // src/solar/data.ts 的 earth.radius（天体数值改动须 captain 批）
   const CLEARANCE_FRAMES = 260; // ≈1.7 个公转周期（月球 period 2.55，speed 1 时 1 单位≈1 秒）
@@ -2082,28 +2083,55 @@ function judgeHudAutoHide(res) {
         if (c.jupiter && Math.abs(c.jupiter.d - prevDepth) < 0.01) break;
         prevDepth = c.jupiter?.d ?? -1;
       }
+      /*
+       * ① 先用**几何摆位**把相机放到背光侧，再闭环微调。
+       *
+       * 旧代码只靠闭环拖动找位置，三个方向全是坑（实测选出来的）：
+       *  · 步长：`t10` 接管 dolly、`t34` 接管相机之后，同样的像素拖动改变的角度已不同，
+       *    闭环在 26 步里反复跨过头 —— 实测两次运行 deltaPx 44.6 / 19.2 卡在容差外；
+       *  · 参照物：太阳一开始**根本不在候选里**（在屏幕外），"找回太阳"那支每次只拖 200px，
+       *    于是一整轮都在找而不是在对齐；
+       *  · 收敛判据：`SUN_JUP_ALIGN_PX` 是个 px 常数，而这里真正要的是「太阳盘被木星盘挡住」——
+       *    与缩放/dpr 无关的写法是 **delta + 太阳屏半径 ≤ 木星屏半径**（全遮挡），见下。
+       *
+       * `__solarPlace` 的方位角以「**指向太阳**」为 0°，所以 180° = 相机在木星背光侧、
+       * 太阳正好落在木星后方。实测这一步就把 deltaPx 打到 **18.3px**（木星屏半径 171.6、
+       * 太阳屏半径 80.4，18.3 + 80.4 = 98.7 ≤ 171.6 → 已全遮挡）。
+       */
+      await page.evaluate((d) => window.__solarPlace?.("jupiter", d, 180, 0), 12.5);
+      await page.waitForTimeout(700);
       // 闭环把太阳拖到木星盘面中心（两轴分别自适应符号与步长）。
       // 拖动量由**实测屏幕坐标**算出来，所以换视口/换 dpr 仍然成立。
       const sign = { x: 1, y: 1 };
       const prevAbs = { x: Infinity, y: Infinity };
       let aligned = false;
       let finalState = null;
-      for (let iter = 0; iter < 26; iter++) {
+      let bestCoverSlack = -Infinity;
+      let stagnation = 0;
+      for (let iter = 0; iter < 24; iter++) {
         const st = await candidatesOf(page, ["jupiter", "sun"]);
         finalState = st;
         if (!st.jupiter) break;
         if (!st.sun) {
-          // 太阳在相机背后（拾取器剔除）：先绕一大步把它找回来
-          await page.mouse.move(640, 400);
-          await page.mouse.down();
-          await page.mouse.move(640 + 200 * sign.x, 400, { steps: 10 });
-          await page.mouse.up();
-          await page.waitForTimeout(140);
+          // 摆位之后太阳仍被剔除：只可能是相机没真正到位，小幅回摆一次再继续
+          await page.evaluate((d) => window.__solarPlace?.("jupiter", d, 180, 0), 12.5);
+          await page.waitForTimeout(400);
           continue;
         }
         const dx = st.sun.x - st.jupiter.x;
         const dy = st.sun.y - st.jupiter.y;
-        if (Math.hypot(dx, dy) < SUN_JUP_ALIGN_PX && st.sun.d > st.jupiter.d) {
+        const delta = Math.hypot(dx, dy);
+        // 收敛判据 = 「太阳盘整个落在木星盘内」：delta + 太阳屏半径 ≤ 木星屏半径。
+        // 它不是"放宽的 px 容差"，而是这条断言真正要的前提（盘被挡住才谈得上遮挡）；
+        // 换成别的缩放/dpr 也自动成立，因为两边都是同一帧的投影半径。
+        const coverSlack = st.jupiter.r - (delta + (st.sun.r ?? 0));
+        if (coverSlack > bestCoverSlack) {
+          bestCoverSlack = coverSlack;
+          stagnation = 0;
+        } else if (++stagnation >= 5) {
+          break; // 连续 5 步没变好：别再空转，把实测数报出去
+        }
+        if (st.sun.d > st.jupiter.d && coverSlack >= 0) {
           aligned = true;
           break;
         }
@@ -2115,11 +2143,13 @@ function judgeHudAutoHide(res) {
           if (Math.abs(dy) > prevAbs.y) sign.y = -sign.y;
           prevAbs.y = Math.abs(dy);
         }
-        const sx = Math.abs(dx) > 6 ? Math.max(-260, Math.min(260, -dx * 0.55 * sign.x)) : 0;
-        const sy = Math.abs(dy) > 6 ? Math.max(-260, Math.min(260, -dy * 0.55 * sign.y)) : 0;
+        // 增益从 0.55 收到 0.25、步长上限 260→60：t10/t34 之后同样的像素拖动改变的角度更大，
+        // 大增益必然跨过头（旧版就是 0.55 在 26 步里来回弹）。
+        const sx = Math.abs(dx) > 6 ? Math.max(-60, Math.min(60, -dx * 0.25 * sign.x)) : 0;
+        const sy = Math.abs(dy) > 6 ? Math.max(-60, Math.min(60, -dy * 0.25 * sign.y)) : 0;
         await page.mouse.move(640, 400);
         await page.mouse.down();
-        await page.mouse.move(640 + sx, 400 + sy, { steps: 12 });
+        await page.mouse.move(640 + sx, 400 + sy, { steps: 8 });
         await page.mouse.up();
         await page.waitForTimeout(140);
       }
@@ -2132,6 +2162,11 @@ function judgeHudAutoHide(res) {
         aligned,
         deltaPx,
         sunBehind,
+        // 对齐是怎么达成的、差多少，全部留痕：只看 aligned 一个布尔，下次它变回 false 时无从下手
+        alignMethod: "__solarPlace(azimuth=180° = 背光侧) + 闭环微调",
+        alignCriterion: "sunBehind 且 (deltaPx + 太阳屏半径) ≤ 木星屏半径（全遮挡）",
+        sunRadiusPx: st.sun?.r ?? null,
+        coverSlackPx: st.jupiter && st.sun ? +(st.jupiter.r - (Math.hypot(st.sun.x - st.jupiter.x, st.sun.y - st.jupiter.y) + st.sun.r)).toFixed(1) : null,
         sunDepth: st.sun?.d ?? null,
         jupiterDepth: st.jupiter?.d ?? null,
         jupiterRadiusPx: st.jupiter?.r ?? null,
