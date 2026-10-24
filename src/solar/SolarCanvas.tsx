@@ -1917,36 +1917,54 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
 }
 
 /**
- * 缩放手感（t32 起调，t10 接管 dolly）。
+ * 缩放手感（t32 起调，t10 接管 dolly，t40 改成**对数视距上的目标跟随**）。
  *
  * 旧做法是"分级 dolly + 加速"：OrbitControls 每收到一格 wheel 就把半径乘一个固定系数，
- * 每格是一次**离散位移** —— 滚一格跳一格，连续滚只是跳得更狠。t10 把 wheel 接管成
- * **速度模型**：wheel 只把 deltaY 折算成"对数视距速度"（1/s），每帧按 exp(v·dt) 积分、
- * 速度按 exp(-λ·dt) 衰减。连续滚速度叠加（快滚快），停手后惯性把余量走完（不是台阶）。
+ * 每格是一次**离散位移**。t10 换成速度模型（wheel 给"对数视距速度"、每帧 exp(v·dt) 积分、
+ * 速度按 exp(-λ·dt) 衰减）—— 连续滚是平滑了，但**每个 wheel 事件仍然是一次速度跳变**：
+ * 逐帧 |Δlog(视距)| 实测出现 0.0251 → 0.0861（3.43 倍）的脉冲，用户的原话是"一格一格"。
  *
- * 三个原有语义全部保留：
- *  - 硬底线 `max(1.15, 最近天体半径×1.2)`：新视距每帧夹回底线，滚不进球体；
- *  - 渐进阻力 `SOFT_APPROACH_SPAN / SOFT_APPROACH_MIN`：越贴近底线速度越小，最后一格不会"跳开"；
- *  - `?diag=1` 的 `__solarPlace(ignoreMinDistance)`：底线与阻力一起关掉，允许相机进球验收。
+ * t40 换成一阶目标跟随：wheel 只改**目标视距**（对数域），相机每帧按 exp 曲线追它。
+ * 事件不再直接改速度，所以速度是连续的（脉冲判据：不许出现"单帧变化 > 上一帧 3 倍"）。
  *
- * 这些数字是手感值，不是物理量：一格 -120px ≈ 1.32/s 的冲量，除以衰减 9/s ⇒ 一格 ≈ 14.6% 视距；
- * 连续滚时倍率最高 2.2（90ms 节奏下 ≈24%/格，`zoom-budget` 的 ≤15 格靠它，实测 11 格）；
- * 速度上限 8/s（60fps 下单帧最多约 12.5%，再大就不像缩放了，是瞬移）。
+ * 为什么中间还要一级"限速推进"（zoomRef）：
+ * 一阶跟随的速度 ∝ (目标−当前)，目标被 wheel 一次性推走时**速度仍会在事件那一帧跳变**
+ * （实测 40ms 连发时第 2 格就撞出 3.2 倍）。所以目标不直接喂给跟随器，先按
+ * ZOOM_REF_RATE 匀速推过去 —— 加速度有上界，事件彻底不产生速度台阶。
+ *
+ * 方向不对称的老 bug（t47 遗留）：`resistance = clamp(gap/(hardMin×3), 0.12, 1)` 乘在速度上、
+ * **与方向无关**。贴脸往外时 gap≈0 → 0.12（实测 3 格只走 6% 视距、每 0.1log 要 1762ms），
+ * 从总览往里 gap 大 → 全程全速（259ms）—— 同一个动作差 6.8 倍。现在阻力**只在朝目标飞近时**
+ * 生效（step < 0），远离时恒 1：方向对称比实测 6.8 → 1.0。贴脸往里的"软着陆"仍然保留。
+ *
+ * 这些数字是手感值，不是物理量：
+ *  - 一格 -120px = 0.147 对数视距（14.6%，t10 的实测口径：缩到太阳 3R 用 11 格）；
+ *  - 连续滚时每格倍率最高 2.2（快滚快，t10 的 1.39 保留）；
+ *  - 跟随时间常数 100ms（一格 ≈ 33ms 推完目标 + 100ms 跟随 ≈ 150ms 滑到位，不是台阶）；
+ *  - 单帧 |Δlog| 上限 0.125（≈13% 视距）：连续滚时一帧也不超过这个量。
  */
-/** wheel：每 CSS px 的 deltaY 折算成多少 1/s 的对数视距速度（一格 -120px ≈ 1.32/s）。 */
-const ZOOM_WHEEL_GAIN = 0.011;
-/** 速度的指数衰减率（1/s）：时间常数 ≈ 111ms。 */
+/** 一格 wheel（-120px）在 log 视距上走多少：14.6%（= t10 的 1.32/s ÷ 衰减 9/s）。 */
+const ZOOM_NOTCH_LOG = 0.147;
+/** wheel：每 CSS px 的 deltaY 折算成多少 log 视距。 */
+const ZOOM_WHEEL_LOG_GAIN = ZOOM_NOTCH_LOG / 120;
+/** t10 速度模型的衰减率（1/s）。现在**只**用来把捏合的"速度增益"换算成对数步长。 */
 const ZOOM_DECAY = 9;
-/** 连续滚动时的速度倍率上限（滚得越快，同一格给的速度越高）。 */
+/** 连续滚动时的倍率上限（滚得越快，同一格给的目标越远）。 */
 const ZOOM_BOOST_MAX = 2.2;
 /** 两次 wheel 的间隔按这个时间常数衰减来算"连续程度"（e 折，毫秒）。 */
 const ZOOM_BOOST_WINDOW_MS = 220;
-/** 速度上限（1/s）。 */
-const ZOOM_VELOCITY_MAX = 8;
-/** 速度小于它就归零，别让指数尾巴永远算下去。 */
-const ZOOM_VELOCITY_EPS = 0.002;
+/** 一阶跟随的时间常数（秒）：目标走完之后相机大约这么久跟到位。 */
+const ZOOM_TAU = 0.1;
+/** 目标视距的推进速率上限（log/s）：给加速度上界，wheel 事件不再产生速度台阶。 */
+const ZOOM_REF_RATE = 4.5;
+/** 单帧 |Δlog 视距| 上限：连续滚时一帧也不许超过它（≈13% 视距）。 */
+const ZOOM_STEP_MAX_LOG = 0.125;
+/** 目标与当前视距差小于它就收工（别让指数尾巴永远算下去）。 */
+const ZOOM_SETTLE_LOG = 1e-3;
 /** 双指捏合：log(两指距离比) 折算成速度的增益（与 wheel 的"一格"同量级）。 */
 const ZOOM_PINCH_GAIN = 8;
+/** 捏合的对数步长 = 速度增益 ÷ 衰减率（与 wheel 那格同一套换算）。 */
+const ZOOM_PINCH_LOG = ZOOM_PINCH_GAIN / ZOOM_DECAY;
 /** 距天体中心的最小距离基数（世界单位，改造前就是 1.15）。 */
 const MIN_DISTANCE_BASE = 1.15;
 /** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
@@ -2035,12 +2053,17 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   const returning = useRef(useSim.getState().switching === "toSandbox").current;
 
   /*
-   * 缩放状态（t10 接管 dolly）：wheel / 捏合只把冲量写进 `zoomVelocity`，
-   * 真正的相机位移在 useFrame 里按帧积分 —— 事件频率和帧率因此解耦，
-   * 60fps / 120fps / 掉一帧都是同一条指数曲线，不会"一格一跳"。
+   * 缩放状态（t10 接管 dolly，t40 改成对数视距上的目标跟随）：
+   * wheel / 捏合只改**目标视距**（log），真正的相机位移在 useFrame 里逐帧跟随 ——
+   * 事件频率和帧率因此解耦，60fps / 120fps / 掉一帧都是同一条指数曲线，不会"一格一跳"。
    */
-  /** 1/s，正 = 拉远（deltaY > 0）。 */
-  const zoomVelocity = useRef(0);
+  /** 目标视距的 log；null = 没有待走的缩放。正 = 拉远（deltaY > 0）。 */
+  const zoomLogTarget = useRef<number | null>(null);
+  /**
+   * 目标视距的**限速**中间量（log）。目标不直接喂给跟随器：先按 ZOOM_REF_RATE 匀速推过去，
+   * 速度才不会在 wheel 事件那一帧跳变（见 t40 的常数注释）。
+   */
+  const zoomLogRef = useRef<number | null>(null);
   /** 指针 NDC（朝指针缩放用）；active = 至少收到过一次指针位置。t34 起 dolly 不再读它。 */
   const zoomPointer = useRef({ x: 0, y: 0, active: false });
   const zoomLastWheelAt = useRef(-1e9);
@@ -2060,11 +2083,30 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
   const gl = useThree((state) => state.gl);
   useEffect(() => {
     const el = gl.domElement;
-    const clampVelocity = (v: number) =>
-      Math.max(-ZOOM_VELOCITY_MAX, Math.min(ZOOM_VELOCITY_MAX, v));
+
+    /** 当前视距的 log（目标跟随的起点；别的路径改过相机时以实际为准）。 */
+    const logNow = () => {
+      const controls = controlsRef.current;
+      if (!controls) return null;
+      return Math.log(Math.max(camera.position.distanceTo(controls.target), 1e-6));
+    };
+    /**
+     * 往目标视距上加一段（log）。**只用它改缩放意图**：wheel / 捏合都走这里。
+     * 目标为 null 时以当前视距为起点，同时给限速器播种 —— 松手后再滚，不会从旧目标续上。
+     *
+     * 底线（hardMin）**不在这里夹**：它取决于"离 target 最近的天体"，每帧都可能变，
+     * 夹在帧里（见 useFrame 的 dolly 段）才只有一个口子。这里只夹远平面（常数）。
+     */
+    const addZoomLog = (delta: number) => {
+      const now = logNow();
+      if (now === null) return;
+      const base = zoomLogTarget.current ?? now;
+      zoomLogTarget.current = Math.min(base + delta, Math.log(MAX_DISTANCE));
+      if (zoomLogRef.current === null) zoomLogRef.current = now;
+    };
 
     /*
-     * wheel：只记冲量与指针位置，不碰相机（相机在帧里积分）。
+     * wheel：只记目标视距与指针位置，不碰相机（相机在帧里跟随）。
      * `passive` 是安全的：OrbitControls 的 enableZoom 已经是 false，它的 wheel 监听在
      * `scope.enableZoom === false` 处直接 return，不会 preventDefault，也不会和这里抢；
      * 页面本身不滚动（body overflow hidden）。
@@ -2076,11 +2118,11 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       const now = performance.now();
       const gap = now - zoomLastWheelAt.current;
       zoomLastWheelAt.current = now;
-      // 连续滚：间隔越小倍率越高（e 折），滚得越快、同一段位移里速度叠加得越高
+      // 连续滚：间隔越小倍率越高（e 折），滚得越快、同一格给的目标越远（t10 的"快滚快"）
       const boost = 1 + (ZOOM_BOOST_MAX - 1) * Math.exp(-Math.max(0, gap) / ZOOM_BOOST_WINDOW_MS);
       // deltaMode：0 = 像素、1 = 行（≈16px）、2 = 页（≈100px）—— Firefox 会给 1/2
       const px = ev.deltaY * (ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? 100 : 1);
-      zoomVelocity.current = clampVelocity(zoomVelocity.current + px * ZOOM_WHEEL_GAIN * boost);
+      addZoomLog(px * ZOOM_WHEEL_LOG_GAIN * boost);
       const rect = el.getBoundingClientRect();
       if (rect.width > 0 && rect.height > 0) {
         zoomPointer.current.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
@@ -2128,10 +2170,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       if (!pinch.current.active) return;
       const d = pinchDistance();
       if (pinch.current.dist > 0 && d > 0) {
-        // 两指张开（d 变大）= 放大 = 视距变小 = 负速度；与 wheel 共用积分器
-        zoomVelocity.current = clampVelocity(
-          zoomVelocity.current - Math.log(d / pinch.current.dist) * ZOOM_PINCH_GAIN,
-        );
+        // 两指张开（d 变大）= 放大 = 视距变小 = 负的对数步长；与 wheel 共用同一个目标
+        addZoomLog(-Math.log(d / pinch.current.dist) * ZOOM_PINCH_LOG);
         pinch.current.dist = d;
       }
       pointerFromPinch();
@@ -2447,6 +2487,12 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     }
     followId.current = null;
     /*
+     * 缩放意图一起清掉：动画结束时相机在别处，旧目标留着会在放锁那一帧把镜头拽回去
+     * （t40 复查的第二个候选成因 —— 实测不是它，但这条清理由此变成硬约束）。
+     */
+    zoomLogTarget.current = null;
+    zoomLogRef.current = null;
+    /*
      * t34：动画期间用我们自己的 `camLocked` 静音输入（旋转/滚轮都看它）。
      * OrbitControls 已整体停用（enabled=false 常驻），这里不再借它的开关。
      */
@@ -2478,19 +2524,20 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      */
 
     /*
-     * ——— 缩放（t10 接管 dolly）：速度积分 ———
+     * ——— 缩放（t10 接管 dolly，t40 改成对数视距上的目标跟随）———
      *
-     * wheel / 捏合只写 `zoomVelocity`（见上面的监听）。这里每帧：
-     *  1) 把速度按 exp(-λ·dt) 衰减；
-     *  2) 把剩余速度积成一段对数视距位移 exp(v·dt)，沿"指针射线"推相机，
-     *     再把 target 放回视轴上（= OrbitControls 的 zoomToCursor + screenSpacePanning 那一支）。
+     * wheel / 捏合只改 `zoomLogTarget`（见上面的监听）。这里每帧：
+     *  1) 目标按 ZOOM_REF_RATE **限速推进**到 zoomLogRef（加速度有上界，事件不产生速度台阶）；
+     *  2) 当前视距按一阶跟随 exp 曲线追 ref：step = (ref − logD)·(1 − e^(−dt/τ))；
+     *  3) step 只在**朝目标飞近**（step < 0）时乘渐进阻力 —— 贴脸往外恒 1（t40 修的方向不对称）；
+     *  4) 沿"相机→target"的视轴推相机，**target 一个字节都不动**（t34 的唯一主人语义）。
      * 位置必须写在 drei 的 controls.update()（优先级 -1）之前 —— 本回调是 -2。
      *
      * 保留 t47 的三个语义：
      *  - 硬底线 hardMin = max(1.15, 最近天体半径×1.2)：滚到底也钻不进太阳里（1.2×3.8 = 4.56），
      *    而 0.2 半径的小卫星下限仍是 1.15、它 1.7 的聚焦距离进得去；
-     *  - 渐进阻力：越贴近底线，速度乘的阻力越小（SOFT_APPROACH_MIN = 0.12 是最后一格的步长下限），
-     *    "最后一格只走 0.09 个单位然后停住" 的手感不变，只是现在由速度衰减给出，不再靠 zoomSpeed；
+     *  - 渐进阻力：越贴近底线走的越少（SOFT_APPROACH_MIN = 0.12 是最后一段的步长下限），
+     *    只作用在"往里缩"上，所以贴脸往外不再被它拖住；
      *  - `?diag=1` 的 __solarPlace(ignoreMinDistance)：底线和阻力一起关掉，允许相机进球验收。
      */
     {
@@ -2500,24 +2547,53 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
       );
       const dist = camera.position.distanceTo(controls.target);
-      // 动画/切换期间不接动量，攒下来的也清零
-      let v = !camLocked.current && switching === null ? zoomVelocity.current : 0;
-      if (Math.abs(v) > ZOOM_VELOCITY_EPS) {
+      const logCur = Math.log(Math.max(dist, 1e-6));
+      const logFloor = Math.log(Math.max(1e-6, DIAG_PLACE.ignoreMinDistance ? 0 : hardMin));
+      const logCeil = Math.log(MAX_DISTANCE);
+      /*
+       * 动画/切换期间不接缩放，攒下来的意图也丢掉：动画结束时相机在别处，
+       * 留着旧目标会在放锁那一帧把镜头拽回去（t40 复查的第二个候选成因，已排除）。
+       */
+      if (camLocked.current || switching !== null) {
+        zoomLogTarget.current = null;
+        zoomLogRef.current = null;
+      }
+      if (zoomLogTarget.current !== null) {
+        const target = Math.min(Math.max(zoomLogTarget.current, logFloor), logCeil);
+        if (zoomLogRef.current === null) zoomLogRef.current = logCur;
+        // 1) 目标限速推进（推完就停在该目标上）
+        const ref0 = zoomLogRef.current;
+        const slew = ZOOM_REF_RATE * dt;
+        const ref = ref0 + THREE.MathUtils.clamp(target - ref0, -slew, slew);
+        zoomLogRef.current = ref;
+        // 2) 一阶跟随
+        const k = 1 - Math.exp(-dt / ZOOM_TAU);
+        let step = (ref - logCur) * k;
         const bypass = DIAG_PLACE.ignoreMinDistance;
-        const gap = Math.max(0, dist - hardMin);
-        const resistance = bypass
-          ? 1
-          : Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
-        // 只在"往里缩"时踩底线；往外拉永远不受下限影响（否则已经在里面时会被弹一下）
-        const floor = v < 0 ? (bypass ? 0 : hardMin) : 0;
-        const ceiling = MAX_DISTANCE;
-        const next = THREE.MathUtils.clamp(dist * Math.exp(v * resistance * dt), floor, ceiling);
-        // 顶到底线/远平面就把速度清掉：别"顶着墙攒动量"，松手后突然弹开
-        zoomVelocity.current =
-          (v < 0 && next <= floor + 1e-9) || (v > 0 && next >= ceiling - 1e-9)
-            ? 0
-            : v * Math.exp(-ZOOM_DECAY * dt);
-        if (next !== dist) {
+        // 3) 渐进阻力**只在朝目标飞近时**生效（step < 0 = 视距变小 = 靠近）
+        if (step < 0 && !bypass) {
+          const gap = Math.max(0, dist - hardMin);
+          step *= Math.min(1, Math.max(SOFT_APPROACH_MIN, gap / (hardMin * SOFT_APPROACH_SPAN)));
+        }
+        step = THREE.MathUtils.clamp(step, -ZOOM_STEP_MAX_LOG, ZOOM_STEP_MAX_LOG);
+        let next = dist * Math.exp(step);
+        // 4) 底线只拦"往里缩"；往外拉永远不受下限影响（否则已经在里面时会被弹一下）
+        if (step < 0 && next < Math.exp(logFloor)) {
+          next = Math.exp(logFloor);
+          zoomLogTarget.current = logFloor;
+          zoomLogRef.current = logFloor;
+        }
+        if (next > MAX_DISTANCE) {
+          next = MAX_DISTANCE;
+          zoomLogTarget.current = logCeil;
+          zoomLogRef.current = logCeil;
+        }
+        // 到位：把意图清掉，别让指数尾巴永远算下去
+        if (Math.abs(target - logCur) < ZOOM_SETTLE_LOG && Math.abs(ref - logCur) < ZOOM_SETTLE_LOG) {
+          zoomLogTarget.current = null;
+          zoomLogRef.current = null;
+        }
+        if (Math.abs(next - dist) > 1e-9) {
           /*
            * t34：缩放**不得改写 target**（它是相机的唯一主人：选中天体 / 总览原点）。
            * 旧写法沿"相机→指针"的射线推相机，再把 target 放回旧视轴 —— 连续缩放后
@@ -2533,8 +2609,6 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
           scratch.zoomFwd.copy(controls.target).sub(camera.position).normalize();
           camera.position.addScaledVector(scratch.zoomFwd, dist - next);
         }
-      } else {
-        zoomVelocity.current = 0;
       }
     }
     /*
