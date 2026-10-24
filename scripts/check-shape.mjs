@@ -314,7 +314,11 @@ const CHECKS = [
   {
     id: 1,
     title: "焦距公式 Math.tan(...fov)",
-    expect: "只在 src/solar/pick.ts 的 focalPx 一处",
+    // 指向 tanHalfFov 而不是 focalPx：fov 约定现在收在 pick.ts 的 tanHalfFov 一行，
+    // focalPx（焦距）与 halfSpanAt（它的反解）都只是调用者。判据逻辑只数「pick.ts 之外」，
+    // 与命中落在哪一行无关；但 expect 文字必须说对 —— 否则下一个人看到「PASS 但命中不在
+    // focalPx 里」会以为判据漏了（engineer2 在 t35 提的，采纳）。
+    expect: "只在 src/solar/pick.ts 的 tanHalfFov（focalPx / halfSpanAt 的唯一 fov 约定点）",
     run(loaded) {
       const hits = hitsIn(loaded, /Math\.tan\([^)\n]*[fF]ov/, "code");
       const outside = hits.filter((h) => h.file !== "src/solar/pick.ts");
@@ -456,8 +460,11 @@ function printReport({ results, manifest }, { root }) {
     const c = r.check;
     console.log(`[${c.id}] ${c.title}`);
     console.log(`    命中=${r.observed} | 期望=${c.expect} | ${r.status}`);
-    const show = r.status === "FAIL" ? r.hits : [];
-    for (const h of show) console.log(`    ${h.file}:${h.line}: ${h.text}`);
+    // 命中位置始终打印（PASS 也打）：判据是「只数 pick.ts 之外」这类相对规则，
+    // 光看 PASS 不知道命中落在哪一行；不打印的话「PASS 但位置看着不对」只能靠猜。
+    for (const h of r.hits) {
+      console.log(`    ${r.status === "FAIL" ? "" : "ⓘ "}${h.file}:${h.line}: ${h.text}`);
+    }
     if (r.extra?.length) {
       console.log(`    ⓘ 注释里还提到 ${r.extra.length} 处（史实说明，自行判断是否漏改）：`);
       for (const h of r.extra) console.log(`      ${h.file}:${h.line}: ${h.text}`);
