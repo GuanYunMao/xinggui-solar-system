@@ -8,7 +8,7 @@ import { isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
-import { frameEarthMoon, lookOf, tightenClipPlanes } from "./systems";
+import { farFloorFor, frameEarthMoon, tightenClipPlanes, type VisibleBody } from "./systems";
 import { acquireCloudTexture, acquirePlanetTexture, glowTexture, textureReport } from "./textures";
 
 declare global {
@@ -25,6 +25,24 @@ type Registry = {
 };
 
 const RegistryContext = createContext<Registry | null>(null);
+
+/**
+ * 从 registry 里读出「必须可见集合」—— `farFloorFor` 的输入（R7）。
+ *
+ * 为什么这段留在渲染层而不进 systems.ts：世界坐标只有 registry 知道。两个相机
+ * （沙盘 / 米制）都走这一个取数口，far 的下界才不会"米制传、沙盘不传"。
+ */
+function visibleExtents(reg: Registry, bodies: readonly Body[]): VisibleBody[] {
+  const p = new THREE.Vector3();
+  const out: VisibleBody[] = [];
+  for (const b of bodies) {
+    const g = reg.groups.get(b.id);
+    if (!g) continue;
+    g.getWorldPosition(p);
+    out.push({ id: b.id, x: p.x, y: p.y, z: p.z, radius: b.radius });
+  }
+  return out;
+}
 
 function useRegistry() {
   const value = useContext(RegistryContext);
@@ -314,18 +332,30 @@ const STAR_FRAG = /* glsl */ `
   }
 `;
 
+/*
+ * 沙盘 home 机位的**唯一出处**（R6）。位置 / 视场这两个数以前写在三处：
+ * Canvas 的 camera prop、applyHome、homeVector —— 改一处忘一处就会"首帧和稳态不是一个机位"。
+ * near/far 不在这里：那是相机的裁剪面，只由 systems.tightenClipPlanes 写。
+ */
+const HOME_POSE = {
+  landscape: { position: [0, 40, 112] as [number, number, number], fov: 42 },
+  portrait: { position: [0, 86, 172] as [number, number, number], fov: 56 },
+};
+
+function homePose(width: number, height: number) {
+  return height > width ? HOME_POSE.portrait : HOME_POSE.landscape;
+}
+
 function homeVector(width: number, height: number, out: THREE.Vector3) {
-  if (height > width) out.set(0, 86, 172);
-  else out.set(0, 40, 112);
+  out.set(...homePose(width, height).position);
   return out;
 }
 
 function applyHome(camera: THREE.PerspectiveCamera, width: number, height: number) {
-  const portrait = height > width;
-  camera.fov = portrait ? 56 : 42;
-  homeVector(width, height, camera.position);
-  camera.near = 0.06;
-  camera.far = 2400;
+  const pose = homePose(width, height);
+  camera.fov = pose.fov;
+  camera.position.set(...pose.position);
+  // near/far 不在这里写：唯一写入点是 tightenClipPlanes（它每帧、且在首帧渲染之前跑）
   camera.updateProjectionMatrix();
   camera.lookAt(0, 0, 0);
 }
@@ -416,7 +446,7 @@ function Simulation() {
   // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
   const { bodies, spec } = useSystem();
   // 观感/行为声明（R3）：这个系统要不要推进时间、要不要转，全看 look，不看 unit
-  const look = lookOf(spec);
+  const look = spec.look;
   useFrame((_, raw) => {
     const delta = Math.min(raw, 0.1);
     /*
@@ -634,7 +664,7 @@ function PlanetSurface({ body }: { body: Body }) {
   const size = useThree((state) => state.size);
   // 观感声明（R3）：云层壳、球面细分都由 look 决定，不再看 unit
   const { spec } = useSystem();
-  const look = lookOf(spec);
+  const look = spec.look;
   /*
    * 贴图不是 useMemo 里同步算出来的，而是一个有生命周期的句柄：
    * 拿到的第一张可能是 1×1 占位色（程序化贴图还没轮到）或摄影贴图，
@@ -834,7 +864,7 @@ function Labels() {
   const camera = useThree((state) => state.camera);
   const reg = useRegistry();
   const { bodies, spec } = useSystem();
-  const look = lookOf(spec);
+  const look = spec.look;
   const showLabels = useSim((state) => state.showLabels);
   const selectedId = useSim((state) => state.selectedId);
 
@@ -1226,15 +1256,15 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
      * 而月球在 3.6e8、太阳在 1.5e11 —— 两颗都在远平面之外，被视锥剔除，
      * 从来没有渲染过。探针只算屏幕投影不看裁剪面，所以"返回 3 个天体"
      * 一直是对的，而画面里只有一颗地球。
+     *
+     * 「必须可见集合」怎么取、余量多少，现在由 systems.farFloorFor 统一（R7）：
+     * 米制与沙盘两个调用点走同一个契约，不再是一个传、一个不传。
      */
-    let farFloor = 0;
-    for (const b of spec.bodies) {
-      const g = reg.groups.get(b.id);
-      if (!g) continue;
-      g.getWorldPosition(scratch.pos);
-      farFloor = Math.max(farFloor, camera.position.distanceTo(scratch.pos) + b.radius * 4);
-    }
-    tightenClipPlanes(camera as THREE.PerspectiveCamera, dist, farFloor * 1.2);
+    tightenClipPlanes(
+      camera as THREE.PerspectiveCamera,
+      dist,
+      farFloorFor(visibleExtents(reg, spec.bodies), camera.position),
+    );
 
     if (DIAG && diagTick.current++ % 20 === 0) {
       const persp = camera as THREE.PerspectiveCamera;
@@ -1276,7 +1306,7 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
  * （旧 CameraRig 里那一行 `appliedKey.current = …|${mode}` 就是）。
  */
 function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
-  const { byId } = useSystem();
+  const { byId, bodies } = useSystem();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
   const reg = useRegistry();
@@ -1432,10 +1462,16 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      * 所以这里不需要再"把共享 ref 说成真话"（旧的 appliedKey/appliedMode.upkeep 就是这么来的）。
      */
 
-    // 每帧按焦点距离收窄 near/far：固定值在 1:1 下不可能覆盖 4.87e9 的跨度
+    /*
+     * 每帧按焦点距离收窄 near/far。和米制相机走同一个契约（R7）：far 的下界由
+     * 「必须可见集合」算出，而不是靠"沙盘里最远的东西（星场 450 / 海王星 63）刚好
+     * 落在 far 下限 819.2 以内"这个数据巧合 —— 加一圈柯伊伯带时 far 会跟着长，
+     * 不会再静默裁掉。
+     */
     tightenClipPlanes(
       camera as THREE.PerspectiveCamera,
       camera.position.distanceTo(controls.target),
+      farFloorFor(visibleExtents(reg, bodies), camera.position),
     );
 
     if (DIAG && diagTick.current++ % 30 === 0) {
@@ -1728,7 +1764,7 @@ function Probe() {
      * 换系统时只改数据，这里读到的组合应当自动跟着变，不需要任何代码分支。
      */
     const lookApi = () => ({
-      ...lookOf(spec),
+      ...spec.look,
       mounted: { clouds: reg.clouds.size, belt: Boolean(reg.belt) },
     });
     (window as unknown as { __solarLook?: typeof lookApi }).__solarLook = lookApi;
@@ -2106,7 +2142,7 @@ function CamTrace({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | 
   const camera = useThree((state) => state.camera);
   const { spec } = useSystem();
   // 轨迹里的 mode 标签就是相机型号（sandbox / meter），不另造一套判断
-  const cameraKind = lookOf(spec).camera;
+  const cameraKind = spec.look.camera;
   useFrame(() => {
     traceCam(cameraKind, camera, controlsRef.current?.target ?? null);
   }, -1);
@@ -2126,7 +2162,7 @@ function Scene() {
   const controlsRef = useRef<OrbitControlsImpl>(null);
   const { byId, spec } = useSystem();
   // 观感声明（R3）：装饰、轨道线、标签、用哪台相机，全部由系统的 look 决定
-  const look = lookOf(spec);
+  const look = spec.look;
   const sun = byId.sun;
   if (!sun) return null;
   /*
@@ -2186,7 +2222,12 @@ export function SolarCanvas() {
     <Canvas
       className="space-canvas"
       dpr={[1, 1.6]}
-      camera={{ position: [0, 40, 112], fov: 42, near: 0.06, far: 2400 }}
+      /*
+       * 只给它 home 的位置和视场，两个数都来自 HOME_POSE（唯一出处）。
+       * 这里**不写 near/far**：那两笔是死配置 —— 首帧渲染发生在 useFrame 之后，
+       * 而相机组件在 useFrame 里就已经把裁剪面算好了（systems.tightenClipPlanes）。
+       */
+      camera={{ position: HOME_POSE.landscape.position, fov: HOME_POSE.landscape.fov }}
       gl={{ antialias: true, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: READBACK }}
       onPointerDown={(event) => {
         dragGuard.x = event.clientX;

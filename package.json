@@ -1,7 +1,7 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.1.6-snap.2",
+  "version": "1.1.6-snap.3",
   "type": "module",
   "description": "巡星·未至之境 —— 可交互的三维太阳系（独立版）",
   "releaseNote": "拆开观感声明",

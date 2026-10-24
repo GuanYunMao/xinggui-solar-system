@@ -43,31 +43,6 @@ export type SystemLook = {
   camera: "sandbox" | "meter";
 };
 
-/**
- * 沙盘那套观感 —— **参考值，不再是缺省值**。
- *
- * `look` 改成必填之后，每个 SystemSpec（`SOL_SYSTEM` 与 `REAL_PROTO`）都必须显式声明自己那份，
- * 所以这个常量不再承担"谁忘了写就用我"的职责。它现在只剩两个用途：
- *  1. `lookOf()` 对**未标注 `SystemSpec` 类型**的调用方兜底（typed 代码里不可能走到）；
- *  2. 当"沙盘长什么样"的参照物，省得读 `SOL_SYSTEM` 去对照。
- * 新增系统时请自己写 look，别依赖这里。
- */
-export const SANDBOX_LOOK: SystemLook = {
-  spins: true,
-  clouds: true,
-  labels: true,
-  decor: true,
-  orbitLines: true,
-  freezesTime: false,
-  refineGeometry: false,
-  camera: "sandbox",
-};
-
-/** 取一个系统实际生效的 look（没写就用沙盘的）。渲染层只该通过它读这些开关。 */
-export function lookOf(spec: SystemSpec): SystemLook {
-  return spec.look ?? SANDBOX_LOOK;
-}
-
 export type SystemSpec = {
   id: string;
   name: string;
@@ -173,17 +148,63 @@ export const REAL_PROTO: SystemSpec = {
 };
 
 /**
- * 相机 near/far 的每帧收窄（t7 定稿）。固定值不可能成立：
- * 全景档需要 4.87e9 的跨度，而 100 km 高度档只要 2.7e3。
- * 这里只依赖焦点距离 d，把跨度压到 4096× 以内。
+ * 一颗「必须可见」的天体：世界坐标 + 半径（含体型余量的口径写在 farFloorFor 里，
+ * 不在调用点 —— 两个调用点各写一份才是 R7 说的问题）。
+ */
+export type VisibleBody = { id: string; x: number; y: number; z: number; radius: number };
+
+/**
+ * far 的下界：让「必须可见集合」整个落在远平面内（R7）。
+ *
+ * 为什么需要它：far 只按焦点距离算的话，远处天体会被远平面裁掉，而探针只算屏幕投影、
+ * 看不出来（实境里曾经"只画得出地球"，探针仍老老实实返回 3 个天体）。
+ * 沙盘以前不传 farFloor，靠「最远的东西（星场 450 + 海王星 63）< far 下限 819.2」
+ * 这个数据巧合成立 —— 加一圈柯伊伯带就会静默裁掉。
+ *
+ * 为什么不把 body 循环塞进 tightenClipPlanes：那个函数是纯数学、可单独测；
+ * 世界坐标要从渲染层的 registry 取，取完再交进来。这里只收位置和半径，不依赖 three。
+ *
+ * `pad` 是余量（默认 1.2）：保证球体整个在里面，而不是刚好切到轮廓。
+ */
+export function farFloorFor(
+  visible: readonly VisibleBody[],
+  camera: { x: number; y: number; z: number },
+  pad = 1.2,
+) {
+  let floor = 0;
+  for (const b of visible) {
+    const dx = b.x - camera.x;
+    const dy = b.y - camera.y;
+    const dz = b.z - camera.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz) + b.radius * 4;
+    if (d > floor) floor = d;
+  }
+  return floor * pad;
+}
+
+/**
+ * 相机 near/far 的每帧收窄（t7 定稿）—— **相机裁剪面的唯一写入点**（R6）。
+ *
+ * Canvas 的 camera prop 与 applyHome 以前也写 near/far，但两处都是死配置：
+ * 每帧这个函数都会覆盖它们，而首帧的渲染发生在 useFrame 之后 —— 那两处的 0.06/2400
+ * 从来没有进过任何一帧画面。现在只剩这里写。
+ *
+ * `nearMin` 就是那两个老值里的 0.06：沙盘里离相机最近的东西也在 1.15 之外，
+ * 近平面从 0.05 推到 0.06 不会裁掉任何可见物，换来的是更紧的深度跨度。
+ *
+ * 2400 **没有**变成 far 的下限：远端该看多远由「必须可见集合」决定（farFloorFor），
+ * 而 2400 会把沙盘的 far 从 819.2 抬到 2400（深度跨度 16384:1 → 40000:1），
+ * 换来一个今天用不上的远端余量 —— 那正是这个函数想避免的。要更远的兜底，
+ * 传 farFloor，别写死一个上限。
  */
 export function tightenClipPlanes(
   camera: { near: number; far: number; updateProjectionMatrix: () => void },
   distance: number,
   farFloor = 0,
+  nearMin = 0.06,
 ) {
   const d = Math.max(distance, 1e-6);
-  const near = Math.min(Math.max(d / 4096, 0.05), d / 1.25);
+  const near = Math.min(Math.max(d / 4096, nearMin), d / 1.25);
   /*
    * farFloor：系统里最远那颗天体到相机的距离（含体型余量）。
    *

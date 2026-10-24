@@ -31,7 +31,9 @@ npm run verify         # = node scripts/verify.mjs
 | `proto-real` | `?proto=1` 真实单位原型：3 个天体、地球钉在屏幕中心 ≤ 1px、**画布不是全黑** | **数值** + 像素 | 偏移说明相机/投影没对齐 |
 | `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动（p10–p90 / 120 帧） | **数值** | 见下节「proto-jitter 的维护契约」 |
 
-数值断言一共 5 条，但**只有 `frame-time` 会因为「这台机器现在忙」而变红**。
+数值断言一共 5 条 —— `frame-time` / `hit-matrix` / `follow-jitter` / `proto-real` / `proto-jitter`
+（**注意：这组和下面「画布像素体检 5 条」是不同的 5 条 pass**，别记串了），
+其中**只有 `frame-time` 会因为「这台机器现在忙」而变红**。
 其余四条量的是几何量（投影坐标、像素偏移），和帧率无关，慢机器上数字一样。
 
 ### 判据的三类（写断言之前先分类）
@@ -82,15 +84,54 @@ npm run verify         # = node scripts/verify.mjs
 `hit-matrix.bodies` 则**要判**：探针契约是「挂载了几个天体就返回几条」，15 变了说明数据层漏天体；
 有意增删天体时，改这里 + 本文件「探针契约」那张表。
 
-**画布像素体检**（`desktop` / `mobile` / `mobile-selected` / `single-file` / `proto-real` 都有）
-见下节「画布像素体检（抓整屏黑）」——它抓的是「数据层全对、眼睛看到一片黑」这类回归。
+**画布像素体检共挂在 5 条 pass 上**（`desktop` / `mobile` / `mobile-selected` / `single-file` /
+`proto-real`，`judgeCanvasPixels` 2 个调用点），见下节「画布像素体检（抓整屏黑）」——
+它抓的是「数据层全对、眼睛看到一片黑」这类回归。`proto-jitter` 另有独立回读，不计入这 5 条。
+
+## 改语义之后：全仓扫旧说法
+
+**规矩**：改了某个语义（字段变必填、默认值取消、行为改名、某个数字变了），**不要只改自己碰过的那一行**——
+用 `Select-String` 把旧说法全仓扫一遍。注释过期从来不是孤例，是**成组**出现的：一处改对，
+另外两处仍在断言旧行为，读者会按旧行为写代码。
+
+```powershell
+# 这台机器 PATH 里没有 rg，用 Select-String（等价：rg -c '旧说法' --glob '!node_modules'）
+Select-String -Path (Get-ChildItem -Recurse -File -Include *.ts,*.tsx,*.md -Encoding UTF8 |
+  Where-Object { $_.FullName -notmatch '\\(node_modules|dist|release)\\' }).FullName -Pattern '旧说法'
+```
+
+扫三样东西：**旧数字**（`512×256`、`7 张贴图`）、**旧名字**（`星轨`、`SANDBOX_LOOK`）、
+**旧类型形状**（「可选」「没写就用默认」）。前两样好想，第三样最容易漏。
+
+两个真实例子（同一类，都发生在 2026-10-24）：
+
+1. **`spec.look ?? SANDBOX_LOOK` 已是死分支。** `SystemSpec.look` 改成必填（`systems.ts:77`
+   `look: SystemLook;`）后，这个 `??` 对任何 typed 调用方都走不到，仓库里也没有 untyped 调用方。
+   而 `SANDBOX_LOOK`（`systems.ts:55-64`）与 `SOL_SYSTEM.look`（`system-context.tsx:47-56`）
+   现在是**两份逐字相同的值**，且没有任何代码校验它们一致——改了一边，另一边就成了谎，
+   而它的注释还写着「当沙盘长什么样的参照物」。与此同时 `lookOf` 自己的注释仍说「没写就用沙盘的」。
+   **结论**：建议删掉 `SANDBOX_LOOK` 与那个 `??`（改成 `return spec.look`），由 types 保证必填；
+   保留的唯一代价是「一个没人用、但看起来像默认值的常量，会让人以为省略 `look` 是合法的」。
+2. **`Hud.tsx` 两处同类过期注释**（t30 修的 `:78-79` 与 `:317-323`）：只改一处，另一处没人搜过。
 
 ## 画布像素体检（抓整屏黑）
 
 **为什么要有这条**：2026-10-24 实测过一次「画布全黑但 8 条 pass 全绿」——`__solarReady` 置位、
 canvas 数量对、DOM 文本对、`__solarProbe()` 的几何也对（`draws: 0, tris: 0`，一笔没提交）。
 因为那些断言只验「数据层说得通」这一层，而用户眼睛看到的是黑的。当时真正抓住它的是
-`proto-jitter` 的像素回读，纯属偶然。所以现在每个开浏览器的 pass 都带一条像素体检。
+`proto-jitter` 的像素回读，纯属偶然。所以现在主 pass 也都带一条像素体检。
+
+**覆盖几条 pass（数过的，别用记的）**：`judgeCanvasPixels` **只有 2 个调用点**——
+`verify.mjs:405`（在 `run()` 里，覆盖 `desktop` / `mobile` / `mobile-selected` / `single-file`
+共 4 条）和 `verify.mjs:610`（`proto-real` 1 条），所以是 **5 条 pass**：
+
+```powershell
+Select-String -Path scripts/verify.mjs -Pattern 'judgeCanvasPixels\(' | Where-Object { $_.Line -notmatch 'function ' }
+# → 2 行：run() 里 1 个（覆盖 4 条 pass）+ proto-real 1 个
+```
+
+`proto-jitter` 另有**自己的一套**像素回读（`__solarPixels`，回读不到样本同样会红），
+但它判的是抖动、不是亮度——**不算进这 5 条**，也别拿它的结论当「画布体检覆盖了 6 条」。
 
 怎么验：读画布上 **25 个 8×8 块**（四角 + 中心），算平均亮度与非黑块占比。
 
