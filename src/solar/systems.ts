@@ -42,6 +42,10 @@ export type SystemLook = {
    * 实境才是真实物理（六根数）。这是一个**观感声明**，和 spins/decor 同一层；
    * 渲层只按字段走，不认 mode、不认 unit。`data.ts` 的 inclination 值保留 ——
    * 它们是真实值，实境（t14）和 t26 的不变量都还在用。
+   *
+   * **「共面」只约束 `parent = sun` 的行星轨道。** 卫星走各自母行星的赤道面
+   * （木卫随木星 3.1°、土卫六随土星 26.7° —— 这两个数是**母行星的 obliquity**，
+   * 不是卫星的 inclination），所以土卫六的轨道与光环面重合。口径见 README 的「三层分工」。
    */
   flatOrbits: boolean;
   /** 冻结模拟时间推进（生产端不推进，见 SolarCanvas 的 Simulation） */
