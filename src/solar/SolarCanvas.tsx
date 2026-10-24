@@ -2852,17 +2852,77 @@ function PickLayer() {
       return projectCandidates(camera as THREE.PerspectiveCamera, rect.width, rect.height, collect());
     };
 
+    /*
+     * t18：点击必须选「手型指的那颗」——手型与点击共用同一个 hoverId。
+     *
+     * 旧写法：`onUp` 在 pointerup 那一刻重新投影、重新 resolvePick。于是同一个像素在
+     * 「手型那次判定」到「抬起那次判定」之间（一次点击 ~120ms，场景在公转/跟随）可以从
+     * 命中翻成不命中。实测 20 个边界点、默认速度：18/20 一致，2 点手型出现但点空；
+     * 暂停后 10/10 一致 —— 这 2 点是时间差，不是热区问题。
+     *
+     * 现在：pointerdown 记下按下的目标（鼠标用手型此刻的 hoverId；触摸没有 hover，
+     * 按按下点投影），pointerup 只做「是不是一次点击」的判定，不再重新投影。
+     *
+     * `pressed` 同时修掉 t11 的 D1：在芯片/按钮上按下、拖到画布空白处松手时，
+     * 画布自己的 pointerdown 没跑过 → `pressed=false` → 这次抬起不是点击。
+     * （旧代码只查 `dragGuard.moved`，而它只被 <Canvas> 自己的回调更新 —— 是旧值。）
+     */
+    let pressed = false;
+    let pressedId: string | null = null;
+
+    const onDown = (ev: PointerEvent) => {
+      if (ev.button !== 0) return;
+      const rect = el.getBoundingClientRect();
+      const px = ev.clientX - rect.left;
+      const py = ev.clientY - rect.top;
+      const nearHover = Math.hypot(px - hoverX, py - hoverY) <= 2;
+      pressed = true;
+      pressedId =
+        ev.pointerType === "mouse" && nearHover ? hoverId : resolvePick(candidates(), px, py);
+      hoverX = px;
+      hoverY = py;
+    };
+
     const onUp = (ev: PointerEvent) => {
+      if (ev.button !== 0) return;
+      const wasPressed = pressed;
+      const id = pressedId;
+      pressed = false;
+      pressedId = null;
+      // t18-B：这次抬起之前不在画布上按下（从芯片/按钮上按下、拖到画布松手）→ 不是点击
+      if (!wasPressed) return;
       // 拖拽视角松手会落一个 pointerup，位移超过阈值就当没点（沿用 dragGuard）
       if (dragGuard.moved) return;
       // 切换动画期间不受理选择：store 会把选择排进 queuedSelectId，这里再挡一层
       if (useSim.getState().switching) return;
-      const rect = el.getBoundingClientRect();
-      const id = resolvePick(candidates(), ev.clientX - rect.left, ev.clientY - rect.top);
-      if (id) useSim.getState().select(id);
+      if (id) {
+        /*
+         * t18-C：点已经选中的那颗 → 重新取景，而不是静默 no-op。
+         *
+         * 旧行为：`select(同一 id)` 不改变 `appliedKey = selectedId|resetToken`，
+         * 于是 startFocus 不跑 —— 用户看到手型、点下去、画面一动不动（实测相机位移 0 m）。
+         * 这里换成 refocus()（resetToken+1）：如果用户已经跟着它转/缩走了，这一下把
+         * 镜头带回焦点距离，是可见的回执；本来就停在焦点上时位移≈0，也不会抖。
+         * 为什么不在 HUD 上做脉冲：那是 designer 的领土，且相机回位本身就是"再看它一眼"。
+         */
+        const s = useSim.getState();
+        if (s.selectedId === id) s.refocus();
+        else s.select(id);
+      }
     };
 
+    el.addEventListener("pointerdown", onDown);
     el.addEventListener("pointerup", onUp);
+
+    /*
+     * 抬起落在画布外时 el 的 pointerup 不会来，`pressed` 会留脏；用 window 的冒泡
+     * 兜底清一次（冒泡阶段，排在 el 的 onUp 之后，不会抢在它前面把状态清掉）。
+     */
+    const onAnyUp = () => {
+      pressed = false;
+      pressedId = null;
+    };
+    window.addEventListener("pointerup", onAnyUp);
 
     /*
      * 光标与点击共用同一个判定。
@@ -2872,22 +2932,24 @@ function PickLayer() {
      * 可是点下去照样选中 —— "能点的范围"和"会变手型的范围"不是同一个，用户看到的就是
      * 时灵时不灵。
      *
-     * 现在：pointermove 只记坐标，真正的判定摊到下一个 rAF 里做一次。
-     * 这样高频移动不会每个事件都投影一遍（15 个天体一次投影是微秒级，但没必要乘以事件率）。
+     * 现在：pointermove 只记坐标，真正的判定摊到下一个 rAF 里做一次；t18 起这次判定的
+     * 结果（hoverId）就是点击的目标，不再在 pointerup 时二次投影。
      */
     let hoverX = 0;
     let hoverY = 0;
     let hoverRaf = 0;
+    let hoverId: string | null = null;
 
     const runHover = () => {
       hoverRaf = 0;
       // 拖拽中不显示手型：那是在转视角，不是在瞄准
       if (dragGuard.active && dragGuard.moved) {
+        hoverId = null;
         clearPointer();
         return;
       }
-      const id = resolvePick(candidates(), hoverX, hoverY);
-      if (id) markPointer();
+      hoverId = resolvePick(candidates(), hoverX, hoverY);
+      if (hoverId) markPointer();
       else clearPointer();
     };
 
@@ -2900,6 +2962,7 @@ function PickLayer() {
           cancelAnimationFrame(hoverRaf);
           hoverRaf = 0;
         }
+        hoverId = null;
         clearPointer();
         return;
       }
@@ -2911,6 +2974,7 @@ function PickLayer() {
         cancelAnimationFrame(hoverRaf);
         hoverRaf = 0;
       }
+      hoverId = null;
       clearPointer();
     };
 
@@ -2926,9 +2990,11 @@ function PickLayer() {
     (window as unknown as { __solarPick?: typeof api }).__solarPick = api;
 
     return () => {
+      el.removeEventListener("pointerdown", onDown);
       el.removeEventListener("pointerup", onUp);
       el.removeEventListener("pointermove", onMove);
       el.removeEventListener("pointerleave", onLeave);
+      window.removeEventListener("pointerup", onAnyUp);
       if (hoverRaf) cancelAnimationFrame(hoverRaf);
       delete (window as unknown as { __solarPick?: typeof api }).__solarPick;
     };
