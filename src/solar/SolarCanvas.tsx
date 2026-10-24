@@ -196,6 +196,15 @@ const PLANET_FRAG = /* glsl */ `
    *   - 两方向的夹角 ≈ |cross(u, v)|（= sin 角度）
    * 覆盖率 = 遮挡圆盘与太阳圆盘的重叠比例，用线性近似 (aOcc + aSun − sep) / (2·aSun)：
    * sep ≥ aOcc+aSun 无遮挡、sep ≤ aOcc−aSun 全食，中间线性过渡 = 半影。
+   *
+   * ⚠ **用 |cross| 当"夹角"必须配一个半空间判断，否则 180° 也会被当成 0°**（t50 用户报的 bug）：
+   * |cross(u,v)| = |sin θ| 在 θ=0°（遮挡体挡在太阳前面 = 真食）和 θ=180°（遮挡体在**背面**，
+   * 根本挡不住太阳）都等于 0。少了下面那行（dot ≤ 0 → continue），卫星绕到"母天体在背面"
+   * 那个相位时（卫星正对太阳、母天体在它身后），整个受光面会被判成全食 —— 实测月球日下点
+   * 24×24 亮度从 134.9 掉到 11.15（8.3%），六颗卫星全中、地球的日下点掉到 20%。
+   * 用户的原话是「卫星在面对太阳时突然会变黑」。
+   * 判据是精确的：遮挡体中心在背面（dot ≤ 0）时它的角盘整个落在后半球，不可能盖住前半球
+   * 的太阳圆盘；而真食（dot > 0）一个像素都不受影响。
    */
   float eclipseCoverage(vec3 P) {
     vec3 toSun = uSunCenter - P;
@@ -209,8 +218,14 @@ const PLANET_FRAG = /* glsl */ `
       vec3 toOcc = uOcc[i] - P;
       float dOcc = length(toOcc);
       if (dOcc < uOccR[i] + 1e-4) continue; // 点在遮挡体内部：交给相机钳制，不算食
+      vec3 occDir = toOcc / dOcc;
+      /*
+       * 遮挡体必须在**太阳那一侧**（dot > 0）。这一行是 t50 的修复：
+       * 少了它，|cross| 把"遮挡体在背面"（θ≈180°）也算成 sep≈0 → 全食 → 受光面整块变黑。
+       */
+      if (dot(sunDir, occDir) <= 0.0) continue;
       float aOcc = uOccR[i] / dOcc;
-      float sep = length(cross(sunDir, toOcc / dOcc));
+      float sep = length(cross(sunDir, occDir));
       cover = max(cover, clamp((aOcc + aSun - sep) / (2.0 * aSun), 0.0, 1.0));
     }
     return cover;
