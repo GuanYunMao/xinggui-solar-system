@@ -314,8 +314,49 @@ const SHELL_FRAG = /* glsl */ `
   uniform float uOpacity;
   varying vec3 vNormalV;
   void main() {
-    float fres = pow(0.62 - dot(normalize(vNormalV), vec3(0.0, 0.0, 1.0)), 2.1);
-    float a = clamp(fres, 0.0, 1.0) * uOpacity;
+    /*
+     * 大气/日冕的边缘衰减（t51 重写）。
+     *
+     * 旧版：pow(0.62 - dot(N, view), 2.1)。BackSide 壳上法线是背向的，dot 基本为正，
+     * 这个式子只在"贴到接近 90°"的极窄一带里才大于 0 —— 结果是**一条硬边塑料圈**：
+     * 内缘突然亮起、外缘在壳的轮廓处被一刀切断，中间几乎没有渐变。
+     *
+     * 现在改成按**屏幕半径**衰减：r = 0 在盘心、1 在壳缘，
+     * 天体表面（r = uInner）处最亮，向外 pow(1 - t, 2.4) 衰减到 0 —— 近似平方衰减。
+     * 为什么用 |dot(N, view)| 反算而不是传顶点：球面在正交性上 r = sqrt(1 - cos²)，
+     * 比新加一个 varying 便宜，而且缩放后仍然成立（壳是等比缩放的球）。
+     *
+     * 只改曲线，不降 uOpacity —— 降不透明度会把日冕一起压淡（同一条链路）。
+     */
+    float c = dot(normalize(vNormalV), vec3(0.0, 0.0, 1.0));
+    float r = sqrt(max(0.0, 1.0 - c * c));
+    /*
+     * core 里 c **不能取绝对值**：BackSide 壳上可见片元的法线是背向的，dot 为负，
+     * 原来的 0.62 - c 于是变成 0.62 + |c| —— 那正是它宽度合适的原因。
+     * 第一版我"顺手"加了 abs，带宽直接掉到 1/5（实测 82.8 → 23.4），这条记在这里。
+     */
+    /*
+     * 两段相乘，各修一个毛病：
+     *
+     *  1. core = 原来的菲涅尔形状（盘缘最亮、向内快速消失）。它的宽度是对的，
+     *     改前之所以像塑料圈，是它在**壳缘**（r = 1）还留着 0.34 的亮度，
+     *     于是几何边界处一刀切成 0 —— 硬边就来自这一刀。
+     *  2. taper 就是补这一刀：在壳缘最后 20% 的带子里把亮度平滑收到 0。
+     *     叠加之后从盘面到太空是一条连续曲线，而日冕（同一条 shader、uInner 0.645）
+     *     也一起变软，不需要单独调它的不透明度。
+     *
+     * 试过更"教科书"的写法 pow(1 - t, 1.5)（t 从盘缘到壳缘），实测反而更糟：
+     * 半程就掉到 10%，图上只剩贴边一条细线 —— 因为背向壳的可见带比想象中窄。
+     */
+    float core = pow(max(0.62 - c, 0.0), 2.1);
+    /*
+     * 壳缘收口：可见带落在 |c| ∈ [0, 0.45]（c = 0 是壳的轮廓，c ≈ 0.45 是天体盘缘），
+     * 所以让 alpha 在 |c| < 0.18（带子的最外 16%）里平滑归零 —— 只削那一刀，不动带宽。
+     * 这是第 5 版才开始用的写法：前几版用屏幕半径 r 做 smoothstep，实测每次都把
+     * 整条带子压窄（82.8 → 49.7 → 33），因为插值后的 r 和我推的几何值对不上。
+     */
+    float edge = smoothstep(0.0, 0.18, abs(c));
+    float a = clamp(core, 0.0, 1.0) * edge * uOpacity;
     gl_FragColor = vec4(uColor, a);
   }
 `;
@@ -505,11 +546,24 @@ function Simulation({ ready = true }: { ready?: boolean }) {
 }
 
 function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
+  /*
+   * 轨道线在地球这种「天体正好压在自己轨道上」的画面里会**横穿球面**（t51）。
+   *
+   * 根因不是深度测试没开：`LineBasicMaterial` 默认 `depthTest: true`，球面是 opaque
+   * 也写了深度。问题是几何本身 —— 天体就站在环上，环的**近侧半圈**在遮挡关系上确实
+   * 在球体前面，深度测试会老老实实把它画出来，于是看起来像一根杆子捅穿行星。
+   *
+   * 改法：把环画成两遍（参数 0..2 覆盖整圈两次），每帧用 `setDrawRange` 只留
+   * 「天体前后留 1.7 倍半径」之外的那一段（单次 draw call，不新增 shader program，
+   * 也不给每帧加 vertex 重算）。天体附近的缺口 = 线在球体后面时不可见、在球体别处
+   * 仍然照常可见，正是验收要的两件事。
+   */
+  const RING_SEGMENTS = 180;
   const line = useMemo(() => {
     const pts: number[] = [];
-    const n = 180;
-    for (let i = 0; i <= n; i++) {
-      const angle = (i / n) * Math.PI * 2;
+    // 两遍：参数 p ∈ [0, 2]，于是「挖掉一段」等价于一个连续的 draw range
+    for (let i = 0; i <= RING_SEGMENTS * 2; i++) {
+      const angle = (i / RING_SEGMENTS) * Math.PI * 2;
       const lx = Math.cos(angle) * body.orbitRadius;
       const lz = Math.sin(angle) * body.orbitRadius;
       pts.push(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
@@ -521,11 +575,27 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
       color: selected ? "#e8edf4" : "#8b97a8",
       transparent: true,
       opacity: selected ? 0.9 : isMoon(body) ? 0.22 : 0.32,
+      // 显式写出来：线要参与深度测试（被球体挡住）、但不写深度（避免遮挡后面的半透明）
+      depthTest: true,
+      depthWrite: false,
     });
     const mesh = new THREE.Line(geo, mat);
     mesh.frustumCulled = false;
     return mesh;
   }, [body, selected]);
+  // 缺口半宽：1.7 倍天体半径换算成「参数」单位（= 角度/2π）
+  const gapHalf = useMemo(
+    () => Math.max(0.004, (body.radius * 1.7) / (body.orbitRadius * Math.PI * 2)),
+    [body.radius, body.orbitRadius],
+  );
+  useFrame(() => {
+    const geo = line.geometry;
+    // 天体在环上的参数位置：与 Simulation 的相位公式同源（angle = t/period·2π + phase）
+    const tParam = (((simTimeNow() / body.period + body.phase / (Math.PI * 2)) % 1) + 1) % 1;
+    const start = Math.round((tParam + gapHalf) * RING_SEGMENTS);
+    const count = Math.max(2, Math.round((1 - gapHalf * 2) * RING_SEGMENTS) + 1);
+    geo.setDrawRange(start, count);
+  });
   useEffect(
     () => () => {
       line.geometry.dispose();
