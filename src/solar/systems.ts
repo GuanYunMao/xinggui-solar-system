@@ -44,11 +44,13 @@ export type SystemLook = {
 };
 
 /**
- * 沙盘那套观感 —— 也是 `look` 缺省值。
+ * 沙盘那套观感 —— **参考值，不再是缺省值**。
  *
- * 缺省给沙盘，是因为 `system-context.tsx` 里的 `SOL_SYSTEM`（不在本文件的领土里）也没写
- * look；给它一个"看得见所有东西"的缺省，比给一个"什么都没有"的缺省安全。
- * 将来谁给 SOL_SYSTEM 补 look，请在同一个提交里显式写上这组值（别靠缺省）。
+ * `look` 改成必填之后，每个 SystemSpec（`SOL_SYSTEM` 与 `REAL_PROTO`）都必须显式声明自己那份，
+ * 所以这个常量不再承担"谁忘了写就用我"的职责。它现在只剩两个用途：
+ *  1. `lookOf()` 对**未标注 `SystemSpec` 类型**的调用方兜底（typed 代码里不可能走到）；
+ *  2. 当"沙盘长什么样"的参照物，省得读 `SOL_SYSTEM` 去对照。
+ * 新增系统时请自己写 look，别依赖这里。
  */
 export const SANDBOX_LOOK: SystemLook = {
   spins: true,
@@ -71,8 +73,8 @@ export type SystemSpec = {
   name: string;
   /** 单位：沙盘是压缩世界单位，实境是米。**只表示单位**，不当功能开关用（见 SystemLook）。 */
   unit: "worldUnit" | "meter";
-  /** 观感/行为声明；省略 = 沙盘那套（SANDBOX_LOOK） */
-  look?: SystemLook;
+  /** 观感/行为声明。**必填**：漏写会静默继承沙盘观感，那正是本文件要防的 bug。 */
+  look: SystemLook;
   bodies: Body[];
 };
 

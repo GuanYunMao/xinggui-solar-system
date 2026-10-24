@@ -34,6 +34,26 @@ const SOL_SYSTEM: SystemSpec = {
   id: "sol",
   name: "太阳系",
   unit: "worldUnit",
+  /*
+   * 沙盘的观感：**全开**。
+   *
+   * 这组值以前靠 `systems.ts` 的 SANDBOX_LOOK 兜底（`look` 当时是可选字段），
+   * 现在显式写出来，因为 `look` 已经改成必填 —— "忘了写就静默继承沙盘观感"
+   * 正是 R3 要防的那类 bug：将来加「星图」（世界单位、但不该自转/不该有云）时，
+   * 漏一处就会得到"星图里行星在自转"这种荒谬结果，而且没有任何报错。
+   *
+   * 刻意不写 `look: SANDBOX_LOOK`：每个系统自己声明观感，别让某个常量变成隐形默认值。
+   */
+  look: {
+    spins: true,
+    clouds: true,
+    labels: true,
+    decor: true,
+    orbitLines: true,
+    freezesTime: false,
+    refineGeometry: false,
+    camera: "sandbox",
+  },
   bodies: BODIES,
 };
 
