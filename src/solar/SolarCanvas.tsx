@@ -9,6 +9,17 @@ import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
 import { farFloorFor, frameEarthMoon, tightenClipPlanes, type VisibleBody } from "./systems";
+import {
+  BAND_FRAG,
+  BAND_OPACITY,
+  BAND_VERT,
+  GALACTIC_NORMAL,
+  SKY_DRIFT_RAD_PER_S,
+  SKY_RADIUS,
+  STAR_FRAG,
+  STAR_VERT,
+  createStarGeometry,
+} from "./starfield";
 import { acquireCloudTexture, acquirePlanetTexture, glowTexture, textureReport } from "./textures";
 
 declare global {
@@ -303,35 +314,6 @@ const RING_FRAG = /* glsl */ `
   }
 `;
 
-const STAR_VERT = /* glsl */ `
-  attribute float aSize;
-  attribute vec3 aColor;
-  attribute float aPhase;
-  varying vec3 vColor;
-  varying float vPhase;
-  void main() {
-    vColor = aColor;
-    vPhase = aPhase;
-    vec4 mv = modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = clamp(aSize * (920.0 / max(1.0, -mv.z)), 1.0, 5.5);
-    gl_Position = projectionMatrix * mv;
-  }
-`;
-
-const STAR_FRAG = /* glsl */ `
-  uniform float uTime;
-  varying vec3 vColor;
-  varying float vPhase;
-  void main() {
-    vec2 p = gl_PointCoord - vec2(0.5);
-    float d = length(p);
-    float a = smoothstep(0.5, 0.12, d);
-    if (a < 0.02) discard;
-    float tw = 0.84 + 0.16 * sin(uTime * 0.65 + vPhase);
-    gl_FragColor = vec4(vColor, a * tw);
-  }
-`;
-
 /*
  * 沙盘 home 机位的**唯一出处**（R6）。位置 / 视场这两个数以前写在三处：
  * Canvas 的 camera prop、applyHome、homeVector —— 改一处忘一处就会"首帧和稳态不是一个机位"。
@@ -364,8 +346,17 @@ function easeInOut(t: number) {
   return t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
 }
 
+/**
+ * 星空（t32）：银河带 + 分层星点 + 极慢漂移。
+ *
+ * 为什么整片天空挂在一个**跟随相机**的 group 上：恒星在太阳系尺度内没有视差，
+ * 相机怎么飞、星点的世界相对位置都不该变。改造前的星点撒在 180~450 世界单位处、
+ * 不跟相机，所以镜头一动它们就整体平移（视差），看起来更像近处的灰而不是星空。
+ * 现在：group.position 每帧跟相机，漂移只靠 group 自己的旋转。
+ */
 function Stars() {
-  const mat = useMemo(
+  const camera = useThree((state) => state.camera);
+  const starMat = useMemo(
     () =>
       new THREE.ShaderMaterial({
         transparent: true,
@@ -377,68 +368,48 @@ function Stars() {
       }),
     [],
   );
-  const geo = useMemo(() => {
-    const count = 2800;
-    const positions = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    const sizes = new Float32Array(count);
-    const phases = new Float32Array(count);
-    let s = 7;
-    const rand = () => {
-      s = (s * 16807) % 2147483647;
-      return (s - 1) / 2147483646;
-    };
-    for (let i = 0; i < count; i++) {
-      const disk = i > 1800;
-      let x: number;
-      let y: number;
-      let z: number;
-      if (disk) {
-        const a = rand() * Math.PI * 2;
-        const rad = 180 + rand() * 260;
-        const lift = (rand() - 0.5) * 26 * rand();
-        x = Math.cos(a) * rad;
-        z = Math.sin(a) * rad * 0.72;
-        y = lift + z * 0.35;
-      } else {
-        const u = rand();
-        const v = rand();
-        const theta = 2 * Math.PI * u;
-        const phi = Math.acos(2 * v - 1);
-        const r = 360 + rand() * 90;
-        x = r * Math.sin(phi) * Math.cos(theta);
-        y = r * Math.cos(phi);
-        z = r * Math.sin(phi) * Math.sin(theta);
-      }
-      positions[i * 3] = x;
-      positions[i * 3 + 1] = y;
-      positions[i * 3 + 2] = z;
-      const warm = rand() > 0.92;
-      const cool = rand() < 0.08;
-      colors[i * 3] = warm ? 1 : cool ? 0.72 : 0.82 + rand() * 0.18;
-      colors[i * 3 + 1] = warm ? 0.9 : cool ? 0.84 : 0.86 + rand() * 0.1;
-      colors[i * 3 + 2] = warm ? 0.72 : cool ? 1 : 0.9 + rand() * 0.08;
-      sizes[i] = disk ? 1.1 + rand() * 1.4 : 1.3 + rand() * 2.2;
-      phases[i] = rand() * Math.PI * 2;
-    }
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    g.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
-    g.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
-    g.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
-    return g;
-  }, []);
+  const bandMat = useMemo(
+    () =>
+      new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        toneMapped: false,
+        side: THREE.BackSide,
+        blending: THREE.AdditiveBlending,
+        uniforms: { uNormal: { value: GALACTIC_NORMAL.clone() }, uOpacity: { value: BAND_OPACITY } },
+        vertexShader: BAND_VERT,
+        fragmentShader: BAND_FRAG,
+      }),
+    [],
+  );
+  const geo = useMemo(() => createStarGeometry(), []);
+  // 天球只用来承载银河带：64×32 段足够让带子的亮度梯度平滑（噪声在顶点里算）
+  const dome = useMemo(() => new THREE.SphereGeometry(SKY_RADIUS, 64, 32), []);
+  const sky = useRef<THREE.Group>(null);
   useEffect(
     () => () => {
       geo.dispose();
-      mat.dispose();
+      dome.dispose();
+      starMat.dispose();
+      bandMat.dispose();
     },
-    [geo, mat],
+    [geo, dome, starMat, bandMat],
   );
   useFrame((state) => {
-    mat.uniforms.uTime!.value = state.clock.elapsedTime;
+    const elapsed = state.clock.elapsedTime;
+    starMat.uniforms.uTime!.value = elapsed;
+    const g = sky.current;
+    if (!g) return;
+    // 天空跟着相机走（零视差）；漂移是天空自己的旋转，与相机无关
+    g.position.copy(camera.position);
+    g.rotation.y = elapsed * SKY_DRIFT_RAD_PER_S;
   });
-  return <points geometry={geo} material={mat} frustumCulled={false} />;
+  return (
+    <group ref={sky}>
+      <mesh geometry={dome} material={bandMat} raycast={() => null} frustumCulled={false} />
+      <points geometry={geo} material={starMat} frustumCulled={false} />
+    </group>
+  );
 }
 
 function Simulation() {
@@ -1299,6 +1270,53 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
 }
 
 /**
+ * 缩放手感（t32）。
+ *
+ * 为什么不是"把 zoomSpeed 调大"就完事：总览到太阳特写是 50 倍，
+ * 一格 3.5%（旧值 0.95^0.7）要 67 格；一格 14% 要 ~19 格；再加连续滚动加速才能压到 12 格以内。
+ * 加速必须有上限、且停手就回落 —— 否则一次猛滚会直接穿进太阳里。
+ */
+/** 基准：0.95^2.94 ≈ 0.86，即一格 14%。 */
+const ZOOM_SPEED_BASE = 2.94;
+/** 连续滚动时的倍率上限（≈23%/格）。再快就不是缩放了，是瞬移。 */
+const ZOOM_BOOST_MAX = 1.7;
+/** 两次 wheel 间隔小于它才算"连续滚动"。 */
+const ZOOM_ACCEL_WINDOW_MS = 400;
+/** 每多一格加多少倍率。 */
+const ZOOM_BOOST_STEP = 0.16;
+/** 停手这么久就复位（验收要求"几百毫秒内"）。 */
+const ZOOM_RESET_MS = 320;
+/** 距天体中心的最小距离基数（世界单位，改造前就是 1.15）。 */
+const MIN_DISTANCE_BASE = 1.15;
+/** 再乘天体半径：1.2×半径 = 贴着表面但不进去。太阳 3.8 → 4.56。 */
+const MIN_DISTANCE_RADIUS_FACTOR = 1.2;
+
+/**
+ * 距 `controls.target` 最近的那颗天体的半径。
+ *
+ * 用途：把 OrbitControls 的 `minDistance` 从固定 1.15 改成"跟着目标走"——
+ * 目标是太阳时下限是 1.2×3.8 = 4.56，谁也别想滚进球里；目标是 0.2 半径的小卫星时
+ * 下限仍是基数 1.15，它 1.7 的聚焦距离才进得去。t18 踩过的"maxDistance 与长距离动画互撞"
+ * 是另一条：动画期间 controls.enabled=false，钳制根本不参与。
+ */
+function nearestBodyRadius(reg: Registry, bodies: readonly Body[], target: THREE.Vector3): number {
+  const p = new THREE.Vector3();
+  let best = Infinity;
+  let radius = 0;
+  for (const b of bodies) {
+    const g = reg.groups.get(b.id);
+    if (!g) continue;
+    g.getWorldPosition(p);
+    const d = p.distanceTo(target);
+    if (d < best) {
+      best = d;
+      radius = b.radius;
+    }
+  }
+  return radius;
+}
+
+/**
  * 沙盘相机：OrbitControls 那一套（首次摆位、聚焦动画、跟随天体、总览回位、竖屏视野）。
  *
  * 只在沙盘系统挂载 —— 切进米制时它整个卸载（见 Scene 里的三元）。这是 R2 拆分的核心：
@@ -1326,6 +1344,28 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
    * 让下面常规的 key 比对分支走 startFocus（这也让 initial 判定为 false）。
    */
   const returning = useRef(useSim.getState().switching === "toSandbox").current;
+
+  /*
+   * 缩放加速状态（见文件上方 ZOOM_* 常量）：wheel 事件只更新这两个 ref，
+   * 真正的 zoomSpeed / minDistance 每帧写进 controls —— 这样 drei 重渲染把 props 刷回来也不怕。
+   */
+  const zoomBoost = useRef(1);
+  const lastWheelAt = useRef(-1e9);
+  const gl = useThree((state) => state.gl);
+  useEffect(() => {
+    const el = gl.domElement;
+    const onWheel = () => {
+      const now = performance.now();
+      const gap = now - lastWheelAt.current;
+      lastWheelAt.current = now;
+      // 连续滚动：倍率 +0.16，封顶 1.7；停手后由 useFrame 里复位
+      zoomBoost.current =
+        gap < ZOOM_ACCEL_WINDOW_MS ? Math.min(ZOOM_BOOST_MAX, zoomBoost.current + ZOOM_BOOST_STEP) : 1;
+    };
+    // passive：只观察，不拦 OrbitControls 自己的 wheel 处理
+    el.addEventListener("wheel", onWheel, { passive: true });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [gl]);
 
   /*
    * 这里原本有一个 `dip()`：命令式 append 一层黑 div，再等一个 rAF 才把 opacity 设成 1。
@@ -1461,6 +1501,20 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      * 那个组件只在自己挂载时存在，本组件只负责沙盘；两套相机不再共享 anim/appliedKey，
      * 所以这里不需要再"把共享 ref 说成真话"（旧的 appliedKey/appliedMode.upkeep 就是这么来的）。
      */
+
+    /*
+     * 缩放（t32）：每帧把倍率和最小距离写回控件。必须写在 drei 的 controls.update() 之前 ——
+     * 本回调是 -2 优先级，它的 update 是 0，所以这一帧就生效。
+     *  - 倍率 = 基准 × 连续滚动加速；停手 320ms 后复位（验收要求"几百毫秒内"）；
+     *  - 最小距离 = max(1.15, 最近天体半径 × 1.2)：滚到底也钻不进太阳里（1.2×3.8 = 4.56），
+     *    而 0.2 半径的小卫星下限仍是 1.15、它 1.7 的聚焦距离进得去。
+     */
+    if (performance.now() - lastWheelAt.current > ZOOM_RESET_MS) zoomBoost.current = 1;
+    controls.zoomSpeed = ZOOM_SPEED_BASE * zoomBoost.current;
+    controls.minDistance = Math.max(
+      MIN_DISTANCE_BASE,
+      nearestBodyRadius(reg, bodies, controls.target) * MIN_DISTANCE_RADIUS_FACTOR,
+    );
 
     /*
      * 每帧按焦点距离收窄 near/far。和米制相机走同一个契约（R7）：far 的下界由
@@ -2207,8 +2261,14 @@ function Scene() {
         enableDamping
         dampingFactor={0.09}
         rotateSpeed={0.55}
-        zoomSpeed={0.7}
-        minDistance={1.15}
+        /*
+         * zoomSpeed / minDistance 每帧由 SandboxCamera 重写（倍率要随连续滚动加速、
+         * 最小距离要跟着目标天体半径走）。这里的值只是首帧的起点。
+         * zoomToCursor：朝指针位置缩放，不用先把星球拖到画面中心再滚。
+         */
+        zoomSpeed={ZOOM_SPEED_BASE}
+        zoomToCursor
+        minDistance={MIN_DISTANCE_BASE}
         maxDistance={280}
         minPolarAngle={0.02}
         maxPolarAngle={Math.PI - 0.02}

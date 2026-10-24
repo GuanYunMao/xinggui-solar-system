@@ -1,18 +1,26 @@
 // 用真实浏览器验证一个单文件 HTML 是否真的能跑。
 // 用法: npm run check -- <文件路径> [用于字节比对的参考文件]
+//       npm run check              → 不传参数时默认验本地刚构建的那份 release/巡星.html
+//                                    （以前不带参数只打印用法再退出 2，导致 `npm run check` 是空跑）
 //
 // 为什么要单独验下载回来的文件：本地构建和 CI 构建会因打包器平台差异
 // 差几十字节（Tailwind 候选类扫描），所以"我本地验过了"不等于"你下载的那份能跑"。
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright-core";
 
 const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
-const target = process.argv[2];
+const DEFAULT_TARGET = path.join(import.meta.dirname, "..", "release", "巡星.html");
+const explicit = Boolean(process.argv[2]);
+const target = process.argv[2] ?? DEFAULT_TARGET;
 const ref = process.argv[3];
-if (!target) {
-  console.error("用法: node scripts/check-single-file.mjs <文件路径> [参考文件]");
-  process.exit(2);
+if (!explicit) {
+  if (!existsSync(target)) {
+    console.error(`找不到 ${target}，先跑 npm run build（或显式传文件：npm run check -- <文件>）`);
+    process.exit(2);
+  }
+  console.log(`（未指定文件，默认验本地构建产物：${target}）`);
 }
 
 if (ref) {

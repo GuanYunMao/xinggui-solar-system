@@ -1,8 +1,13 @@
 # 验收怎么跑
 
+> **形状判据是门卫，行为判据才是裁判，两层别混成一层报。**
+> 形状只证明「这个写法只出现在这里」，行为才证明「它算出来的数是对的」——
+> 两层分工见下面「形状判据（`check-shape.mjs`）」。
+
 ```bash
 npm run build          # 先出 release/（verify 验的是构建产物，不是 dev server）
-npm run verify         # = node scripts/verify.mjs
+npm run verify         # = node scripts/verify.mjs（行为验收，跑真浏览器，9 条 pass）
+npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒级，不跑浏览器）
 ```
 
 `verify.mjs` 起一个临时静态服务器指向 `release/site`，用系统 Edge（不下载 Chromium）开真浏览器，
@@ -87,6 +92,79 @@ npm run verify         # = node scripts/verify.mjs
 **画布像素体检共挂在 5 条 pass 上**（`desktop` / `mobile` / `mobile-selected` / `single-file` /
 `proto-real`，`judgeCanvasPixels` 2 个调用点），见下节「画布像素体检（抓整屏黑）」——
 它抓的是「数据层全对、眼睛看到一片黑」这类回归。`proto-jitter` 另有独立回读，不计入这 5 条。
+
+## 形状判据（`check-shape.mjs`）
+
+`npm run check:shape`（约 0.2 秒，纯静态读源码，不起浏览器）。守卫的是**「同一个概念长出第二份真相」**：
+焦点距离、near/far 写入、模式判断点、时钟、已删除符号——每个都只该有一个出处。
+
+| # | 守什么 | 期望 | 现在（2026-10-24） |
+| --- | --- | --- | --- |
+| 1 | 焦距公式 `Math.tan(...fov)` | 只在 `pick.ts` 的 `focalPx` | **FAIL：4 处**（pick.ts 1 + SolarCanvas 3） |
+| 2 | `camera.near/far` 写入 | 只在 `systems.ts` 的 `tightenClipPlanes` 内 | PASS（2 处，都在函数体内） |
+| 3 | `spec.unit ===` 在 `SolarCanvas.tsx` | ≤2（R3 后应为 0） | VACUOUS（0） |
+| 4 | `inReal` 在 `Hud.tsx` | ≤1 | VACUOUS（0） |
+| 5 | `simClock` 在 `src/` | 0 | VACUOUS（0） |
+| 6 | 已删符号 `realPose`/`dip(`/`SANDBOX_LOOK`/`lookOf`/`startSwitchPose`/`appliedMode`/`switchReleased` | 代码 0；注释允许但逐条列出 | VACUOUS（代码 0 / 注释 9） |
+
+### 三态：PASS / FAIL / VACUOUS
+
+- **FAIL** → 打印每条 `文件:行号: 内容`，退出码 1。
+- **VACUOUS**：命中 0 且期望也是 0 —— **这不是通过，是判据失效**。重构把符号删干净之后，
+  「数它还有几处」这种判据会真空变绿：将来用新名字复现同一份双真相，它照样全绿。
+- **vacuous 为什么不判红**：R3/R6 之后 #3–#6 在当前代码上必然命中 0，判红会让这条命令**永远红**——
+  本仓库有过先例：帧时间写死 `EMA ≤ 26ms`，忙机器天天红，红到最后没人看。
+  所以 vacuous 打警告 + 计入汇总，退出码仍 0，**牙齿由 `--selftest` 保**。
+
+### `--selftest`：证明护栏会红
+
+`npm run check:shape:selftest` 在临时副本（`os.tmpdir()`）里**故意重引入**一份第二真相，
+断言对应判据确实变红：注入 `simClock` 到 clock.ts、注入 `lookOf` 到 store.ts、注入 3 处
+`spec.unit ===` 到 SolarCanvas……六条各一次，任何一条注入后不红 → 退出码 1。
+**跑不通的护栏不算护栏。** 判定用「原始命中数增加 + 状态变 FAIL」两个条件，
+不能用显示条数——第 2 条通过时只展示函数外的命中，注入后显示数反而会变小（这个坑第一次跑就踩了）。
+
+### 扫描范围：显式清单，不是递归 glob
+
+`SCAN_FILES` 手写 18 个文件。`src/copy/**`、`dist/`、`release/` 里的字符串会污染计数，
+第一次跑就会有人把脚本关掉。**新增 src 文件必须加进清单**——`[清单]` 那条 meta 判据会红并告诉你加哪个，
+它防的是「新文件悄悄逃出扫描范围」（写这条判据的当天它就抓到了 `starfield.ts`）。
+
+### 注释与代码怎么分开
+
+`classify()` 是个小状态机：`//` 到行尾、`/* … */` 之内算注释；字符串与模板正文算**代码**（保守，宁多报）。
+已知误判（换代码后要重看）：正则字面量里的 `//`、JSX 文本节点、`String.raw` 内容会被当成代码；
+`"lookOf"` 这种字符串引用会计入命中（有意的，引用已删符号同样可疑）。
+怀疑判错时用维护开关看分类结果：
+
+```bash
+node scripts/check-shape.mjs --dump src/solar/systems.ts      # 每行的代码/注释划分
+node scripts/check-shape.mjs --dump-fn src/solar/systems.ts "function\s+tightenClipPlanes"  # 函数体行范围
+```
+
+> 第 2 条的函数体范围是**括号感知**的：参数里的类型字面量（`camera: { near: number }`）自带花括号，
+> 只数花括号会在参数没结束时就配平、把函数体截成两行。已知限制：返回类型里带对象字面量时范围会偏短，
+> 本仓库不触发。
+
+### 什么时候可以改期望值
+
+改期望值的门槛只有一个：**能说清「旧期望为什么不再成立」**，并在本节记一行。因为红了就调，等于没有判据。
+
+| 情形 | 允许的改法 |
+| --- | --- |
+| 2 代际真的加了第二个相机系统 | 第 2 条从「只在 tightenClipPlanes」改成「这两个函数各自的自有范围内」，**同时**给第 1 条补「每个相机模块各自唯一一份焦距」——两个一起改，别只放行一个 |
+| 新增第三种 `unit`（除 worldUnit/meter） | 第 3 条的上限 2 才有意义（现在写 2 是给「过渡期」留的口子，R3 落地后应收到 0） |
+| 某符号确认永久删除 | 第 6 条把它从列表里去掉，并在本节写一句「XX 已随 RN 删除」；**不要**因为「注释里还有 9 处」去改期望——注释本来就允许 |
+
+### 第 1 条不够硬：形状判据抓不住「公式写对了但用法错了」
+
+critic 点破的反例：把 `tan(asin(R/d))` 改成 `tan(asin(R/d)/2)`，**计数不变、本脚本依旧全绿**，
+而所有点击热区静默腰斩。所以第 1 条真正的护栏是**行为断言**：
+
+- 同帧 `__solarProbe()[i].radiusPx` 对 `__solarPick.candidates()[i].radiusPx`，差 < 1e-6；
+- t17 那四个构造点（土星环空白点 / 月球盘内 / 地球盘内 / 相机背后）各自返回期望 id。
+
+这层排在 t33 之后做，**不在 check-shape 里**——静态扫描和浏览器行为是两层，别混成一层报。
 
 ## 改语义之后：全仓扫旧说法
 
@@ -323,7 +401,8 @@ rm -rf .tmp-release-snap
 | --- | --- |
 | `verify.mjs` | 本文件说的那套验收 |
 | `texture-report.mjs` | 贴图预算 + 探针体检：打印 `__solarTextures()` 的像素/排队数与 `__solarProbe()` 的 NaN 哨兵条数（`node scripts/texture-report.mjs "?proto=1"`） |
-| `check-single-file.mjs` | 单文件版自检：资源是否真的内联、没有残留外链 |
+| `check-single-file.mjs` | 单文件版自检：资源是否真的内联、没有残留外链。**不带参数时默认验 `release/巡星.html`**（以前不带参数只打印用法就退出，等于空跑）；`npm run check -- <文件>` 可指定 |
+| `check-shape.mjs` | 形状判据：六条「同一个概念不许有第二份真相」+ 清单完整性；`--selftest` 证明每条护栏会红，`--dump` / `--dump-fn` 是维护开关 |
 | `bake-textures.mjs` | 预烘行星贴图到 `.texture-src/`（生成物，目录已 ignore） |
 | `make-icons.mjs` | 生成 PWA 图标（`public/icon-*.png`） |
 | `package-release.mjs` | 把 dist 打成 `release/site` + `release/巡星.html` |

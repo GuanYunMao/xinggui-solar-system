@@ -1,10 +1,10 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.1.6-snap.3",
+  "version": "1.1.6",
   "type": "module",
   "description": "巡星·未至之境 —— 可交互的三维太阳系（独立版）",
-  "releaseNote": "拆开观感声明",
+  "releaseNote": "星空活起来,滚轮省点力",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vite build && node scripts/package-release.mjs",
@@ -12,7 +12,9 @@
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "typecheck": "tsc --noEmit",
     "verify": "node scripts/verify.mjs",
-    "check": "node scripts/check-single-file.mjs",
+    "check": "node scripts/check-single-file.mjs && node scripts/check-shape.mjs",
+    "check:shape": "node scripts/check-shape.mjs",
+    "check:shape:selftest": "node scripts/check-shape.mjs --selftest",
     "shoot": "node scripts/shoot.mjs"
   },
   "dependencies": {
