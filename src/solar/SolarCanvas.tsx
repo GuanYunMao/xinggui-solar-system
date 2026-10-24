@@ -753,13 +753,41 @@ function SunSurface({ body }: { body: Body }) {
     },
     [mat, shell, sprite],
   );
+  const camera = useThree((state) => state.camera);
+  const bodyMesh = useRef<THREE.Mesh>(null);
+  /*
+   * 相机钻进光晕层时按距离淡出**发光件**（t56 B3 收尾）。
+   *
+   * 用户报的"跟随水星、左后方太阳把镜头挡住"，本质是镜头钻进了日冕的**光晕层**：
+   * 贴片 Sprite 的半径是 11× 日面（≈41.8 世界单位），卡在火星轨道以内基本都在它里面，
+   * 而它是加法混合的相机朝向平面 —— 从里面往外看会糊满整屏（实测整帧均值 212.4）。
+   * 这和 t42 那次是同一层东西，只不过那次是它穿透别人，这次是它糊住镜头。
+   *
+   * 两条规则，都按**相机到日心距离**插值（不二值切换，边界不闪）：
+   *  - 光晕 Sprite：从 0.9×光晕半径 到 1.4×光晕半径 淡出（37.6 → 58.5）；
+   *    进到 37.6 以内就是"在日冕里"，光晕看不见才是对的。
+   *  - 日冕壳（1.55×日面）：从 1.05×壳半径 到 1.6×壳半径 淡出（6.2 → 9.4）。
+   *  - 日面本体：进到 1.02×日面就整块不画（和 PlanetSurface 那条同一个判据）。
+   */
+  const fadeScratch = useMemo(() => new THREE.Vector3(), []);
   useFrame(() => {
     mat.uniforms.uTime!.value = simTimeNow();
+    const dist = camera.position.length(); // 太阳在世界原点
+    const glowR = body.radius * 11;
+    const shellR = body.radius * 1.55;
+    const fade = (from: number, to: number) => {
+      const t = Math.min(1, Math.max(0, (dist - from) / Math.max(to - from, 1e-6)));
+      return t * t * (3 - 2 * t);
+    };
+    sprite.material.opacity = 0.72 * fade(glowR * 0.9, glowR * 1.4);
+    shell.uniforms.uOpacity!.value = 0.95 * fade(shellR * 1.05, shellR * 1.6);
+    if (bodyMesh.current) bodyMesh.current.visible = dist > body.radius * 1.02;
+    void fadeScratch;
   });
   return (
     <group>
       <primitive object={sprite} />
-      <mesh material={mat}>
+      <mesh ref={bodyMesh} material={mat}>
         <sphereGeometry args={[body.radius, 64, 48]} />
       </mesh>
       <mesh material={shell} scale={1.55} raycast={() => null}>
@@ -2751,6 +2779,9 @@ function Scene() {
    *  - 90° = 垂直那个方向的晨昏线侧；
    *  - opts.ignoreMinDistance（t55 B3）= 把相机放进球体内部验收"进天体"，
    *    同时打开 DIAG_PLACE 开关让相机帧不再写 minDistance。只在 ?diag=1 下存在。
+   *  - opts.faceU / faceV（t56 A）= **朝贴图坐标摆机位**：把贴图上 (u, v) 那个点
+   *    转到正对相机。大红斑之所以"看不见"，是因为它的 u 在当前自转相位下朝向哪一侧
+   *    没人算得出来，靠扫方位角等于碰运气。这里直接反算。
    */
   useEffect(() => {
     if (!DIAG) return;
@@ -2759,7 +2790,7 @@ function Scene() {
       dist: number,
       azimuthDeg: number,
       elevationDeg = 12,
-      opts?: { ignoreMinDistance?: boolean },
+      opts?: { ignoreMinDistance?: boolean; faceU?: number; faceV?: number },
     ) => {
       const g = registry.current.groups.get(id);
       const body = byId[id];
@@ -2769,6 +2800,41 @@ function Scene() {
       if (DIAG_PLACE.ignoreMinDistance) controls.minDistance = 0;
       const center = new THREE.Vector3();
       g.getWorldPosition(center);
+      /*
+       * 朝贴图坐标摆位（t56 A）。three 的 SphereGeometry 参数化：
+       *   u = 0 → −X，u 增大朝 +Z（u=0.25 是 +Z），v = 0 → 北极（+Y）。
+       * 于是贴图上 (u, v) 那个点的局部方向是
+       *   (−cos(2πu)·sin(πv), cos(πv), sin(2πu)·sin(πv))
+       * 再用 `reg.spins` 那个节点的世界四元数把它转到世界空间 —— 这一枚同时包含自转
+       * 和 `rotation.z = obliquity` 的倾角，比自己乘两个矩阵稳。
+       */
+      if (opts?.faceU !== undefined) {
+        const u = opts.faceU;
+        const v = opts.faceV ?? 0.5;
+        const phi = u * Math.PI * 2;
+        const theta = v * Math.PI;
+        const local = new THREE.Vector3(
+          -Math.cos(phi) * Math.sin(theta),
+          Math.cos(theta),
+          Math.sin(phi) * Math.sin(theta),
+        ).normalize();
+        const spinNode = registry.current.spins.get(id);
+        const q = new THREE.Quaternion();
+        if (spinNode) spinNode.getWorldQuaternion(q);
+        const worldDir = local.clone().applyQuaternion(q).normalize();
+        camera.position.copy(center).addScaledVector(worldDir, dist);
+        controls.target.copy(center);
+        camera.lookAt(center);
+        return {
+          mode: "faceU",
+          id,
+          faceU: u,
+          faceV: v,
+          dist,
+          worldDir: worldDir.toArray().map((n) => +n.toFixed(4)),
+          pos: camera.position.toArray().map((n) => +n.toFixed(3)),
+        };
+      }
       // 天体 → 太阳 的方向（太阳在世界原点）
       const toSun = new THREE.Vector3().sub(center);
       if (toSun.lengthSq() < 1e-12) toSun.set(0, 0, 1);
