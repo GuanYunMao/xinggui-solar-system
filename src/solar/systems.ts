@@ -134,10 +134,13 @@ function periodFact(el: OrbitalElements): { label: string; value: string } {
 }
 
 /**
- * 三体原型（`?proto=1` 的测量夹具 + 产品实境的地月部分）。
- * 位置不再用圆轨道：六根数 → 开普勒解（见 SolarCanvas 的 Simulation）。
+ * 产品实境的地月三体（t14）：六根数 → 开普勒解（见 SolarCanvas 的 Simulation）。
+ *
+ * ⚠ **不要把它复用到 `?proto=1` 的测量夹具上**（见下面的 REAL_PROTO_BODIES）：
+ * proto-jitter 的基线依赖旧圆轨道的贴图相位；t14 实测换成根数后 modern p10–p90
+ * 从 0.073px 涨到 2.756px，夹具失去区分力（那是相位变化，不是浮点回归）。
  */
-export const REAL_PROTO_BODIES: Body[] = [
+const REAL_SYSTEM_BASE: Body[] = [
   {
     id: "sun",
     name: "太阳",
@@ -220,7 +223,7 @@ export const REAL_PROTO_BODIES: Body[] = [
  * 两份 spec 共用 `REAL_PROTO_BODIES` 的三体数据，只多两条样本 + 一个开关。
  */
 export const REAL_SYSTEM_BODIES: Body[] = [
-  ...REAL_PROTO_BODIES,
+  ...REAL_SYSTEM_BASE,
   {
     id: "pluto",
     name: "冥王星",
@@ -271,6 +274,73 @@ export const REAL_SYSTEM_BODIES: Body[] = [
       { label: "倾角", value: "162.19°（逆行）" },
       { label: "彗核", value: "约 5.5 km" },
     ],
+  },
+];
+
+/**
+ * 三体原型（`?proto=1` 的测量夹具）：太阳 / 地球 / 月球，圆形近似，单位米。
+ *
+ * ⚠ **这是测量夹具，不是产品实境**，所以保留 t14 之前的圆轨道与相位：
+ *  - proto-jitter 的 p10–p90 基线（modern 0.073px / legacy 0.434px）依赖"地球在 +X、
+ *    可见贴图相位固定"；换成开普勒位置会改变相位（t14 实测 modern 0.073 → 2.756px，
+ *    整条断言失去区分力 —— 那是相位变化，不是浮点回归）；
+ *  - proto-real 的断言数"3 个天体"也在这里；产品实境是 REAL_SYSTEM_BODIES 的 5 个。
+ * 产品实境（`mode === "real"`）用 REAL_SYSTEM，不读这套数据。
+ */
+export const REAL_PROTO_BODIES: Body[] = [
+  {
+    id: "sun",
+    name: "太阳",
+    kind: "恒星 · G2V",
+    blurb: "真实单位原型，仅用于验证相机与深度精度。",
+    radius: 6.957e8,
+    orbitRadius: 0,
+    period: 1,
+    phase: 0,
+    inclination: 0,
+    obliquity: 0,
+    spin: 0.08,
+    focus: 6.957e9,
+    swatch: "#f0c27a",
+    texture: "sun",
+    facts: [{ label: "半径", value: "695,700 km" }],
+  },
+  {
+    id: "earth",
+    name: "地球",
+    kind: "类地行星",
+    blurb: "真实单位原型。1 AU = 1.496e11 m。",
+    radius: 6.371e6,
+    orbitRadius: 1.496e11,
+    period: 18,
+    phase: 0,
+    inclination: 0,
+    obliquity: 0.408,
+    spin: 0.95,
+    parent: "sun",
+    focus: 3e7,
+    swatch: "#6aa2d8",
+    texture: "earth",
+    facts: [{ label: "轨道", value: "1.496e11 m" }],
+  },
+  {
+    id: "moon",
+    name: "月球",
+    kind: "天然卫星",
+    blurb: "真实单位原型。地月距离 3.844e8 m。",
+    radius: 1.7374e6,
+    orbitRadius: 3.844e8,
+    period: 2.55,
+    phase: 0.6,
+    inclination: 0.089,
+    obliquity: 0.117,
+    spin: 0,
+    locked: true,
+    parent: "earth",
+    focus: 1e7,
+    swatch: "#c5c1b8",
+    texture: "moon",
+    facts: [{ label: "地月距离", value: "3.844e5 km" }],
   },
 ];
 
