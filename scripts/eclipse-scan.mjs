@@ -164,8 +164,51 @@ function cameraDir(pos, id, occId) {
   return { az: +az.toFixed(2), el: +el.toFixed(2), dot: +dot3(S, E).toFixed(3) };
 }
 
+/**
+ * 与 shader **同源**的遮挡覆盖度（独立重算，不吃实现里的中间值）：
+ *   sep  = |cross(单位日向, 单位遮挡体向)| = sin θ
+ *   aSun = uSunRadius / dSun，aOcc = uOccR / dOcc（角半径）
+ *   cover = (aOcc + aSun − sep) / (2·aSun)   ≥1 全食、0–1 偏食、≤0 无食
+ * ⚠ 沙盘是**压缩几何**：`uSunRadius=3.8`、日距≈15 ⇒ 太阳角半径 ~14.5°，不是真世界的 0.27°。
+ *   所以"dot=0.9（夹角 25.7°）"在沙盘里完全可能是一次真偏食——判"算不算食"必须用本模型的角半径。
+ */
+const geometryOf = (pos, id, occId, radii) => {
+  const S = sub(pos.sun ?? pos.sol, pos[id]);
+  const E = sub(pos[occId], pos[id]);
+  const dSun = Math.hypot(...S);
+  const dOcc = Math.hypot(...E);
+  const Su = norm(S);
+  const Eu = norm(E);
+  if (!Su || !Eu) return null;
+  const sep = Math.hypot(...cross(Su, Eu));
+  const aSun = radii.sun / dSun;
+  const aOcc = radii[occId] / dOcc;
+  const cover = (aOcc + aSun - sep) / (2 * aSun);
+  return {
+    dot: +dot3(Su, Eu).toFixed(3),
+    sep: +sep.toFixed(4),
+    aSunDeg: +((aSun * 180) / Math.PI).toFixed(2),
+    aOccDeg: +((aOcc * 180) / Math.PI).toFixed(2),
+    cover: +cover.toFixed(3),
+    dSun: +dSun.toFixed(3),
+    dOcc: +dOcc.toFixed(3),
+  };
+};
 const sample = async (id, t, occId) => {
   const pos = await worldAt(t);
+  const radii = await page.evaluate(({ ids }) => {
+    const cam = window.__solarCamera();
+    const canvas = document.querySelector("canvas");
+    const H = canvas.clientHeight;
+    const tanHalf = Math.tan((cam.fov * Math.PI) / 360);
+    const out = {};
+    for (const id of ids) {
+      const c = window.__solarPick?.candidates?.().find((x) => x.id === id);
+      out[id] = c && c.depth > 0 ? (c.radiusPx * c.depth * tanHalf * 2) / H : null;
+    }
+    return out;
+  }, { ids: [id, occId, "sun"] });
+  const geo = radii.sun != null && radii[occId] != null ? geometryOf(pos, id, occId, radii) : null;
   const dirInfo = cameraDir(pos, id, occId);
   if (!dirInfo) return { available: false, reason: "几何算不出机位方向（位置缺失）" };
   const stable = await stableBody(id);
@@ -229,29 +272,51 @@ const sample = async (id, t, occId) => {
 const out = { base: BASE, site: SITE, pairs: [], errors: [] };
 for (const [id, occ] of PAIRS) {
   // ① 扫一个轨道周期，按**实测 dot** 归组
-  const buckets = { plus: [], minus: [], zero: [] };
+  // 半径先量一次（产品里是常量，但**从 candidates 反推**而不是抄常数表）
+  const radii0 = await page.evaluate(({ ids }) => {
+    const cam = window.__solarCamera();
+    const H = document.querySelector("canvas").clientHeight;
+    const tanHalf = Math.tan((cam.fov * Math.PI) / 360);
+    const out = {};
+    for (const id of ids) {
+      const c = window.__solarPick?.candidates?.().find((x) => x.id === id);
+      out[id] = c && c.depth > 0 ? (c.radiusPx * c.depth * tanHalf * 2) / H : null;
+    }
+    return out;
+  }, { ids: [id, occ, "sun"] });
+
+  /*
+   * 分组用 **cover（与 shader 同源的遮挡覆盖度）**，不用 `dot` 拍阈值：
+   *   cover ≥ 1 全食 / 0–1 偏食 / ≤ 0 无食。
+   * 为什么：`dot=0.9` 在真世界是 25.7°（绝无食），在**沙盘压缩几何**里却是真偏食
+   * （太阳角半径 ~14.5°，地球在月距处 ~22°）。用本模型的角半径算 cover，
+   * 才分得清"该暗"与"不该暗"，也才谈得上阈值从分布取。
+   */
+  const buckets = { total: [], partial: [], none: [] };
   for (let t = 0; t <= SWEEP_END + 1e-9; t += SWEEP_STEP) {
     const tt = +t.toFixed(3);
     const pos = await worldAt(tt);
-    const d = dotSunOcc(pos, id, occ);
-    if (d === null) continue;
-    const g = d > 0.9 ? "plus" : d < -0.9 ? "minus" : Math.abs(d) < 0.1 ? "zero" : null;
-    if (g) buckets[g].push({ t: tt, dot: +d.toFixed(3) });
+    if (!radii0.sun || !radii0[occ]) continue;
+    const g0 = geometryOf(pos, id, occ, radii0);
+    if (!g0) continue;
+    const g = g0.cover >= 1 ? "total" : g0.cover <= 0 ? "none" : "partial";
+    buckets[g].push({ t: tt, dot: g0.dot, cover: g0.cover, geo: g0 });
   }
+  const GROUP_LABEL = { total: "全食(cover≥1)", none: "无食(cover≤0)", partial: "偏食(0<cover<1)" };
   const pick = (arr) => {
     if (arr.length <= PER_GROUP) return arr;
     const step = (arr.length - 1) / (PER_GROUP - 1);
     return Array.from({ length: PER_GROUP }, (_, i) => arr[Math.round(i * step)]);
   };
   const rec = { pair: `${id}:${occ}`, groups: {} };
-  for (const g of ["plus", "zero", "minus"]) {
+  for (const g of ["total", "none", "partial"]) {
     const chosen = pick(buckets[g]);
     const rows = [];
     const fails = [];
     for (const c of chosen) {
       const m = await sample(id, c.t, occ);
       if (!m.available) fails.push({ t: c.t, reason: m.reason || "unknown" });
-      if (m.available) rows.push({ t: c.t, dot: c.dot, diskMean: m.diskMean, el: m.placed?.elevationDeg ?? null, az: m.placed?.azimuthDeg ?? null });
+      if (m.available) rows.push({ t: c.t, dot: c.dot, cover: c.cover, diskMean: m.diskMean, el: m.placed?.elevationDeg ?? null, az: m.placed?.azimuthDeg ?? null, geo: c.geo ?? null });
     }
     const v = rows.map((r) => r.diskMean).sort((a, b) => a - b);
     rec.groups[g] = {
@@ -263,10 +328,10 @@ for (const [id, occ] of PAIRS) {
       failures: fails,
     };
   }
-  const zeroMed = rec.groups.zero.median;
-  for (const g of ["plus", "minus"]) {
+  const zeroMed = rec.groups.none.median;
+  for (const g of ["total", "none"]) {
     const b = rec.groups[g];
-    b.ratioToZero = {
+    b.ratioToNone = {
       min: zeroMed && b.min !== null ? +(b.min / zeroMed).toFixed(3) : null,
       max: zeroMed && b.max !== null ? +(b.max / zeroMed).toFixed(3) : null,
       median: zeroMed && b.median !== null ? +(b.median / zeroMed).toFixed(3) : null,
@@ -274,9 +339,9 @@ for (const [id, occ] of PAIRS) {
   }
   out.pairs.push(rec);
   console.log(
-    `${rec.pair}  plus ${rec.groups.plus.n}帧 [${rec.groups.plus.min}–${rec.groups.plus.max}] 中位 ${rec.groups.plus.median}（对参照 ${JSON.stringify(rec.groups.plus.ratioToZero)}）` +
-      `  |  minus ${rec.groups.minus.n}帧 [${rec.groups.minus.min}–${rec.groups.minus.max}] 中位 ${rec.groups.minus.median}（对参照 ${JSON.stringify(rec.groups.minus.ratioToZero)}）` +
-      `  |  zero 中位 ${zeroMed}`,
+    `${rec.pair}  plus ${rec.groups.total.n}帧 [${rec.groups.total.min}–${rec.groups.total.max}] 中位 ${rec.groups.total.median}（对参照 ${JSON.stringify(rec.groups.total.ratioToNone)}）` +
+      `  |  none ${rec.groups.none.n}帧 [${rec.groups.none.min}–${rec.groups.none.max}] 中位 ${rec.groups.none.median}` +
+      `  |  partial ${rec.groups.partial.n}帧 中位 ${rec.groups.partial.median}`,
   );
 }
 out.errors = errors.slice(0, 8);
