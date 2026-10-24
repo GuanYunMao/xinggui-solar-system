@@ -2422,6 +2422,13 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       controls.target.copy(scratch.target);
       camera.position.copy(scratch.pos);
       /*
+       * t19（1/3）：过渡路径不得穿越天体。
+       * t4 实测：点月球后的 0.95s 动画里 clampOutsideParent 不跑，相机穿过地球
+       * （地心距离 0.528 / 0.570 / 0.977，地球半径 0.76）。跟随模式每帧有钳制，过渡没有。
+       * 先单独提交这一条，不与后面的 slerp 混在一起 —— 它自己就能判红/判绿。
+       */
+      clampAnimationPath(current.home ? null : current.toId);
+      /*
        * 朝向必须跟着走。
        *
        * 之前漏了这一步，表现就是用户报的"点总览先飞进深空再瞬切回总览"：
@@ -2503,6 +2510,32 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      */
     clampOutsideParent(id);
   }, -2);
+
+  /**
+   * t19（1/3）：过渡路径的硬钳制。
+   *
+   * 为什么硬钳而不是像跟随那样每帧走 35%：验收量的是「过渡全程 nearest.dist ≥ radius」，
+   * 软钳在"刚进入球面"的那几帧仍然 < radius —— 那正是这条判据会红的样子。
+   * 过渡是一次性路径，硬钳只在真的穿越时发生；观感是"擦着球面滑过去"，不是穿模。
+   *
+   * 跳过目标本体：相机本来就要靠近它（target.focus > radius），不该被推回去。
+   * 跳过 home 的目标（null）：回总览没有目标本体。
+   */
+  function clampAnimationPath(skipId: string | null) {
+    for (const b of bodies) {
+      if (b.id === skipId || !(b.radius > 0)) continue;
+      const g = reg.groups.get(b.id);
+      if (!g) continue;
+      g.getWorldPosition(scratch.delta);
+      const minD = b.radius * 1.12;
+      scratch.pos.copy(camera.position).sub(scratch.delta);
+      const d = scratch.pos.length();
+      if (d >= minD) continue;
+      if (d < 1e-6) scratch.pos.set(0, 1, 0);
+      else scratch.pos.multiplyScalar(1 / d);
+      camera.position.copy(scratch.delta).addScaledVector(scratch.pos, minD);
+    }
+  }
 
   /**
    * 把相机从母天体的球体里**滑**出来（t47 改了连续性）。
