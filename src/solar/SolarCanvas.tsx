@@ -1,4 +1,4 @@
-import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
@@ -538,19 +538,24 @@ function Rings({ body }: { body: Body }) {
   useEffect(() => () => mat?.dispose(), [mat]);
   if (!rings || !mat) return null;
   return (
-    <mesh rotation={[Math.PI / 2, 0, 0]} material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
+    <mesh rotation={[Math.PI / 2, 0, 0]} material={mat}>
       <ringGeometry args={[rings.inner, rings.outer, 160]} />
     </mesh>
   );
 }
 
-function setPointer(e: ThreeEvent<PointerEvent>) {
-  e.stopPropagation();
-  document.body.style.cursor = "pointer";
+/*
+ * 光标状态由 PickLayer 统一驱动（屏幕空间判定），不再由网格的 onPointerOver 触发。
+ * 旧写法是逐 mesh 射线悬停：远处天体只有几像素，射线打不中 → 光标不出现，
+ * 但点下去却有效（点击走的是 22px 热区）。"能点的范围"和"会变手型的范围"
+ * 必须是同一个判定，否则就是这种时灵时不灵的错觉。
+ */
+function markPointer() {
+  if (document.body.style.cursor !== "pointer") document.body.style.cursor = "pointer";
 }
 
 function clearPointer() {
-  document.body.style.cursor = "";
+  if (document.body.style.cursor) document.body.style.cursor = "";
 }
 
 function SunSurface({ body }: { body: Body }) {
@@ -610,7 +615,7 @@ function SunSurface({ body }: { body: Body }) {
   return (
     <group>
       <primitive object={sprite} />
-      <mesh material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
+      <mesh material={mat}>
         <sphereGeometry args={[body.radius, 64, 48]} />
       </mesh>
       <mesh material={shell} scale={1.55} raycast={() => null}>
@@ -667,7 +672,7 @@ function PlanetSurface({ body }: { body: Body }) {
   const seg = hiFi ? 128 : body.radius > 1.4 ? 56 : body.radius > 0.4 ? 40 : 24;
   return (
     <>
-      <mesh material={mat} onPointerOver={setPointer} onPointerOut={clearPointer}>
+      <mesh material={mat}>
         <sphereGeometry args={[body.radius, seg, Math.max(16, Math.round(seg * 0.7))]} />
       </mesh>
       {cloudMat && (
@@ -686,14 +691,22 @@ function PlanetSurface({ body }: { body: Body }) {
   );
 }
 
-function SelectionRing({ radius }: { radius: number }) {
-  return (
-    <mesh rotation={[Math.PI / 2, 0, 0]} raycast={() => null}>
-      <torusGeometry args={[radius * 1.72, Math.max(0.012, radius * 0.03), 8, 72]} />
-      <meshBasicMaterial color="#e8edf4" transparent opacity={0.78} />
-    </mesh>
-  );
-}
+/*
+ * 这里原本有一个 `SelectionRing`：选中天体时在黄道面上画一个 torus
+ * （半径 1.72×天体半径、管径 3%、72 段）。已删除。
+ *
+ * 判断它"不该存在"的理由，按分量排序：
+ * 1. **它和真实行星环长得一样。** 木星被选中时那圈白环，与画面右上角天王星
+ *    自带的真环（data.ts 里 uranus.rings）在几何上是同一个东西；土星更是自带
+ *    两圈。一个"选中提示"长得像天体物理特征，是让玩家误读，不是提示。
+ * 2. **它是冗余的。** 选中状态已经有三处在说：详情卡弹出、芯片行高亮、
+ *    标签转强调色（`.star-label.is-selected`）。
+ * 3. **它横切画面。** torus 固定在黄道面上，相机飞近后它必然以一个大椭圆
+ *    穿过视野，看起来像场景里的几何而不是 UI。
+ *
+ * 所以不是"太粗太亮"的问题，是这个视觉语汇本身选错了：选择态应该用
+ * 界面语汇（标签/卡片/芯片），不该用几何体。
+ */
 
 function BodyNode({
   body,
@@ -719,7 +732,6 @@ function BodyNode({
         else reg.groups.delete(body.id);
       }}
     >
-      {selected && <SelectionRing radius={body.radius} />}
       <group rotation={[0, 0, body.obliquity]}>
         <group
           ref={(node) => {
@@ -1386,6 +1398,40 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       }
       controls.target.copy(scratch.target);
       camera.position.copy(scratch.pos);
+      /*
+       * 朝向必须跟着走。
+       *
+       * 之前漏了这一步，表现就是用户报的"点总览先飞进深空再瞬切回总览"：
+       * 相机被搬到 home 位置，但四元数还停在原来的朝向 —— 镜头一边飞一边看着别处，
+       * 屏幕上就是空天区；等动画结束 `controls.enabled` 恢复、drei 的 update() 跑一拍，
+       * 朝向才被瞬间掰正，于是"瞬切"。
+       *
+       * 为什么以前没暴露：startFocus 在 t18 才把 `controls.enabled` 关掉（为了不让
+       * OrbitControls 的 maxDistance=280 夹取和长距离动画打架）。以前 update() 每帧都跑，
+       * 顺带把朝向对准了 target，这个缺失被掩盖着。
+       *
+       * 现在动画期间由我们独占相机，就由我们负责朝向 —— 位置和朝向同一个进度 u，
+       * 结束那一刻不会再有"对齐"动作。
+       */
+      camera.lookAt(scratch.target);
+      if (DIAG) {
+        // 诊断：动画期间相机朝向是否跟着目标走。
+        // angle 大 = 镜头在"一边飞一边看着别处"，那就是"先飞进深空再瞬切"的成因。
+        const fwd = new THREE.Vector3();
+        camera.getWorldDirection(fwd);
+        const toTarget = scratch.target.clone().sub(camera.position).normalize();
+        const angle = THREE.MathUtils.radToDeg(Math.acos(Math.min(1, Math.max(-1, fwd.dot(toTarget)))));
+        console.log(
+          "[anim]",
+          JSON.stringify({
+            u: +u.toFixed(2),
+            pos: camera.position.toArray().map((n) => +n.toFixed(1)),
+            target: scratch.target.toArray().map((n) => +n.toFixed(1)),
+            lookOffDeg: +angle.toFixed(1),
+            enabled: controls.enabled,
+          }),
+        );
+      }
       if (u >= 1) {
         anim.current = null;
         /*
@@ -1747,6 +1793,59 @@ function PickLayer() {
 
     el.addEventListener("pointerup", onUp);
 
+    /*
+     * 光标与点击共用同一个判定。
+     *
+     * 旧写法问题：光标由逐 mesh 的 `onPointerOver`（R3F 射线打真实网格）驱动，
+     * 点击走屏幕空间的 22px 热区。远处天体只有一两像素，射线打不中 → 光标不出现，
+     * 可是点下去照样选中 —— "能点的范围"和"会变手型的范围"不是同一个，用户看到的就是
+     * 时灵时不灵。
+     *
+     * 现在：pointermove 只记坐标，真正的判定摊到下一个 rAF 里做一次。
+     * 这样高频移动不会每个事件都投影一遍（15 个天体一次投影是微秒级，但没必要乘以事件率）。
+     */
+    let hoverX = 0;
+    let hoverY = 0;
+    let hoverRaf = 0;
+
+    const runHover = () => {
+      hoverRaf = 0;
+      // 拖拽中不显示手型：那是在转视角，不是在瞄准
+      if (dragGuard.active && dragGuard.moved) {
+        clearPointer();
+        return;
+      }
+      const id = resolvePick(candidates(), hoverX, hoverY);
+      if (id) markPointer();
+      else clearPointer();
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      const rect = el.getBoundingClientRect();
+      hoverX = ev.clientX - rect.left;
+      hoverY = ev.clientY - rect.top;
+      if (dragGuard.active && dragGuard.moved) {
+        if (hoverRaf) {
+          cancelAnimationFrame(hoverRaf);
+          hoverRaf = 0;
+        }
+        clearPointer();
+        return;
+      }
+      if (!hoverRaf) hoverRaf = requestAnimationFrame(runHover);
+    };
+
+    const onLeave = () => {
+      if (hoverRaf) {
+        cancelAnimationFrame(hoverRaf);
+        hoverRaf = 0;
+      }
+      clearPointer();
+    };
+
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerleave", onLeave);
+
     // 验收钩子：坐标 → 命中 id、全量候选、热区半径
     const api = {
       at: (px: number, py: number) => resolvePick(candidates(), px, py),
@@ -1757,6 +1856,9 @@ function PickLayer() {
 
     return () => {
       el.removeEventListener("pointerup", onUp);
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerleave", onLeave);
+      if (hoverRaf) cancelAnimationFrame(hoverRaf);
       delete (window as unknown as { __solarPick?: typeof api }).__solarPick;
     };
   }, [camera, gl, reg, bodies]);
