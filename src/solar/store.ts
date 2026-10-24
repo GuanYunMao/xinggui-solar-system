@@ -74,6 +74,12 @@ export const SPEED_MIN = 0.05;
 /** 滑条上限：8× = 8 天/秒。 */
 export const SPEED_MAX = 8;
 
+/**
+ * 开局倍率：取档位顶端（8×）。理由见 initialState 里那段注释 —— 一句话：
+ * 1× 在总览里看起来像卡死，而 20.29×（旧观感）不在档位里，硬设会让旋钮与读数打架。
+ */
+export const DEFAULT_SPEED = SPEED_MAX;
+
 /** 年长（供显示层取整用，别再各写一个 365）。 */
 export function daysPerYear() {
   return DAYS_PER_YEAR;
@@ -233,7 +239,16 @@ export const useSim = create<SimStore>((set, get) => {
 
   return {
   paused: false,
-  speed: 1,
+  /*
+   * 默认倍率 = 8×（t44 补丁，captain 定：第一印象不能是"行星不动"）。
+   *
+   * 新口径下 1× = 365 秒绕地球一圈，直接开局会被当成卡死。旧版默认是 18 秒一圈，
+   * 换成新口径是 20.29× —— 但 20 不在滑条档位里（0.05/0.1/0.2/0.5/1/2/4/8），
+   * 硬设 20 会让旋钮停在 8、读数写 20，两者打架。所以取档位顶端的 8×（45.7 秒一圈）：
+   * 旋钮在最右、读数写 ×8，玩家看到的仍是"在转"，只是比旧版慢 2.5 倍。
+   * 要还原旧观感（20.29×）得给滑条加一档 20，那是 HUD 侧的改动，等 designer 点头。
+   */
+  speed: DEFAULT_SPEED,
   showLabels: true,
   showOrbits: true,
   showTrails: true,
@@ -245,7 +260,7 @@ export const useSim = create<SimStore>((set, get) => {
   everReset: false,
   mode: "sandbox",
   switching: null,
-  prevSpeed: 1,
+  prevSpeed: DEFAULT_SPEED,
   queuedSelectId: null,
   gateLit: [],
   gateUnlocked: false,
@@ -361,7 +376,7 @@ export const useSim = create<SimStore>((set, get) => {
     set({
       mode: "sandbox",
       switching: "toSandbox",
-      speed: s.prevSpeed || 1,
+      speed: s.prevSpeed || DEFAULT_SPEED,
       selectedId: s.selectedId,
       resetToken: s.resetToken + 1,
     });
@@ -382,7 +397,7 @@ export const useSim = create<SimStore>((set, get) => {
 
   hydrate: (settings) =>
     set({
-      speed: clampSpeed(settings.speed ?? 1),
+      speed: clampSpeed(settings.speed ?? DEFAULT_SPEED),
       showLabels: settings.showLabels ?? true,
       showOrbits: settings.showOrbits ?? true,
       showTrails: settings.showTrails ?? true,
