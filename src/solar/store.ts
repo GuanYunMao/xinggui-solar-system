@@ -29,7 +29,69 @@ type Settings = {
 
 function clampSpeed(value: number) {
   if (!Number.isFinite(value)) return 1;
-  return Math.min(8, Math.max(0.2, value));
+  return Math.min(SPEED_MAX, Math.max(SPEED_MIN, value));
+}
+
+/**
+ * 时间基准（t44，唯一的换算处）。
+ *
+ * 用户的原话是「1.0 倍的时候，速度是正常时间流逝的不知道多少倍了」—— 旧口径里 `1.0×`
+ * 只是"没乘系数"：地球 18 秒一圈，等于 1 实秒 = 20.3 天 = 实时的 175 万倍。名字在骗人。
+ *
+ * 现在的定义：**`1.0×` = 1 实秒 = 1 模拟日 = 86,400 倍实时**。于是地球一圈 = 365.25 秒（约 6 分钟）。
+ * 换算只有下面这一处：
+ *
+ *   simSeconds 每实秒 += speed × SECONDS_PER_SIM_SECOND
+ *   SECONDS_PER_SIM_SECOND = EARTH_PERIOD / DAYS_PER_YEAR   （= 18 / 365.25 ≈ 0.04928）
+ *
+ * 为什么除的是 EARTH_PERIOD：沙盘的轨道周期（data.ts）是以「模拟秒」为单位的压缩量，
+ * EARTH_PERIOD 秒 = 地球一圈 = 一年。要把"一年"摊到 365.25 秒实时上，就只能按这个比例缩。
+ * 各天体的**相对**速度因此一点没变（木星 11.9 年、土星 29.5 年这些比例仍在 data.ts 里）。
+ */
+export const SECONDS_PER_DAY = 86400;
+
+/**
+ * 模拟历的年长：**365.25 天**（t44 定案）。
+ *
+ * 为什么不定成 365：项目对外说的是"真实太阳系"，而 `daysOf` 从 t28 起就用 365.25 把
+ * 「EARTH_PERIOD 秒 = 一年」摊开。定成 365 会立刻出现两张皮：1 实秒推进的天数比 1 天多
+ * 0.07%，一年差 0.25 天，一百年差 25 天 —— 现在看不出来，接真实星历那天一定打架。
+ *
+ * 代价是"日"不再是整数：内部一律保留小数（`simSeconds` 本来就是浮点），
+ * **取整只发生在显示层**：年 = floor(days / DAYS_PER_YEAR)，日 = floor(days % DAYS_PER_YEAR) + 1。
+ * 显示层（Hud）以前各写了一遍 365，现在应该只 import 这一个常量 —— 见 `daysPerYear()` 的注释。
+ */
+export const DAYS_PER_YEAR = 365.25;
+
+/** 一个模拟秒等于多少模拟日（= 1 / SECONDS_PER_SIM_SECOND 的倒数关系见下）。 */
+export const DAYS_PER_SIM_SECOND = DAYS_PER_YEAR / EARTH_PERIOD;
+
+/** 一实秒（speed = 1）推进多少模拟秒。 */
+export const SECONDS_PER_SIM_SECOND = 1 / DAYS_PER_SIM_SECOND;
+
+/** 滑条下限：1.0× = 1 天/秒，0.05× = 1.2 小时/秒（t44 从 0.2× 下探）。 */
+export const SPEED_MIN = 0.05;
+/** 滑条上限：8× = 8 天/秒。 */
+export const SPEED_MAX = 8;
+
+/** 年长（供显示层取整用，别再各写一个 365）。 */
+export function daysPerYear() {
+  return DAYS_PER_YEAR;
+}
+
+/** 一实秒推进多少个模拟日（1.0× 时恰好 = 1 天）。HUD 直接用它拼「1 秒 = N 天」。 */
+export function daysPerRealSecond(speed = 1) {
+  return DAYS_PER_SIM_SECOND * secondsPerRealSecond(speed);
+}
+
+/** 一实秒推进多少模拟秒（物理量，不是天数）。 */
+export function secondsPerRealSecond(speed = 1) {
+  return SECONDS_PER_SIM_SECOND * speed;
+}
+
+/** 地球绕一圈要多少实秒（= 一年 / 速率）—— 验收和 HUD 都用这一个口径。 */
+export function earthLapSeconds(speed = 1) {
+  return EARTH_PERIOD / secondsPerRealSecond(speed);
 }
 
 /**
@@ -41,9 +103,13 @@ function clampSpeed(value: number) {
  */
 export const SIM_EPOCH_MS = Date.UTC(2000, 0, 1, 12);
 
-/** 模拟秒 → HUD 的「第 N 日」（压缩时间轴：EARTH_PERIOD 秒 = 365.25 日）。 */
+/**
+ * 模拟秒 → HUD 的「第 N 日」。
+ * 口径：EARTH_PERIOD 模拟秒 = 一个地球年 = `DAYS_PER_YEAR` 天（365.25）。
+ * 这里只做换算，**不取整** —— 取整是显示层的事（见 DAYS_PER_YEAR 的注释）。
+ */
 export function daysOf(simSeconds: number) {
-  return (simSeconds / EARTH_PERIOD) * 365.25;
+  return simSeconds * DAYS_PER_SIM_SECOND;
 }
 
 /**
@@ -240,7 +306,8 @@ export const useSim = create<SimStore>((set, get) => {
   advanceSim: (dt) => {
     const s = get();
     if (s.paused) return;
-    const next = s.simSeconds + dt * s.speed;
+    // 时间基准：`dt`（实秒）× speed × SECONDS_PER_SIM_SECOND（t44 定的 1.0× = 1 天/秒）
+    const next = s.simSeconds + dt * s.speed * SECONDS_PER_SIM_SECOND;
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (now - lastDaysWrite >= 250) {
       lastDaysWrite = now;
@@ -254,6 +321,12 @@ export const useSim = create<SimStore>((set, get) => {
   },
 
   setSimTime: (when) => {
+    /*
+     * 切换动画期间不许跳时间（t44）。`setSpeed` / `togglePaused` 早就守了这一条，
+     * `setSimTime` 漏了 —— UI 层虽然 disable 了入口，但绕过 UI 直接调 store 就能在
+     * 相机动画中途跳时间。锁定期间时间轴不该被动，跟"锁定期间不能改速度"同一个理由。
+     */
+    if (get().switching) return;
     const seconds = typeof when === "number" ? when : (when.getTime() - SIM_EPOCH_MS) / 1000;
     // 非有限值一律不写：钟停着是"没反应"，写进去会让整条时间轴变 NaN，
     // 之后每个天体的位置、每个投影都是 NaN —— 那比不动难查一百倍。
