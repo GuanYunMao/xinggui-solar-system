@@ -46,12 +46,8 @@ npm run check          # = 单文件冒烟（起真浏览器，要 Edge）+ 形�
 | `hud-card-bar` | 收起档 `article` 高 ≤ `7rem`（按运行时根字号换算，非写死 112）、computed `max-height` = 7rem、标题仍是「地球」 | **结构量**（设计值换算） | `SHEET_MAX.bar` 被改大；标题没了说明收起变成了卸载 |
 | `hud-chips` | 星球列表收起⇄展开⇄收起：`aria-expanded` 三态、文本「全部 N」⇄「收起」、`flex-wrap` nowrap⇄wrap、展开后横向溢出 ≤1px、行高增量 >20px | **结构量**（同次自比，不写死 48/148） | 展开不换行 → 仍 nowrap；行高没变 → `open` 状态没接上 |
 | `hud-header` | 模拟历：非空、未 `display:none`、**完整在视口内**、不被左侧品牌组压住；抬头自身横向溢出 ≤1px；**窄屏(<640) 版本号必须让位**（`.eyebrow` display:none）。两格样本：390 锁态 + 390 已校准 | **结构量**（几何关系 + 二值） | 越界/被压 → 抬头里又塞了宽控件；版本号可见 → `hidden` 被摘 |
+| `pointer-misselection` | Space 暂停后，找「小天体盘外 6px、`elementFromPoint===CANVAS`、`__solarPick.at()` 命中同一 id」的点 → 按住 `#chip-jupiter` 拖到该点松手 → **`?body=` 不变、无 `aria-pressed=true` 芯片、无 `article`**。两条对照：正常点地球必须选中；画布拖 40px 必须不选 | **结构量**（URL 参数 + DOM 存在性，无阈值） | 若红：`PickLayer.onUp` 的 `pressed` 守卫（`if (!wasPressed) return`）失效了——「按下在 HUD、抬起在画布」被当成点击（t11 D1 复发） |
 | `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏）、**画布不是全黑**、dpr 红线 | 结构性 + 像素 | 该条 `errors`；漏资源会在控制台报 404 |
-
-> **历史（别删）**：`hud-*` 这五条在引入之前是 **0/5 被守**——五条交互在 1.2.1 里全都工作，
-> 但删掉 `skipClick`、把 `SHEET_MAX.bar` 改回 `28dvh`、把 `.eyebrow` 放出来，verify 和 CI 都会全绿。
-> 现在每条都做过一次反向验证：在产物副本里把被测行为打坏，对应断言必须红（五个案例全部红在各自判据上）。
-> 反向验证的入口是 `XG_ONLY=mobile,mobile-selected`：只跑带夹具的那两页，十几秒一轮。
 | `frame-time` | 稳态帧时间相对**本次运行的机器基线**的比值 | **数值** | `results[frame-time].normalized`，见下节 |
 | `hit-matrix` | 探针投影出的天体数（判）；屏幕重叠对数（**只记录**） | **数值** | 见下面「哪些数字不许当判据」 |
 | `follow-jitter` | 选中地球后 90 帧，目标屏幕位置峰峰值 < 0.5px | **数值** | 抖动说明相机跟随里混进了逐帧噪声 |
@@ -61,6 +57,13 @@ npm run check          # = 单文件冒烟（起真浏览器，要 Edge）+ 形�
 | `sun-occlusion` | 跟随木星、把太阳转到木星盘面中心后，**中心 24×24 平均亮度 ≤ 60** | **结构量** | 见下节「太阳遮挡 / 启动分期 / 相机避让」 |
 | `boot-stage` | `?bootstage=1\|2\|3` 每期挂到的天体数、ready 时小行星带是否已挂；**长任务只记录** | 半结构（长任务只记录） | 同上 |
 | `camera-clearance` | 跟随月球 **≥3 个周期**：相机到地心距离（**分窗口**）、单帧跳变、是否进天体内部；外加点月球后 0–3s 的过渡段（钉三相位） | **结构量**（第 2 周期起 `min ≥ 1.0`）；第 1 周期与跳变只记录；过渡段**记录**，见「已知缺陷」 | 第 2 周期起 min < 1.0 → 软滑出/跟随退化；过渡段越界查「已知缺陷」 |
+
+> **历史（别删）**：`hud-*` 那五条与 `pointer-misselection` 在引入之前都是 **0 条断言在守**——
+> 五条手机交互在 1.2.1 里全都工作，但删掉 `skipClick`、把 `SHEET_MAX.bar` 改回 `28dvh`、
+> 把 `.eyebrow` 放出来，verify 和 CI 都会全绿；而「在芯片上按下、拖到画布空白松手」这条误选手势
+> 从 t11 查出根因到 t18 修好，**全程没有一条断言会红**。
+> 现在每一条都做过反向验证：在产物副本里把被测行为打坏，对应断言必须红。
+> 反向验证入口：`XG_ONLY=mobile,mobile-selected`（两条手机页）与 `XG_ONLY=pointer-misselection`（误选那条）。
 
 数值断言一共 9 条 —— `frame-time` / `hit-matrix` / `follow-jitter` / `proto-real` / `proto-jitter` /
 `zoom-budget` / `sun-occlusion` / `boot-stage` / `camera-clearance`

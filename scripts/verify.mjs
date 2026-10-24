@@ -762,6 +762,135 @@ function judgeHudLocked(hud) {
   }
 }
 
+// ——— 点击误选（t11 D1 / t18-B）：按下在 HUD、松手在画布空白，不许选中 ————————
+// 病根（t11 实测）：`PickLayer.onUp` 只看"拖没拖"，不看"这次抬起之前在不在画布上按下"。
+// 于是在芯片上按下、拖到画布空白松手，会用旧状态选中松手点下的天体——按的是木星、亮的是水星。
+// t18 用 `pressed` 守卫（`if (!wasPressed) return`）修掉它；这条断言就是给那个守卫上锁。
+//
+// 判据全结构量、无阈值：`?body=` 不变、无 `aria-pressed=true` 的芯片、无 `article`。
+// 找不到合格夹具点 → **只记录不判红**并写 available:false + 原因（宁可标环境不可用，也不许空跑变绿）。
+const PICKER_EMPTY_OFFSET = 6; // 盘外 6px：落在 22px 热区内（at() 会命中），但在盘面之外
+
+async function findPickerFixture(page) {
+  return page.evaluate((offset) => {
+    const cs = window.__solarPick?.candidates?.() ?? [];
+    const small = cs.map((c) => ({ id: c.id, x: c.x, y: c.y, r: c.r ?? c.radiusPx ?? 0 })).filter((c) => c.r > 0 && c.r < 12);
+    for (const c of small) {
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const x = c.x + dx * (c.r + offset);
+        const y = c.y + dy * (c.r + offset);
+        if (x < 2 || y < 2) continue;
+        const el = document.elementFromPoint(x, y);
+        const hit = window.__solarPick.at(x, y);
+        // 两个条件必须同时成立：点在画布上（不是 HUD 覆盖），且 at() 命中同一颗小天体
+        if (el && el.tagName === "CANVAS" && hit === c.id) return { x, y, id: c.id, radiusPx: +c.r.toFixed(2) };
+      }
+    }
+    return null;
+  }, PICKER_EMPTY_OFFSET);
+}
+
+const pickerState = (page) =>
+  page.evaluate(() => ({
+    body: new URL(location.href).searchParams.get("body"),
+    article: document.querySelectorAll("article").length,
+    pressedChips: document.querySelectorAll('#chip-row button[aria-pressed="true"]').length,
+  }));
+
+async function runPickerGesture(page, context) {
+  // 先移动指针把 chrome 唤醒（t12 自动收起会在静置 2s 后把芯片行从 DOM 拿掉）
+  await page.mouse.move(300, 40);
+  await page.waitForSelector("#chip-jupiter", { state: "visible", timeout: 5000 });
+  // Space 暂停：天体在动的话夹具点会漂走
+  await page.keyboard.press("Space");
+  await page.waitForTimeout(250);
+  const t0 = await page.evaluate(() => window.__solarTime.now());
+  await page.waitForTimeout(300);
+  const t1 = await page.evaluate(() => window.__solarTime.now());
+  const paused = Math.abs(t1 - t0) < 1e-6;
+
+  const fixture = await findPickerFixture(page);
+  const before = await pickerState(page);
+  const out = { paused, fixture, before };
+
+  if (fixture) {
+    const chip = await page.locator("#chip-jupiter").boundingBox();
+    const cdp = await context.newCDPSession(page);
+    const from = chip ? { x: chip.x + chip.width / 2, y: chip.y + chip.height / 2 } : null;
+    if (from) {
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1 });
+      const steps = 8;
+      for (let i = 1; i <= steps; i++) {
+        const k = i / steps;
+        await cdp.send("Input.dispatchMouseEvent", {
+          type: "mouseMoved",
+          x: from.x + (fixture.x - from.x) * k,
+          y: from.y + (fixture.y - from.y) * k,
+          button: "left",
+        });
+        await page.waitForTimeout(16);
+      }
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: fixture.x, y: fixture.y, button: "left", clickCount: 1 });
+      await page.waitForTimeout(400);
+    }
+    out.from = from;
+    out.after = await pickerState(page);
+  }
+
+  // 对照 1：正常点地球必须选中（否则这条断言会"什么都不选也绿"）
+  await page.mouse.move(300, 40);
+  await page.waitForSelector("#chip-earth", { state: "visible", timeout: 5000 });
+  await page.locator("#chip-earth").click({ timeout: 8000, force: true });
+  await page.waitForTimeout(500);
+  out.controlClickEarth = await pickerState(page);
+
+  // 对照 2：在画布空白上拖 40px 必须不选（正常拖拽没被误伤）
+  const start = { x: 640, y: 300 };
+  const cdp2 = await context.newCDPSession(page);
+  await cdp2.send("Input.dispatchMouseEvent", { type: "mousePressed", x: start.x, y: start.y, button: "left", clickCount: 1 });
+  for (let i = 1; i <= 6; i++) {
+    await cdp2.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: start.x + (40 * i) / 6, y: start.y, button: "left" });
+    await page.waitForTimeout(16);
+  }
+  await cdp2.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: start.x + 40, y: start.y, button: "left", clickCount: 1 });
+  await page.waitForTimeout(400);
+  out.controlCanvasDrag = await pickerState(page);
+  return out;
+}
+
+function judgePickerGesture(gesture) {
+  const name = "pointer-misselection";
+  if (!gesture.paused) {
+    failures.push(`${name}: Space 没能暂停模拟（__solarTime 在 300ms 内仍在走）—— 夹具不成立，判据无效`);
+  }
+  const c1 = gesture.controlClickEarth;
+  if (!c1 || c1.article < 1) {
+    failures.push(`${name}: 对照失败 —— 正常点 #chip-earth 没出现卡片（article=${c1?.article}），这条断言会"什么都不选也绿"`);
+  }
+  const c2 = gesture.controlCanvasDrag;
+  if (c2 && c1 && c2.article > c1.article) {
+    failures.push(`${name}: 对照失败 —— 画布拖 40px 竟然选中了东西（article ${c1.article} → ${c2.article}）`);
+  }
+
+  if (!gesture.fixture) {
+    // 找不到合格夹具点：只记录，不判红（环境不可用 ≠ 产品有问题）
+    return { available: false, reason: "找不到「小天体盘外 6px 且 elementFromPoint===CANVAS 且 at() 命中同一 id」的点" };
+  }
+  if (!gesture.after) return { available: false, reason: "chip-jupiter 的位置量不到，手势没发出" };
+
+  const b = gesture.before;
+  const a = gesture.after;
+  if (a.body !== b.body) {
+    failures.push(
+      `${name}: 按下在 #chip-jupiter、松手在画布空白，?body 却从 ${b.body} 变成 ${a.body} —— ` +
+        `「按下在 HUD 抬起在画布」被当成了点击（t18-B 的 pressed 守卫失效了？）`,
+    );
+  }
+  if (a.pressedChips > 0) failures.push(`${name}: 手势之后有 ${a.pressedChips} 个芯片 aria-pressed=true —— 误选发生了`);
+  if (a.article > b.article) failures.push(`${name}: 手势之后多出卡片（article ${b.article} → ${a.article}）—— 误选发生了`);
+  return { available: true, ...gesture };
+}
+
 async function run(browser, spec) {
   const context = await browser.newContext({
     viewport: spec.viewport,
@@ -931,6 +1060,24 @@ try {
         viewport: { width: 1280, height: 720 },
       }),
     );
+  }
+  // ——— 点击误选（t11 D1 / t18-B）：按下在 HUD、松手在画布空白，不许选中 ————
+  if (want("pointer-misselection")) {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    try {
+      // 不加 ?diag：这条判的是选择行为，与读回无关；少开一个开关就少一份"夹具改变被测对象"的风险
+      await page.goto(base, { waitUntil: "load", timeout: 30000 });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      await page.waitForTimeout(1200);
+      const gesture = await runPickerGesture(page, ctx);
+      const judged = judgePickerGesture(gesture);
+      results.push({ pass: "pointer-misselection", 分类: "结构量", ...judged });
+    } catch (err) {
+      failures.push(`pointer-misselection: ${err.message}`);
+    } finally {
+      await ctx.close();
+    }
   }
   // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
   // XG_ONLY 设了就不再往下跑：反向测试只关心某条 page pass 会不会红，数值段是最费时的部分。
