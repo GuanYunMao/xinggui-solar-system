@@ -21,6 +21,7 @@ import {
   createStarGeometry,
 } from "./starfield";
 import { acquireCloudTexture, acquirePlanetTexture, glowTexture, textureReport } from "./textures";
+import { installQualityProbe, noteFrame, noteGpu, texCap, useQualityTier } from "./quality";
 
 declare global {
   interface Window {
@@ -420,6 +421,8 @@ function Simulation() {
   // 观感/行为声明（R3）：这个系统要不要推进时间、要不要转，全看 look，不看 unit
   const look = spec.look;
   useFrame((_, raw) => {
+    // 设备分流的唯一帧时间来源（1.2.0）：喂的是**未钳制**的 raw —— 钳过就看不见卡顿了
+    noteFrame(raw * 1000);
     const delta = Math.min(raw, 0.1);
     /*
      * 时间只有一处推进（R4）：这一行是**唯一**的生产端；`look.freezesTime` 决定要不要推进。
@@ -711,8 +714,10 @@ function PlanetSurface({ body }: { body: Body }) {
     // 贴图预算按**设备**像素算：视网膜屏上同一颗球有更多物理像素要糊
     const devicePx = Math.min(4096, 2 * radiusCss * gl.getPixelRatio());
     if (!Number.isFinite(devicePx)) return;
-    map.plan(devicePx);
-    cloudMap?.plan(devicePx);
+    // 占幅决定「该多大」，档位只封顶（quality.ts 的 texCap）——两件事别混
+    const cap = texCap();
+    map.plan(devicePx, cap);
+    cloudMap?.plan(devicePx, cap);
   });
   useEffect(
     () => () => {
@@ -1801,6 +1806,14 @@ function Probe() {
     (window as unknown as { __solarTextures?: typeof textures }).__solarTextures = textures;
 
     /*
+     * 设备分流探针（1.2.0）：当前档位 / 触发原因 / 变化次数 / 阈值 / 历史。
+     * GPU 字符串只在这条路径里露面（诊断用），**不参与分档** —— 分档只看指针类型 + 视口宽。
+     */
+    installQualityProbe();
+    const renderer = gl.getContext().getParameter(gl.getContext().RENDERER);
+    if (typeof renderer === "string") noteGpu(renderer);
+
+    /*
      * 时间钩子（R4）：读模拟钟 / 拨模拟钟的稳定入口。
      * 真值在 store.simSeconds，这里只是转发、不持有任何状态 —— 将来的"改时间"UI
      * 直接调 store.setSimTime，这个钩子是给验收和现场排查用的（跟 __solarProbe 一路货）。
@@ -2283,10 +2296,16 @@ function Scene() {
 }
 
 export function SolarCanvas() {
+  /*
+   * 设备档位（1.2.0）：dpr 上限跟着档位走 —— 这是"每帧要光栅多少像素"的唯一旋钮。
+   * 用 useSyncExternalStore 订阅：升/降档会让这里重渲染，r3f 才会真的 setDpr。
+   * 红线：手机档 dprCap 1.25，任何档位都不会低于它（见 quality.ts 的 TIERS）。
+   */
+  const tier = useQualityTier();
   return (
     <Canvas
       className="space-canvas"
-      dpr={[1, 1.6]}
+      dpr={[1, tier.dprCap]}
       /*
        * 只给它 home 的位置和视场，两个数都来自 HOME_POSE（唯一出处）。
        * 这里**不写 near/far**：那两笔是死配置 —— 首帧渲染发生在 useFrame 之后，

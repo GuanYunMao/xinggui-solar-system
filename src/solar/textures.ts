@@ -76,11 +76,16 @@ function pow2Nearest(x: number) {
  *       320        503            512
  *       686       1077           1024
  *      1300       2041           2048（上限）
+ *
+ * `texCap` 是**设备档位**给的上限（quality.ts 的 Tier.texCap）：占幅决定「该多大」，
+ * 档位只回答「这台机器最多给多大」。两者别混 —— 按档位一刀切会让好设备聚焦行星时也糊，
+ * 而按占幅不限档又会让弱机在放大那一下重新生成一张用不上的大图。
  */
-export function textureBudget(maxScreenPx: number): TextureSize {
+export function textureBudget(maxScreenPx: number, texCap: number = TEX_MAX_WIDTH): TextureSize {
   const safe = Number.isFinite(maxScreenPx) ? Math.max(0, maxScreenPx) : 0;
   const ideal = Math.PI * safe * TEXELS_PER_SCREEN_PX;
-  const width = Math.min(TEX_MAX_WIDTH, Math.max(TEX_MIN_WIDTH, pow2Nearest(ideal)));
+  const cap = Number.isFinite(texCap) ? Math.max(TEX_MIN_WIDTH, texCap) : TEX_MAX_WIDTH;
+  const width = Math.min(cap, Math.max(TEX_MIN_WIDTH, pow2Nearest(ideal)));
   return { width, height: width / 2 };
 }
 
@@ -661,8 +666,11 @@ function cancelJob(job: Job) {
 export type BodyTexture = {
   /** 当前可用的贴图：占位色 / 已完成的程序化贴图 / 摄影贴图 */
   readonly texture: THREE.Texture;
-  /** 告诉调度器「这颗星在屏幕上最大占多少设备像素（直径）」。只升不降。 */
-  plan(maxScreenPx: number): void;
+  /**
+   * 告诉调度器「这颗星在屏幕上最大占多少设备像素（直径）」，以及设备档位允许的宽度上限。
+   * 占幅决定该多大，`texCap` 只封顶；只升不降（降档不回收已经生成的大图，避免闪一下）。
+   */
+  plan(maxScreenPx: number, texCap?: number): void;
   /** 贴图升级完成时回调（升级后的那一张），返回取消订阅 */
   onChange(fn: (tex: THREE.Texture) => void): () => void;
   /** 组件卸载：退订并取消还没跑完的任务（已生成的贴图留在缓存里） */
@@ -727,9 +735,9 @@ function enqueue(slot: Slot, need: TextureSize): Job {
   return job;
 }
 
-function planSlot(slot: Slot, maxScreenPx: number) {
+function planSlot(slot: Slot, maxScreenPx: number, texCap: number) {
   if (!slot.painter) return;
-  const need = textureBudget(maxScreenPx);
+  const need = textureBudget(maxScreenPx, texCap);
   if (need.width <= slot.bestWidth) return;
   if (slot.job) {
     // 已经在做更大的了：这次请求不需要排队
@@ -745,7 +753,7 @@ function handleOf(slot: Slot): BodyTexture {
     get texture() {
       return slot.best;
     },
-    plan: (maxScreenPx) => planSlot(slot, maxScreenPx),
+    plan: (maxScreenPx, cap = TEX_MAX_WIDTH) => planSlot(slot, maxScreenPx, cap),
     onChange: (fn) => {
       slot.subs.add(fn);
       return () => {

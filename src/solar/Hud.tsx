@@ -1,5 +1,5 @@
-import { LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
-import { useEffect, type ReactNode } from "react";
+import { ChevronRight, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
 import { APP_ERA_NAME, versionLabel } from "./brand";
@@ -8,21 +8,42 @@ import { bindSettingsPersistence, loadSettings, useSim } from "./store";
 import { useSystem } from "./system-context";
 
 /**
- * HUD 的结构（R5 重构后）：
+ * HUD 的结构（R5 重构后，1.2.0 加了设备密度）：
  *
  *   Hud                     ← 唯一的模式判断点（模式只在这里读一次、分一次支）
  *   ├─ SandboxHud           ← 导航台：芯片行 + 卫星行 + 详情卡 + 底栏
  *   │   ├─ HudHeader trailing={<Epoch/>}
- *   │   ├─ Chips / Moons
- *   │   └─ SandboxCard | EmptyHint
+ *   │   ├─ Chips（窄屏带渐隐提示）/ Moons
+ *   │   └─ SandboxCard（窄屏三档手柄）| EmptyHint
+ *   │   └─ Dock（窄屏 3 键 + 图层浮层 / 宽屏 5 键）
  *   └─ RealHud              ← 航行仪表：只有品牌 + 徽标 + 详情卡
  *       ├─ HudHeader
  *       └─ RealCard
  *
  * 关键取舍：**「实境里不显示某样东西」不再是运行时条件，而是那个组件不在树里。**
- * 以前是"一套布局 + 八个例外"，1.2.0 一加手机/电脑分流，例外就会变成十六个以上。
- * 现在要加设备维度，只需在 SandboxHud/RealHud 内部再分一层，互不干扰。
+ * 密度同理：窄屏的差异长成**不同的组件分支**（3 键 + 浮层），不是给 5 键加 `hidden`。
+ * 所以 1.2.0 加设备维度时，每个模式内部各分一层，互不干扰。
  */
+
+/**
+ * 窄屏判定：**跟宽度走，不跟指针类型走**。
+ * 密度是"装不装得下"的问题，不是"有没有手指"的问题——外接键盘的平板仍然装不下 5 个键加文字。
+ * 640px 与 Tailwind 的 `sm` 同界，所以这里的判断与 CSS 里的 `sm:` 不会打架。
+ * 用 matchMedia 而不是一次性读 innerWidth：转屏/拖动窗口会触发 change，密度随之重算（t39 第 4 条）。
+ */
+function useCompact() {
+  const [compact, setCompact] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 639px)").matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 639px)");
+    const onChange = () => setCompact(mq.matches);
+    onChange(); // 首帧后再对齐一次，避免挂载期间窗口已经变过
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return compact;
+}
 
 function formatSpeed(speed: number) {
   return `${speed.toFixed(1)}×`;

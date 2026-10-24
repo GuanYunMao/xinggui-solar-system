@@ -63,6 +63,7 @@ const SCAN_FILES = [
   "src/solar/gate.ts",
   "src/solar/pick.ts",
   "src/solar/progress.ts",
+  "src/solar/quality.ts",
   "src/solar/starfield.ts",
   "src/solar/store.ts",
   "src/solar/system-context.tsx",
