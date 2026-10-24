@@ -454,6 +454,20 @@ function easeInOut(t: number) {
 }
 
 /**
+ * t19：聚焦过渡的缓动 —— 起步就得有速度。
+ *
+ * 旧 `easeInOut` 在 t=0 的导数是 0（4t³），等于切换那一帧先把镜头刹停；用户的原话
+ * 「要半天才有反应」就是这一段。t55 当年靠"中途换目标把 dur 缩到 0.55"绕过，
+ * 但没解决起点速度为 0。
+ *
+ * easeOutCubic：t=0 斜率 3（100ms/750ms 已走 ~35%），到 1 时斜率 0（抵达不顿）。
+ * 位置/朝向/距离共用这一个 u —— 三条曲线同相位。
+ */
+function easeFocus(t: number) {
+  return 1 - (1 - t) ** 3;
+}
+
+/**
  * 星空（t32）：银河带 + 分层星点 + 极慢漂移。
  *
  * 为什么整片天空挂在一个**跟随相机**的 group 上：恒星在太阳系尺度内没有视差，
@@ -2110,7 +2124,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     dur: number;
     fromPos: THREE.Vector3;
     fromTarget: THREE.Vector3;
-    dir: THREE.Vector3;
+    /** 起始的「目标→相机」单位方向（t19 起它是 slerp 的起点，不再是全程常量） */
+    fromDir: THREE.Vector3;
     fromDist: number;
     toDist: number;
     toId: string | null;
@@ -2130,6 +2145,12 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
       /** 缩放：朝指针的射线方向 / 旧视轴（见 useFrame 里的 dolly 段） */
       zoomDir: new THREE.Vector3(),
       zoomFwd: new THREE.Vector3(),
+      /** t19 过渡：当前朝向 / 抵达朝向 / 球面插值的两个四元数 / 太阳位置 */
+      dirNow: new THREE.Vector3(),
+      dirTo: new THREE.Vector3(),
+      sun: new THREE.Vector3(),
+      q: new THREE.Quaternion(),
+      q2: new THREE.Quaternion(),
     }),
     [],
   );
@@ -2183,10 +2204,11 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const continuing = anim.current !== null;
     anim.current = {
       t: 0,
-      dur: reduced ? 0.01 : continuing ? 0.55 : 0.95,
+      /* t19：0.95 → 0.75（continuing 0.55 → 0.45）。easeFocus 起步就有速度，短一点才不"拖"。 */
+      dur: reduced ? 0.01 : continuing ? 0.45 : 0.75,
       fromPos,
       fromTarget,
-      dir: offset,
+      fromDir: offset.clone(),
       fromDist,
       toDist: body?.focus ?? 1,
       toId: id,
@@ -2385,7 +2407,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const current = anim.current;
     if (current) {
       current.t += delta;
-      const u = easeInOut(Math.min(1, current.t / current.dur));
+      const u = easeFocus(Math.min(1, current.t / current.dur));
       if (current.home) {
         homeVector(sizeRef.current.width, sizeRef.current.height, scratch.home);
         scratch.target.lerpVectors(current.fromTarget, scratch.origin, u);
@@ -2417,7 +2439,23 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
             u,
           ),
         );
-        scratch.pos.copy(scratch.target).addScaledVector(current.dir, dist);
+        /*
+         * t19（3/3）：转动与缩放同轨 —— 朝向也从 fromDir 球面插值到**抵达朝向**，
+         * 与 dist 共用同一个 u。旧的 `dir` 是常量：相机只会平移过去，
+         * 于是永远从同一个方位看目标；抵达时目标背面朝相机就是"点开一颗星看到黑球"。
+         *
+         * 抵达朝向 = 「目标→太阳」方向再抬 12°（太阳在相机背后，正面受光）。
+         * 每帧现算：目标在动（公转/冻结历元都一样），到达那一刻的日向才是对的。
+         */
+        const sun = reg.groups.get("sun");
+        if (sun) sun.getWorldPosition(scratch.sun);
+        else scratch.sun.set(0, 0, 0);
+        scratch.dirTo.copy(scratch.sun).sub(scratch.dest).normalize();
+        scratch.dirTo.applyAxisAngle(perpAxis(scratch.dirTo), 0.2126);
+        scratch.q.setFromUnitVectors(current.fromDir, scratch.dirTo);
+        scratch.q2.identity().slerp(scratch.q, u);
+        scratch.dirNow.copy(current.fromDir).applyQuaternion(scratch.q2).normalize();
+        scratch.pos.copy(scratch.target).addScaledVector(scratch.dirNow, dist);
       }
       controls.target.copy(scratch.target);
       camera.position.copy(scratch.pos);
