@@ -63,7 +63,7 @@ jobs:
       # 放在 build 后面是因为将来真接上单文件检查后，它需要 `release/巡星.html` 已经存在。
       # 真正不能动的是**先后关系**：这两条必须先于「准备发布用文件名 / 上传 / 发布」，
       # 否则 tag 仍然是拿「构建成功」换来的，不是「验收通过」换来的。
-      - name: 闸 1/2 · 形状判据 check:shape
+      - name: 闸 1/3 · 形状判据 check:shape
         run: |
           # 显式声明 pipefail：`| tee` 会把 npm 的退出码换成 tee 的 0，等于隐式 `|| true`。
           set -o pipefail
@@ -92,10 +92,50 @@ jobs:
             echo "> runner=\`$RUNNER_OS\` · node $(node -v) · 判据定义在 \`scripts/check-shape.mjs\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 闸 2/2 · 形状判据自检（证明六条护栏都会红）
+      - name: 闸 2/3 · 形状判据自检（证明每条护栏都会红）
         # 4 条 VACUOUS 在 CI 里等于「绿灯但没验」，这条闸补的是它们的牙齿：
         # 在临时副本里注入第二真相，六条判据必须各自变 FAIL，否则 exit 1。
         run: npm run check:shape:selftest
+
+      - name: 闸 3/3 · README「线上正式版」== 线上的最新正式版
+        # 离线那半条（README「开发中」== package.json）在 npm run check:shape 里，本地就能跑；
+        # 这半条要"线上到底是哪版"，只能问线上。
+        # 口径优先 `releases/latest`：**release 才是线上事实，tag 只是标记**——tag 可以在别的分支上、
+        # 也可以有 tag 却不发 release（本仓库两种都真实存在）。拿不到 API 才回落到 tag，并明确声明降级。
+        # 本地（非 CI）**明确打印跳过**，不静默，也不拿本地 tag 冒充线上。
+        run: |
+          set -o pipefail
+          DOC=$(grep -m1 '^| 线上正式版' README.md | sed -E 's/.*\*\*([^*]+)\*\*.*/\1/')
+          if [ -z "${GITHUB_ACTIONS:-}" ]; then
+            echo "（非 CI 环境：跳过「线上正式版」这半条 —— 线上事实要问 GitHub release API，本地没有权威来源）"
+            echo "  README 现在写的是：${DOC:-（读不到）}"
+            echo "  本地 tag 只作参考（tag ≠ release）：$(git tag --list 'v*' --sort=-v:refname | grep -v -- '-' | head -n1)"
+            exit 0
+          fi
+          LIVE=""
+          if [ -n "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+            LIVE=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null | sed 's/^v//')
+          fi
+          if [ -z "$LIVE" ]; then
+            git fetch --tags --force --quiet
+            LIVE=$(git tag --list 'v*' --sort=-v:refname | grep -v -- '-' | head -n1 | sed 's/^v//')
+            echo "⚠ 拿不到 releases/latest，降级用 tag 口径：最高正式 tag = ${LIVE:-（挑不出来）}"
+            echo "  tag ≠ release，这条降级结论要打折扣看"
+          fi
+          echo "线上最新正式版 = ${LIVE:-（未知）}；README「线上正式版」= ${DOC:-（读不到）}"
+          if [ -z "$LIVE" ]; then
+            echo "✗ 挑不出线上最新正式版 —— 判据失去对照物，先修来源，别让它静默变绿"
+            exit 1
+          fi
+          if [ -z "$DOC" ]; then
+            echo "✗ README 里读不到「| 线上正式版 |」那一行 —— 找不到就判红，不跳过"
+            exit 1
+          fi
+          if [ "$LIVE" != "$DOC" ]; then
+            echo "✗ README 的「线上正式版」是 $DOC，而线上最新正式版是 $LIVE —— 发版后忘了改文档"
+            exit 1
+          fi
+          echo "✓ 一致：$LIVE"
 
       - name: 准备发布用文件名（避开 URL 里的中文）
         # 本地中间产物叫「巡星.html」，这里 cp 成 xinggui.html 再发。

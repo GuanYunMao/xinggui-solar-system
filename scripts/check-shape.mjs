@@ -595,6 +595,71 @@ const CHECKS = [
       };
     },
   },
+  {
+    id: 9,
+    title: "README「开发中」那一行 == package.json 的 version（离线半边）",
+    // 为什么要有这条：这轮开头最贵的发现就是「README 落后两版而零告警」——
+    // 文档写着「线上正式版 1.1.6 / 开发中 1.2.0-snap.14」，实际已经 1.2.1 发布。
+    // 版本号是**同一个事实的两个住处**（文档 / 包清单），必须机器对账，不能靠人记得改。
+    // 另外半条（「线上正式版」== 最新正式 release tag）只能在 CI 跑——本地没有 tag，
+    // 那半条在 .github/workflows/build.yml 里，且本地会明确打印「跳过」而不是静默。
+    // 只扫版本表那两行，**不依赖** README 里那张版本规则表（那张表可能被删成一句指路）。
+    expect: "README 版本表「开发中」行的版本号，与 package.json 的 version 逐字相等（含 -snap.N 后缀）",
+    run(loaded, root) {
+      const dir = root ?? ROOT;
+      let pkgVersion = null;
+      let md = "";
+      try {
+        pkgVersion = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")).version ?? null;
+      } catch {
+        pkgVersion = null;
+      }
+      try {
+        md = readFileSync(path.join(dir, "README.md"), "utf8");
+      } catch {
+        md = "";
+      }
+      const row = md.split(/\r?\n/).find((l) => /^\|\s*开发中\s*\|/.test(l)) ?? null;
+      const devVersion = row
+        ? (/\*\*([^*]+)\*\*/.exec(row)?.[1] ?? /\b\d+\.\d+\.\d+(?:-snap\.\d+)?\b/.exec(row)?.[0] ?? null)
+        : null;
+
+      const dev = [];
+      if (pkgVersion === null) dev.push("读不到 package.json 的 version —— 判据失去对照物，必须修");
+      if (!row) {
+        dev.push(
+          "README 里找不到「| 开发中 |」这一行 —— 找不到就判红、不跳过：跳过等于给一条会静默失效的判据" +
+            "（真要删这行，就连本判据一起删）",
+        );
+      } else if (!devVersion) {
+        dev.push(`README 的「开发中」行里读不出版本号：${row.trim()}`);
+      }
+      if (pkgVersion !== null && devVersion && pkgVersion !== devVersion) {
+        dev.push(
+          `版本号对不上：README「开发中」= ${devVersion}，package.json version = ${pkgVersion} —— ` +
+            `改一个就要改另一个（发版时最容易漏的正是文档这一半）`,
+        );
+      }
+      const rows = dev.length
+        ? []
+        : [
+            { file: "README.md", line: 0, text: `开发中 = ${devVersion}（与 package.json 一致）` },
+            {
+              file: "README.md",
+              line: 0,
+              text: "另半条（线上正式版 == 最新 release tag）只在 CI 有 tag 时判；本地 check-shape 不覆盖它",
+            },
+          ];
+      return {
+        hits: dev.length ? dev.map((text) => ({ file: "README.md", line: 0, text })) : rows,
+        observed: dev.length ? `${dev.length} 处不一致` : `开发中 ${devVersion} == package.json ${pkgVersion}`,
+        ok: dev.length === 0,
+        // 不变量：通过态的取证数是 2（对账一致 + 声明另半条在 CI），越界一处 +1，所以注入后是 3。
+        // 别写成 rows.length + dev.length —— 那会在越界时从 2 掉到 1，selftest 判成"没红"（已踩过）。
+        raw: 2 + dev.length,
+      };
+    },
+  },
 ];
 
 /** 清单漂移：src 下这一层出现的 .ts/.tsx 必须都在 SCAN_FILES 里，反之亦然 */
@@ -632,7 +697,9 @@ function checkManifest(loaded) {
 function runChecks(root, files) {
   const loaded = loadFiles(root, files);
   const results = CHECKS.map((c) => {
-    const r = c.run(loaded);
+    // root 也传下去：第 9 条要读 package.json 与 README.md（selftest 会把它们一起拷进临时目录，
+    // 所以判据必须读"这次的 root"而不是写死仓库根，否则注入永远改不动它）
+    const r = c.run(loaded, root);
     const status = !r.ok ? "FAIL" : r.hits.length === 0 ? "VACUOUS" : "PASS";
     return { check: c, ...r, status };
   });
@@ -726,6 +793,14 @@ const SELFTEST_CASES = [
     file: "src/solar/store.ts",
     inject: "\nconst __mu = 3.986004418e14;\n",
   },
+  {
+    // 第 9 条的牙齿：把 package.json 的版本号前缀改掉（给任何版本号前面加一个 9）。
+    // 用"前缀加 9"而不是写死某个版本号：版本号一升级，写死的注入就会失效，
+    // 而失效的注入会让 selftest 变成假证明——这个坑第 7 条已经踩过一次。
+    id: 9,
+    file: "package.json",
+    replace: ['"version": "', '"version": "9'],
+  },
 ];
 
 function selftest() {
@@ -741,6 +816,11 @@ function selftest() {
         const dst = path.join(dir, rel);
         mkdirSync(path.dirname(dst), { recursive: true });
         cpSync(src, dst);
+      }
+      // 第 9 条的对账对象不在 src 里：版本表在 README.md、版本号在 package.json。
+      // selftest 要把它们也拷进临时目录，否则注入改不到、判据永远绿（又是"假证明"）。
+      for (const rel of ["README.md", "package.json"]) {
+        cpSync(path.join(ROOT, rel), path.join(dir, rel));
       }
       const target = path.join(dir, test.file);
       // 两种注入方式：
