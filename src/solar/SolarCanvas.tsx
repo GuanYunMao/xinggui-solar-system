@@ -1132,6 +1132,25 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
   );
 
   useFrame(() => {
+    /*
+     * 米制相机的放锁点 —— **放在所有判空之前**（captain 裁定 b）。
+     *
+     * 释放只该看一件事：还在不在切换里。它不该看「地球这颗天体在不在」「控件就绪没」——
+     * 凡是能跳过这一段的分支，都是潜在的永久锁死：今天 earth 一定存在，但切星系、改数据、
+     * 或者哪天地球改了 id，这段被跳过之后 `finishSwitch` 就只剩 store 的 1500ms 超时兜底，
+     * 界面会卡在"锁着"的状态。旧代码里这段写在 `if (!earth) return` 之后，是那个隐患的源头。
+     *
+     * 放锁时机不变：这台相机没有过渡动画，位置一旦摆好，「动画结束」就等于「这一帧」。
+     * 在这里放锁是安全的：这支每帧都重写 camera.position，OrbitControls 就算被放开
+     * 也挪不动相机，不存在"黑幕里被拖歪"的窗口。黑场由壳层负责。
+     */
+    if (switching === "toReal" && !released.current) {
+      released.current = true;
+      useSim.getState().finishSwitch();
+    } else if (switching === null) {
+      released.current = false;
+    }
+
     const controls = controlsRef.current;
     if (!controls) return;
     const earth = reg.groups.get("earth");
@@ -1210,24 +1229,6 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
       farFloor = Math.max(farFloor, camera.position.distanceTo(scratch.pos) + b.radius * 4);
     }
     tightenClipPlanes(camera as THREE.PerspectiveCamera, dist, farFloor * 1.2);
-
-    /*
-     * 米制相机的放锁点。
-     *
-     * 这台相机没有过渡动画：位置在这一帧就已经摆好，「动画结束」就等于「这一帧」。
-     * 旧代码里这段写在一支每帧提前 return 的分支里，注释说得很清楚——沙盘那个
-     * 「动画跑完 → finishSwitch()」的释放点对它永远走不到。现在它是自己的组件、
-     * 自己的帧回调，不需要再解释这件事。
-     *
-     * 在这里放锁是安全的：这支每帧都重写 camera.position，OrbitControls 就算被放开
-     * 也挪不动相机，不存在"黑幕里被拖歪"的窗口。黑场由壳层负责。
-     */
-    if (switching === "toReal" && !released.current) {
-      released.current = true;
-      useSim.getState().finishSwitch();
-    } else if (switching === null) {
-      released.current = false;
-    }
 
     if (DIAG && diagTick.current++ % 20 === 0) {
       const persp = camera as THREE.PerspectiveCamera;
@@ -2055,10 +2056,15 @@ function traceCam(mode: string, camera: THREE.Camera, target: THREE.Vector3 | nu
 
 /**
  * 相机轨迹记录器。优先级 -1：排在相机组件（-2）之后跑，量到的是当帧最终机位。
- * **必须是负数**：r3f 里任何 `useFrame(cb, priority > 0)` 都会把自动渲染关掉
- * （`internal.priority` 非零 → 循环不再 `gl.render`，只剩手动渲染）。我第一版给的 10
- * 就让整个场景一笔没画：相机数据、探针、贴图全正常，屏幕上却只有 HUD —— 正是
- * verifier 在 ?proto=1&diag=1 里看到的 `draws: 0, tris: 0`。诊断组件不该有这个权力。
+ *
+ * ⚠ **负数只影响回调顺序；正数会把渲染权一起拿走。** r3f 里任何 `useFrame(cb, priority > 0)`
+ * 的订阅都会给 `internal.priority` 加一，而渲染循环只在它为零时才 `gl.render(...)` ——
+ * 也就是"谁要手动渲染谁自己画"的开关，不是"谁先谁后"的排序参数。
+ * （`@react-three/fiber/dist/events-e51d7528.esm.js:1312` 累加；`:17537` 判零。）
+ * 我第一版在这里写了 `10`，结果整个场景一笔没画：相机数据、探针、贴图、HUD 全正常，
+ * 屏幕上只有 HUD —— 正是 verifier 在 `?proto=1&diag=1` 里看到的 `draws: 0, tris: 0`，
+ * 而当时 8 条 verify 全绿。诊断组件不该有拿走渲染权的权力，所以这里只允许 ≤0。
+ * 改这个数字之前先想清楚：你在决定"谁来渲染这一帧"。
  */
 function CamTrace({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
   const camera = useThree((state) => state.camera);
