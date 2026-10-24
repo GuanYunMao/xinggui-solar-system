@@ -113,6 +113,10 @@ export function ModeBadge() {
    * t54：庆祝层退场时，实境入口再来一次 1.5s 的**自证高亮**（观察位的头条：
    * 解锁后 `realMentions=1 / hintMentions=0 / animationName=null`，入口可点却零提示）。
    * 同样只是开关一个状态，动画全在 CSS：`transform / filter / opacity`，不动布局。
+   *
+   * ⚠ `prefers-reduced-motion` 是**减少动态、不是减少信息**：那里动画关掉但保留静止高亮
+   * （亮度 + 轮廓，不依赖色相）。别在无障碍清理时把提示一起删掉 —— 那会把零提示留给
+   * 最需要提示的那批人。
    */
   const [celebrate, setCelebrate] = useState(false);
   const [ctaHint, setCtaHint] = useState(false);
