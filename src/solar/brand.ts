@@ -15,6 +15,10 @@
  * 把这里的字面量换成消费常量——**只改这个文件**，HUD 里不要出现第二处硬编码。
  */
 
+// 类型专用 import（Node 类型剥离后不产生运行时代码）：这个文件保持"运行时零 import"，
+// `node .tmp-t55-compression-test.mjs` 才能直接 import 它做单测。
+import type { Body } from "./data";
+
 /** 全名：一整个名字，不拆。 */
 export const APP_FULL_NAME = "巡星·未至之境";
 
@@ -76,4 +80,98 @@ export function formatDistanceMeters(meters: number | null): string {
   }
   const wan = m / 1e7;
   return `${wan < 100 ? wan.toFixed(2) : Math.round(wan)} 万 km`;
+}
+
+/* ────────────────────── 时间压缩标注（t55） ────────────────────── */
+
+/**
+ * 沙盘详情卡底部那行「时间压缩：公转 ×1.89 · 自转 ×18.1」的派生。
+ *
+ * 两条律、两把尺（t55 全表：`.tmp-t55/HANDOFF-designer.md`）：
+ *  - **公转**：真实值从**卡片自己的「公转」字符串**取（88 地球日 / 365.25 日 / 11.9 年），
+ *    所以标注与卡片永远同源，卡片改了它自动跟着变；
+ *  - **自转**：锁定天体（`locked`）的自转由轨道角派生 ⇒ 倍数**恒等于**公转倍数；
+ *    其余行星按 `2π/spin × 每天模拟日 ÷ |真实自转周期|`。
+ *
+ * **不存在统一压缩系数**（公转 0.04–37.8、自转 13–174，差两个量级），所以逐天体现算；
+ * 写一个全局常数必错。取不到就给 null —— 宁可不标，也不标错数。
+ *
+ * 为什么时间尺度是**参数**而不是 import：brand.ts 必须保持"运行时零 import"，
+ * Node 才能直接 import 它做单测（上面 formatDistanceMeters 的注释也写了这条）。
+ * 两个常量仍只有一处定义（store.ts 的 DAYS_PER_YEAR / DAYS_PER_SIM_SECOND），
+ * 调用点从那里取、原样传进来，不在这里再写一份 365.25。
+ */
+export type Compression = { orbit: number | null; spin: number | null };
+
+/** 时间尺度：唯一出处是 store.ts，调用点传进来（别在这里写死）。 */
+export type TimeScale = { daysPerSimSecond: number; daysPerYear: number };
+
+/** 参考表：真实自转周期（天；正=顺行、负=逆行）。**照抄 t55 全表 1b，别自己换算。** */
+const REAL_SPIN_DAYS: Record<string, number> = {
+  sun: 25.38,
+  mercury: 58.646,
+  venus: -243.02,
+  earth: 0.99727,
+  mars: 1.02595,
+  jupiter: 0.41354,
+  saturn: 0.44401,
+  uranus: -0.71833,
+  neptune: 0.67125,
+};
+
+/** "88 地球日"→88；"365.25 日"→365.25；"11.9 年"→11.9×daysPerYear；解析失败 → null */
+function parseCardDays(value: string | undefined, daysPerYear: number): number | null {
+  if (!value) return null;
+  const match = /^\s*(\d+(?:\.\d+)?)\s*(地球日|日|年)\s*$/.exec(value);
+  if (!match) return null;
+  const n = Number(match[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return match[2] === "年" ? n * daysPerYear : n;
+}
+
+/**
+ * 两个倍数。六种边界全部退化到 `null`（**不显示 0 / Infinity / NaN**）：
+ * 没有「公转」fact、卡片串解析失败、`period ≤ 0`、非锁定但 `spin === 0`、
+ * 参考表里没有这颗天体、两者都取不到（整行不渲染）。
+ */
+export function deriveCompression(body: Body, scale: TimeScale): Compression {
+  const periodOk = Number.isFinite(body.period) && body.period > 0;
+  const cardDays = parseCardDays(
+    body.facts.find((fact) => fact.label === "公转")?.value,
+    scale.daysPerYear,
+  );
+  const orbit =
+    periodOk && cardDays !== null ? (body.period * scale.daysPerSimSecond) / cardDays : null;
+
+  let spin: number | null = null;
+  if (body.locked) {
+    spin = orbit;
+  } else if (periodOk && body.spin !== 0) {
+    const real = REAL_SPIN_DAYS[body.id];
+    if (real !== undefined) {
+      // 逆行（金星/天王星）：模型自转与真实自转同号，比值为正；取绝对值避免"负压缩"读成反向
+      const modelDays = (Math.PI * 2 / body.spin) * scale.daysPerSimSecond;
+      spin = Math.abs(modelDays / real);
+    }
+  }
+  return { orbit, spin };
+}
+
+/** 倍数文案：<10 两位小数、≥10 一位（×1.89 / ×134.6 / ×0.04 / ×37.8） */
+function formatMultiple(value: number): string {
+  return `×${value < 10 ? value.toFixed(2) : value.toFixed(1)}`;
+}
+
+/** "公转 ×1.89 · 自转 ×18.1"；两段都取不到 → null */
+export function formatCompression(c: Compression): string | null {
+  const parts: string[] = [];
+  if (c.orbit !== null) parts.push(`公转 ${formatMultiple(c.orbit)}`);
+  if (c.spin !== null) parts.push(`自转 ${formatMultiple(c.spin)}`);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+/** 卡片底部整行："时间压缩：公转 ×1.89 · 自转 ×18.1"；没有可标 → null（整行不渲染） */
+export function compressionLine(body: Body, scale: TimeScale): string | null {
+  const text = formatCompression(deriveCompression(body, scale));
+  return text === null ? null : `时间压缩：${text}`;
 }

@@ -2,9 +2,9 @@ import { ArrowLeft, ChevronDown, ChevronRight, ChevronUp, Clock, Layers, LocateF
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
-import { APP_ERA_NAME, formatDistanceMeters, snapshotTag, versionLabel } from "./brand";
+import { APP_ERA_NAME, compressionLine, formatDistanceMeters, snapshotTag, versionLabel } from "./brand";
 import type { Body } from "./data";
-import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, isGateUnlocked, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
+import { bindSettingsPersistence, DAYS_PER_SIM_SECOND, DAYS_PER_YEAR, daysPerRealSecond, daysOf, isGateUnlocked, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
 import { useSystem } from "./system-context";
 
 /**
@@ -897,6 +897,10 @@ function SandboxCard({ compact }: { compact: boolean }) {
   const unlocked = useSim((state) => isGateUnlocked(state));
   const { byId } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
+  // t55：时间压缩标注（沙盘专有；实境卡片本来就是模型值，加这句自相矛盾）
+  const compression = selected
+    ? compressionLine(selected, { daysPerSimSecond: DAYS_PER_SIM_SECOND, daysPerYear: DAYS_PER_YEAR })
+    : null;
   /*
    * 开合状态**按天体记**（t13）：同一颗再次选中时保持上次的开合。
    *
@@ -1058,6 +1062,16 @@ function SandboxCard({ compact }: { compact: boolean }) {
       <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
         大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
       </p>
+      {/*
+        t55：时间压缩那一行 —— 逐天体现算，不写全局系数（两条律：公转 0.04–37.8、自转 13–174）。
+        取不到就整行不渲染（太阳只有自转；实境样本不在参考表里）。
+        时间尺度从 store 取，原样传进纯函数；brand.ts 保持运行时零 import，Node 能直接单测。
+      */}
+      {compression && (
+        <p data-compression={compression} className="mt-2 text-[11px] leading-snug text-subtle">
+          {compression}
+        </p>
+      )}
       <button
         type="button"
         className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
