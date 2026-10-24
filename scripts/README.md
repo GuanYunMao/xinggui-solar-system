@@ -21,18 +21,95 @@ npm run verify         # = node scripts/verify.mjs
 
 | pass | 验什么 | 判据 | 红了先看哪 |
 | --- | --- | --- | --- |
-| `desktop` | 1280×720：画布起来、恰好 1 个 canvas、无横向溢出、点「地球」后卡片标题是「地球」 | 结构性 | `results[]` 里该条的 `errors` / `overflowX` / `selected` |
-| `mobile` | 390×844 @3x 触屏视口同上（不点选） | 结构性 | 同上 |
-| `mobile-selected` | 手机视口 + 点选 | 结构性 | 同上 |
-| `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏） | 结构性 | 该条 `errors`；漏资源会在控制台报 404 |
+| `desktop` | 1280×720：画布起来、恰好 1 个 canvas、无横向溢出、点「地球」后卡片标题是「地球」、**画布不是全黑** | 结构性 + 像素 | `results[]` 里该条的 `errors` / `overflowX` / `selected` / `canvasPixels` |
+| `mobile` | 390×844 @3x 触屏视口同上（不点选） | 结构性 + 像素 | 同上 |
+| `mobile-selected` | 手机视口 + 点选 | 结构性 + 像素 | 同上 |
+| `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏）、**画布不是全黑** | 结构性 + 像素 | 该条 `errors`；漏资源会在控制台报 404 |
 | `frame-time` | 稳态帧时间相对**本次运行的机器基线**的比值 | **数值** | `results[frame-time].normalized`，见下节 |
 | `hit-matrix` | 探针投影出 15 个天体；重叠对只记录不判 | **数值** | 大于/小于 15 说明数据层漏天体，不是渲染问题 |
 | `follow-jitter` | 选中地球后 90 帧，目标屏幕位置峰峰值 < 0.5px | **数值** | 抖动说明相机跟随里混进了逐帧噪声 |
-| `proto-real` | `?proto=1` 真实单位原型：3 个天体、地球钉在屏幕中心 ≤ 1px | **数值** | 偏移说明相机/投影没对齐 |
+| `proto-real` | `?proto=1` 真实单位原型：3 个天体、地球钉在屏幕中心 ≤ 1px、**画布不是全黑** | **数值** + 像素 | 偏移说明相机/投影没对齐 |
 | `proto-jitter` | 像素回读对比 modern 与 legacy 顶点路径的 float32 量化抖动（p10–p90 / 120 帧） | **数值** | 见下节「proto-jitter 的维护契约」 |
 
 数值断言一共 5 条，但**只有 `frame-time` 会因为「这台机器现在忙」而变红**。
 其余四条量的是几何量（投影坐标、像素偏移），和帧率无关，慢机器上数字一样。
+
+**画布像素体检**（`desktop` / `mobile` / `mobile-selected` / `single-file` / `proto-real` 都有）
+见下节「画布像素体检（抓整屏黑）」——它抓的是「数据层全对、眼睛看到一片黑」这类回归。
+
+## 画布像素体检（抓整屏黑）
+
+**为什么要有这条**：2026-10-24 实测过一次「画布全黑但 8 条 pass 全绿」——`__solarReady` 置位、
+canvas 数量对、DOM 文本对、`__solarProbe()` 的几何也对（`draws: 0, tris: 0`，一笔没提交）。
+因为那些断言只验「数据层说得通」这一层，而用户眼睛看到的是黑的。当时真正抓住它的是
+`proto-jitter` 的像素回读，纯属偶然。所以现在每个开浏览器的 pass 都带一条像素体检。
+
+怎么验：读画布上 **25 个 8×8 块**（四角 + 中心），算平均亮度与非黑块占比。
+
+- 判红条件：`meanLum < 2` **或** `nonBlackRatio < 0.5`
+- 阈值标定（合成画布实测，两个方向都验过）：
+  - 产品背景色 `#07090e` → `meanLum 8.94`、`nonBlackRatio 1.0` → **判绿**（4.5× 余量）
+  - 纯黑 → `0 / 0` → 判红
+- **前提**：`preserveDrawingBuffer` 必须为真，否则 `readPixels` 永远返回 0，会把「读不到」
+  误判成「黑屏」。所以这几个 pass 的 URL 统一追加 `?diag=1`（`SolarCanvas` 的 `READBACK`
+  由 `proto|legacy|diag` 触发）；万一属性不是 true，结果是 `available: false` + `reason`，
+  **不判红**（宁可说测不了，也不冤枉产品）。
+- `frame-time` 所在的数值页**故意不加** `diag`：`preserveDrawingBuffer` 会让每帧多一次拷贝，
+  污染帧时间测量。那一页的「黑屏」由 `proto-jitter` 的像素回读兜底。
+
+红了先看这条的 `canvasPixels`：`meanLum: 0` + `nonBlackRatio: 0` 就是整屏黑。
+顺序是——先确认 `__solarProbe()` 的几何是否正常（正常说明数据层没坏，是渲染没画），
+再看渲染器有没有提交（`?proto=1&diag=1` 的 `[proto]` 日志里 `draws`/`tris`）。
+
+## 探针契约（`__solarProbe()` / `__solarTextures()`）
+
+`__solarProbe()` 返回的**条数 = 当前挂载的天体数**（沙盘 15、`?proto=1` 3），
+**不是**「画面里能看到的数量」。
+
+**相机背后的天体返回 NaN 哨兵**：`x/y/z = NaN`、`radiusPx = 0`。
+这是**有意设计，不是 bug**——拾取器那边把背后的天体剔掉（点不中、也不该出手型），
+但探针保留一条记录，因为 `hit-matrix` 数 15、`proto-real` 数 3 这两条断言都建在
+「条数 = 挂载数」上。更关键的是**不编造镜像坐标**：`project()` 在 z<0 时会翻符号把
+背后的天体镜像回画面，看着在屏幕上、点了却没反应 —— 那正是 t13 修掉的幽灵热区。
+
+实测（`node scripts/texture-report.mjs`，加 `"?proto=1"` 参数换模式）：
+
+| 场景 | 条数 | NaN 条数 | 是哪些 |
+| --- | --- | --- | --- |
+| 沙盘默认视图 | 15 | 0 | — |
+| 沙盘聚焦地球后 | 15 | 6 | 示例 sun / mercury / mars / saturn / titan / neptune —— **具体哪几颗随相机状态变**，别当不变量 |
+| `?proto=1` | 3 | 1 | sun（真的在相机背后） |
+
+**看 verify 输出时有个坑**：`JSON.stringify(NaN)` 是 `null`，所以 results 里 `"x": null`
+表示「这颗没有屏幕位置」，不是「探针坏了」。`hit-matrix` 的配对统计天然不受影响 ——
+`NaN < 44` 恒为 false，NaN 条目不会进配对。
+
+代码位置：`src/solar/SolarCanvas.tsx:1599-1607`（`Select-String -Path src/solar/SolarCanvas.tsx
+-Pattern 'Number\.NaN, y: Number\.NaN' | Measure-Object` → 1）。
+
+## 贴图预算与首屏（frame-time 为什么单列启动段）
+
+1.1.2 之前是 `radius > 0.4 ? 512×256 : 256×128`，在 React 首次 render 里同步跑完：
+**12 张 + 云层 = 1,114,112 px**，主线程一次阻塞 **380–500 ms**（注记在 `textures.ts:16-19`）。
+现在切成两刀：`textureBudget()` 按屏幕占幅定尺寸（0.5 纹素/像素，128–2048 取 2 的幂，
+见 `TEXELS_PER_SCREEN_PX`），像素循环按 `CHUNK_MS = 5` 分帧排队，每片落在下一帧 rAF 里。
+
+实测（本机 1280×720，`node scripts/texture-report.mjs`）：
+
+| 时刻 | `totalPixels` | 说明 |
+| --- | --- | --- |
+| `__solarReady` 瞬间 | **13** | 13 张全是 1×1 占位色，`pending=13`，首帧不阻塞 |
+| 稳态总览位（~4s） | **106,496** | 13 × 128×64（`TEX_MIN_WIDTH` 档），`pending=0` |
+| 聚焦地球后 | **≈0.79–0.82 M** | 两次实测 794,624 / 819,200，**不是定值** |
+
+最后一行不稳定是设计使然：预算「只升不降」，聚焦动画期间谁上过屏就按谁的占幅升档，
+两次运行的相机轨迹略有差别，升上去的档位就不同（`venus` 会到 1024×512、`clouds` 512×256）。
+所以**别拿这个数当断言**；要断言就断 `pending` 归零、且每张不超过 `TEX_MAX_WIDTH` 档。
+
+`?proto=1` 下 `__solarTextures()` 返回空列表（原型不生成程序化贴图），像素预算只对沙盘有意义。
+
+这也是 `frame-time` **单列启动段、只判稳态**的原因：首帧要跑几何首建 + 13 张贴图排队，
+一次性成本混进稳态，等于把「刹车」算成「车重」。
 
 ## frame-time 的红线怎么读
 
@@ -152,6 +229,7 @@ rm -rf .tmp-release-snap
 | 文件 | 干什么 |
 | --- | --- |
 | `verify.mjs` | 本文件说的那套验收 |
+| `texture-report.mjs` | 贴图预算 + 探针体检：打印 `__solarTextures()` 的像素/排队数与 `__solarProbe()` 的 NaN 哨兵条数（`node scripts/texture-report.mjs "?proto=1"`） |
 | `check-single-file.mjs` | 单文件版自检：资源是否真的内联、没有残留外链 |
 | `bake-textures.mjs` | 预烘行星贴图到 `.texture-src/`（生成物，目录已 ignore） |
 | `make-icons.mjs` | 生成 PWA 图标（`public/icon-*.png`） |

@@ -281,6 +281,77 @@ function judgeFrameTime(ft, steadyDeltas, baselines) {
   }
 }
 
+// ——— 画布像素体检：抓「场景一笔没画」这类整屏黑 ————————————————————
+// 为什么要有这条：9 个 pass 曾经在一次「画布全黑」的构建上全绿（2026-10-24 实测，draws:0/tris:0）。
+// 因为它们只验自己看得懂的那一层——__solarReady 置位、canvas 数量、DOM 文本、__solarProbe 的
+// JS 几何。这些都是「数据层说得通」，而用户眼睛看到的是黑的。真正抓住它的是 proto-jitter
+// 的像素回读，纯属偶然。所以每个开浏览器的 pass 都补一条：读画布上的 25 个块看亮度。
+//
+// 前提：preserveDrawingBuffer 必须为真，否则 readPixels 永远返回 0 —— 那会把「读不到」
+// 误判成「黑屏」。所以导航时统一追加 ?diag=1（SolarCanvas 的 READBACK 由 proto|legacy|diag
+// 触发）；万一属性不是 true，就标 available:false 不判红，免得冤枉产品。
+const BLACK_LUM_MIN = 2; // 健康画布的背景是 #07090e ≈ 8.9/255，留 4× 余量
+
+const withDiag = (url) => {
+  const u = new URL(url);
+  if (!u.searchParams.has("diag")) u.searchParams.set("diag", "1");
+  return u.href;
+};
+
+async function sampleCanvasPixels(page) {
+  return page.evaluate(async (blackLumMin) => {
+    const canvas = document.querySelector("canvas");
+    if (!canvas) return { available: false, reason: "没有 canvas" };
+    const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+    if (!gl) return { available: false, reason: "拿不到 WebGL 上下文" };
+    const attrs = gl.getContextAttributes?.() ?? {};
+    if (!attrs.preserveDrawingBuffer) {
+      return { available: false, reason: "preserveDrawingBuffer=false（读回来必是 0，不能当黑屏）" };
+    }
+    const W = canvas.width;
+    const H = canvas.height;
+    if (!W || !H) return { available: false, reason: "画布尺寸为 0" };
+    // 合成之后才读，避免读到半帧
+    await new Promise((r) => requestAnimationFrame(() => r()));
+    const lums = [];
+    for (const fx of [0, 0.25, 0.5, 0.75, 1]) {
+      for (const fy of [0, 0.25, 0.5, 0.75, 1]) {
+        const x = Math.min(W - 8, Math.max(0, Math.round(fx * (W - 8))));
+        const y = Math.min(H - 8, Math.max(0, Math.round(fy * (H - 8))));
+        const buf = new Uint8Array(8 * 8 * 4);
+        gl.readPixels(x, y, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i += 4) {
+          sum += 0.2126 * buf[i] + 0.7152 * buf[i + 1] + 0.0722 * buf[i + 2];
+        }
+        lums.push(sum / 64);
+      }
+    }
+    const meanLum = lums.reduce((a, b) => a + b, 0) / lums.length;
+    const nonBlack = lums.filter((l) => l >= blackLumMin).length;
+    return {
+      available: true,
+      width: W,
+      height: H,
+      meanLum: +meanLum.toFixed(2),
+      maxLum: +Math.max(...lums).toFixed(2),
+      nonBlackRatio: +(nonBlack / lums.length).toFixed(2),
+      grid: lums.map((l) => +l.toFixed(1)),
+    };
+  }, BLACK_LUM_MIN);
+}
+
+// 判红：整屏黑（平均亮度地板）或大部分块是全黑
+function judgeCanvasPixels(name, px) {
+  if (!px || !px.available) return; // 读不到就明说，不冤枉产品
+  if (px.meanLum < BLACK_LUM_MIN || px.nonBlackRatio < 0.5) {
+    failures.push(
+      `${name}: 画布是黑的（平均亮度 ${px.meanLum}、非黑块占比 ${px.nonBlackRatio}、${px.width}×${px.height}）` +
+        ` —— 场景可能一笔没画（先看 __solarProbe 的几何是否正常，再看 draws/tris）`,
+    );
+  }
+}
+
 async function run(browser, spec) {
   const context = await browser.newContext({
     viewport: spec.viewport,
@@ -297,7 +368,8 @@ async function run(browser, spec) {
 
   const result = { pass: spec.name, url: spec.url, errors };
   try {
-    await page.goto(spec.url, { waitUntil: "load", timeout: 30000 });
+    // ?diag=1：只为打开 preserveDrawingBuffer（画布像素体检要用），不改产品行为
+    await page.goto(withDiag(spec.url), { waitUntil: "load", timeout: 30000 });
     await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
     await page.waitForTimeout(1200);
 
@@ -317,6 +389,9 @@ async function run(browser, spec) {
       await page.waitForTimeout(1500); // 等镜头聚焦动画走完
     }
 
+    // 定稿态再采样：点选后镜头更近，画面内容更多
+    result.canvasPixels = await sampleCanvasPixels(page);
+
     await page.screenshot({ path: path.join(SHOTS, `${spec.name}.png`) });
   } catch (err) {
     errors.push(`fatal: ${err.message}`);
@@ -327,6 +402,7 @@ async function run(browser, spec) {
   if (errors.length) failures.push(`${spec.name}: 控制台/页面报错 ${errors.length} 条`);
   if (result.canvas !== 1) failures.push(`${spec.name}: canvas 数量 ${result.canvas} ≠ 1`);
   if (result.overflowX > 1) failures.push(`${spec.name}: 横向溢出 ${result.overflowX}px`);
+  judgeCanvasPixels(spec.name, result.canvasPixels);
   if (spec.expectSelected && result.selected !== spec.expectSelected) {
     failures.push(`${spec.name}: 点选后卡片是「${result.selected}」，期望「${spec.expectSelected}」`);
   }
@@ -403,8 +479,10 @@ try {
     await numPage.goto(base, { waitUntil: "load" });
     await numPage.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
 
-    // A1 帧时间：分两段采。启动段单列不判（首屏要逐像素生成 7 张行星贴图，必然有阻塞），
+    // A1 帧时间：分两段采。启动段单列不判（首帧要几何首建 + 13 张程序化贴图排队；
+    //    1.1.2 起贴图改成 5ms 分帧，但那只是把一次性成本摊进若干帧，仍然会拉高启动段的间隔），
     //    稳态段才断言 —— 混在一起测会把一次性成本当成持续缺陷。
+    //    贴图预算的实测数字见 scripts/README.md「贴图预算与首屏」（node scripts/texture-report.mjs）。
     //    判定见 judgeFrameTime：绝对 ms 只记录，判的是「场景 ÷ 本次机器基线」的比值。
     const startupDeltas = await collectDeltas(numPage);
     await numPage.waitForTimeout(2500); // 让贴图与几何生成完
@@ -508,10 +586,12 @@ try {
       }
       return { bodies: count, samples, centerOffsetPx: +maxOffset.toFixed(3) };
     });
+    const protoCanvas = await sampleCanvasPixels(protoPage);
     await protoPage.screenshot({ path: path.join(SHOTS, "proto-real.png") });
-    results.push({ pass: "proto-real", ...proto, errors: protoErrors });
+    results.push({ pass: "proto-real", ...proto, canvasPixels: protoCanvas, errors: protoErrors });
     if (proto.bodies !== 3) failures.push(`proto-real: 原型应有 3 个天体，实际 ${proto.bodies}`);
     if (proto.centerOffsetPx > 1) failures.push(`proto-real: 地球没钉在屏幕中心，偏移 ${proto.centerOffsetPx}px`);
+    judgeCanvasPixels("proto-real", protoCanvas);
     if (protoErrors.length) failures.push(`proto-real: 报错 ${protoErrors.length} 条`);
   } catch (err) {
     failures.push(`proto-real: ${err.message}`);

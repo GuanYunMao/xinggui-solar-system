@@ -1081,22 +1081,214 @@ function Trails() {
   );
 }
 
-function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
+/**
+ * 控制权恢复的唯一入口。
+ *
+ * 调用点只有两个，都是「切换/动画刚结束」：
+ *   1) 沙盘聚焦动画走到 u>=1（此时 store 可能已放锁，也可能自己顺手放）；
+ *   2) switching 变成 null 那一下，而当前没有动画在跑（SandboxCamera 里的 effect）。
+ *
+ * 第 2 条就是 R9 要求显式化的那条不变式。旧代码把它隐含成「回沙盘必然伴随一次
+ * resetToken 动画」—— 只要这个前提被打破（动画没起来、目标天体已不在系统里、
+ * 回调被别的切换打断），controls.enabled 就再也没人打开，从实境回来视角永久拖不动。
+ * store 的 armSwitchTimeout(1500ms) 保证 switching 一定回到 null，所以第 2 条一定可达。
+ */
+function releaseControls(controls: OrbitControlsImpl) {
+  controls.enableRotate = true;
+  controls.enableZoom = true;
+  controls.enabled = true;
+}
+
+/** 「从实境切回沙盘」时占住 appliedKey 的哨兵：真实 key 永远是 `${id}|${token}`，撞不上。 */
+const RETURNING_KEY = "←from-real";
+
+/**
+ * 米制相机（实境 / ?proto=1）：每帧独占相机，机位由 frameEarthMoon（或抖动夹具的固定机位）
+ * 直接算出来，不接受用户拖拽 —— `controls.enabled` 每帧强制 false。
+ *
+ * 为什么必须是独立组件：它和沙盘那台 OrbitControls 相机是两套完全不同的东西，
+ * 共享 anim/appliedKey 只会逼出「谁该把共享 ref 补写成真话」这类补丁。现在谁挂载谁负责，
+ * 卸载就是卸载 —— 不存在跨模式的状态残留。（旧 CameraRig 里米制分支最后那两行
+ * `appliedKey.current = …; appliedMode.current = mode;` 就是为此存在的。）
+ */
+function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
   const { byId, spec } = useSystem();
+  const reg = useRegistry();
+  const camera = useThree((state) => state.camera);
+  const gl = useThree((state) => state.gl);
+  const switching = useSim((state) => state.switching);
+  /** 放锁只做一次，避免每帧调 finishSwitch */
+  const released = useRef(false);
+  const diagTick = useRef(0);
+  const scratch = useMemo(
+    () => ({
+      pos: new THREE.Vector3(),
+      dest: new THREE.Vector3(),
+      target: new THREE.Vector3(),
+      sunDir: new THREE.Vector3(),
+      camDir: new THREE.Vector3(),
+    }),
+    [],
+  );
+
+  useFrame(() => {
+    const controls = controlsRef.current;
+    if (!controls) return;
+    const earth = reg.groups.get("earth");
+    if (!earth) return;
+    // 这台相机每帧独占相机：OrbitControls 每帧 update() 会把相机拉回它自己的球坐标状态，
+    // 必须关掉，否则手动摆放的机位会被覆盖。
+    controls.enabled = false;
+    earth.getWorldPosition(scratch.dest);
+    let dist = PROTO_DIST;
+
+    /*
+     * 机位必须落在「地球→太阳」这个方向上，不能挂在世界固定角上。
+     * 之前的写法用 performance.now()*0.0003 转方位角，而地球公转角速度是
+     * 2π/18 = 0.349 rad/s —— 两者几乎同速，方位差被锁死在 ~0。
+     * 结果相机永远停在地球背光侧（实测 toSun·toCam = −0.98），
+     * 片元着色器的 shade 地板 0.08 把整颗球压到 RGB(2,3,5)，
+     * 比清屏色 #07090e 还暗 —— 画面全黑的真正原因就在这里，
+     * 不是相机没到位、不是天体没到位、也不是被 near/far 裁掉。
+     *
+     * 现在：相机站在地球与太阳之间（相位角 0），整面受光；再抬 12° 俯视一点，
+     * 相位角 12° 时最远端点的 dot(N,L) = −sin12° = −0.21，
+     * shade 仍有 0.25，整个轮廓都亮 —— 像素回读的遮罩才能量到真正的圆盘，
+     * 而不是"受光的那一块"。
+     *
+     * 运动：绕「日向轴」滚转 ±10° 做慢摆，再叠 ±1% 的径向呼吸。
+     * 绕日向轴转的好处是与太阳的夹角恒定，受光区域一点不变；纯径向呼吸虽然
+     * 也不改受光，但误差几乎全落在视线方向上，投影上扫不出横向位移（实测对照
+     * 组只差 0.05 px），必须有横向的三维位移才能把 float32 量化扫出来。
+     */
+    scratch.sunDir.copy(scratch.dest).negate().normalize();
+    if (PROTO_HARNESS) {
+      scratch.camDir.copy(scratch.sunDir);
+      scratch.camDir.applyAxisAngle(perpAxis(scratch.sunDir), 0.2126); // 抬 12° 俯视
+      // 绕「日向轴」滚转 ±10°：与太阳的夹角恒定，受光区域完全不变，
+      // 但相机在三维里扫一个锥面，float32 的量化误差才会在屏幕横向扫出来。
+      // 只做径向呼吸的话，误差几乎全落在视线方向上，投影上根本看不见。
+      scratch.camDir.applyAxisAngle(scratch.sunDir, 0.17 * Math.sin(performance.now() * 0.0016));
+      const breath = 1 + 0.01 * Math.sin(performance.now() * 0.00314);
+      camera.position.copy(scratch.dest).addScaledVector(scratch.camDir, STILL ? dist : dist * breath);
+      controls.target.copy(scratch.dest);
+      camera.lookAt(scratch.dest);
+    } else {
+      /*
+       * 实地取景：地月同框，站在日向一侧（太阳在相机背后，两颗都正面受光）。
+       * 之前这里用的是「系统外缘 2.4 倍」的全景位，地球在 7.2e11 m 外只是亚像素 ——
+       * 那不是实境，是一张星图。取景距离的推导见 systems.frameEarthMoon。
+       */
+      const moon = reg.groups.get("moon");
+      const earthR = byId.earth?.radius ?? 6.371e6;
+      if (moon) moon.getWorldPosition(scratch.pos);
+      const pose = frameEarthMoon(
+        { x: scratch.dest.x, y: scratch.dest.y, z: scratch.dest.z },
+        moon ? { x: scratch.pos.x, y: scratch.pos.y, z: scratch.pos.z } : null,
+        earthR,
+      );
+      dist = pose.dist;
+      scratch.target.set(pose.target[0], pose.target[1], pose.target[2]);
+      scratch.camDir.set(pose.dir[0], pose.dir[1], pose.dir[2]);
+      camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
+      controls.target.copy(scratch.target);
+      camera.lookAt(scratch.target);
+    }
+
+    /*
+     * far 必须覆盖整个系统，不能只按"到焦点"算。
+     * 之前 far = max(1.25·d, 16384·near)：d=2.5e7 时上界只有 1.0e8，
+     * 而月球在 3.6e8、太阳在 1.5e11 —— 两颗都在远平面之外，被视锥剔除，
+     * 从来没有渲染过。探针只算屏幕投影不看裁剪面，所以"返回 3 个天体"
+     * 一直是对的，而画面里只有一颗地球。
+     */
+    let farFloor = 0;
+    for (const b of spec.bodies) {
+      const g = reg.groups.get(b.id);
+      if (!g) continue;
+      g.getWorldPosition(scratch.pos);
+      farFloor = Math.max(farFloor, camera.position.distanceTo(scratch.pos) + b.radius * 4);
+    }
+    tightenClipPlanes(camera as THREE.PerspectiveCamera, dist, farFloor * 1.2);
+
+    /*
+     * 米制相机的放锁点。
+     *
+     * 这台相机没有过渡动画：位置在这一帧就已经摆好，「动画结束」就等于「这一帧」。
+     * 旧代码里这段写在一支每帧提前 return 的分支里，注释说得很清楚——沙盘那个
+     * 「动画跑完 → finishSwitch()」的释放点对它永远走不到。现在它是自己的组件、
+     * 自己的帧回调，不需要再解释这件事。
+     *
+     * 在这里放锁是安全的：这支每帧都重写 camera.position，OrbitControls 就算被放开
+     * 也挪不动相机，不存在"黑幕里被拖歪"的窗口。黑场由壳层负责。
+     */
+    if (switching === "toReal" && !released.current) {
+      released.current = true;
+      useSim.getState().finishSwitch();
+    } else if (switching === null) {
+      released.current = false;
+    }
+
+    if (DIAG && diagTick.current++ % 20 === 0) {
+      const persp = camera as THREE.PerspectiveCamera;
+      const ndc = scratch.dest.clone().project(camera);
+      // 太阳（原点）→地球 与 地球→相机 两个单位向量的点积：>0 表示看着昼半球
+      const toSun = scratch.sunDir;
+      const toCam = camera.position.clone().sub(scratch.dest).normalize();
+      const lit = toSun.dot(toCam);
+      const ctx = gl.getContext();
+      const bw = gl.domElement.width;
+      const bh = gl.domElement.height;
+      const px = new Uint8Array(4);
+      ctx.readPixels(bw >> 1, bh >> 1, 1, 1, ctx.RGBA, ctx.UNSIGNED_BYTE, px);
+      console.log(
+        "[proto]",
+        JSON.stringify({
+          camToEarth: camera.position.distanceTo(scratch.dest).toExponential(3),
+          near: persp.near.toExponential(3),
+          far: persp.far.toExponential(3),
+          ndc: [ndc.x, ndc.y, ndc.z].map((n) => +n.toFixed(4)),
+          draws: gl.info.render.calls,
+          tris: gl.info.render.triangles,
+          litFace: +lit.toFixed(4),
+          centerRGBA: Array.from(px),
+          legacy: LEGACY_SHADER,
+        }),
+      );
+    }
+  }, -2);
+
+  return null;
+}
+
+/**
+ * 沙盘相机：OrbitControls 那一套（首次摆位、聚焦动画、跟随天体、总览回位、竖屏视野）。
+ *
+ * 只在沙盘系统挂载 —— 切进米制时它整个卸载（见 Scene 里的三元）。这是 R2 拆分的核心：
+ * 两套相机不再共享 anim / appliedKey，也就没有"米制分支每帧把共享 ref 补写成真话"的补丁
+ * （旧 CameraRig 里那一行 `appliedKey.current = …|${mode}` 就是）。
+ */
+function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
+  const { byId } = useSystem();
   const camera = useThree((state) => state.camera);
   const size = useThree((state) => state.size);
-  const gl = useThree((state) => state.gl);
   const reg = useRegistry();
   const selectedId = useSim((state) => state.selectedId);
   const resetToken = useSim((state) => state.resetToken);
   /*
    * 模式切换锁（store 层由 t12 立的 switching，1500ms 兜底）。
    * 禁拖拽/缩放只能在渲染层做 —— controls 在这儿，HUD 那边碰不到。
-   * 释放点按 store 的契约走：finishSwitch() 由渲染层在相机动画结束时调用，
-   * 是 `switching` 的唯一释放点（超时兜底在 store 里，不归这里管）。
+   * 放锁（finishSwitch）按 store 的契约只在相机动画结束时调用；超时兜底在 store 里。
    */
   const switching = useSim((state) => state.switching);
-  const mode = useSim((state) => state.mode);
+  /*
+   * 从实境切回来的那一刻：store 的 setMode("sandbox") 同一拍置 switching="toSandbox"、
+   * bump resetToken。此时本组件才被挂载，但相机还停在米制机位上（1e7~1e11 m 量级），
+   * 它不是「首次进场」—— 不能 applyHome 瞬切，而要像老代码那样从这里起一次回归动画。
+   * 做法：posed 直接初始化成 true、appliedKey 占一个不可能等于当帧 key 的哨兵，
+   * 让下面常规的 key 比对分支走 startFocus（这也让 initial 判定为 false）。
+   */
+  const returning = useRef(useSim.getState().switching === "toSandbox").current;
 
   /*
    * 这里原本有一个 `dip()`：命令式 append 一层黑 div，再等一个 rAF 才把 opacity 设成 1。
@@ -1111,7 +1303,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   sizeRef.current = size;
   // 用 state 而不是 ref：r3f 首帧尺寸是 0，摆好相机会发生在之后的一次渲染，
   // 注意力放在 ref 上时聚焦 effect 的依赖永远不变，等于永不重跑（深链就白选了）。
-  const [posed, setPosed] = useState(false);
+  const [posed, setPosed] = useState(returning);
   const anim = useRef<{
     t: number;
     dur: number;
@@ -1134,16 +1326,16 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       home: new THREE.Vector3(),
       origin: new THREE.Vector3(),
       delta: new THREE.Vector3(),
-      sunDir: new THREE.Vector3(),
-      camDir: new THREE.Vector3(),
     }),
     [],
   );
 
-  // 首次摆位放在帧循环里做（见 useFrame）。放 layout effect 里不可靠：
-  // <OrbitControls> 排在 CameraRig 之后挂载，此时 ref 还是 null，
-  // 而尺寸之后不再变化的话这个 effect 也不会重跑 —— posed 永远是 false，
-  // 深链选中了却永远不聚焦，就是这么来的。
+  /*
+   * 首次摆位放在帧循环里做（见 useFrame）。放 layout effect 里不可靠：
+   * <OrbitControls> 排在相机组件之后挂载，此时 ref 还是 null，
+   * 而尺寸之后不再变化的话这个 effect 也不会重跑 —— posed 永远是 false，
+   * 深链选中了却永远不聚焦，就是这么来的。
+   */
 
   // 横竖屏切换时视野没重算：转屏后 fov 还停在竖屏的 56°，全景被裁掉一圈。
   // 只在总览状态重排，跟随某颗行星时不动镜头（否则用户转个屏就被踢回全景）。
@@ -1168,10 +1360,7 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   wantId.current = selectedId;
   const wantReset = useRef(resetToken);
   wantReset.current = resetToken;
-  const appliedKey = useRef<string | null>(null);
-  const appliedMode = useRef<string>("sandbox");
-  /** 米制分支的放锁只做一次，避免每帧调 finishSwitch */
-  const switchReleased = useRef(false);
+  const appliedKey = useRef<string | null>(returning ? RETURNING_KEY : null);
 
   const startFocus = (controls: OrbitControlsImpl, id: string | null) => {
     const reduced =
@@ -1207,15 +1396,9 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
   };
 
   /*
-   * 这里原本有一个 `startSwitchPose`（0.9s 飞向"系统外缘 2.4 倍"的切换动画）。
-   * 已删除：米制分支每帧独占相机并提前 return，这个函数永远走不到 —— 它和
-   * systems.ts 里配套的 realPose() 都是死代码。进实地是瞬切，而且壳层有黑幕
-   * 盖着那一下，动画本来也看不见。实地的取景现在由 frameEarthMoon 在米制分支里
-   * 每帧直接算（地月同框），不再需要一条独立的切换轨迹。
-   */
-
-  /*
-   * 切换结束（switching → null）时把控制权还回去。
+   * 切换结束（switching → null）时把控制权还回去 —— 这是 R9 那条不变式的第 2 条路径，
+   * 也是「无动画时的恢复分支」：不管回归动画有没有起来，store 的 1500ms 兜底一定会
+   * 把 switching 落回 null，于是这里一定会跑到。
    * 有动画在跑的话不在这里抢：那种情况由动画结束处（u>=1 那一支）负责恢复，
    * 两处都以 switching 为条件，谁先到都不会提前开锁。
    */
@@ -1226,156 +1409,21 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       c.enableRotate = false;
       c.enableZoom = false;
     } else if (!anim.current) {
-      c.enableRotate = true;
-      c.enableZoom = true;
-      c.enabled = true;
+      releaseControls(c);
     }
   }, [switching, controlsRef]);
+
+  /** 这里原本有一个 `startSwitchPose`…已删除（见 MeterCamera 的注释）。 */
 
   useFrame((_, raw) => {
     const controls = controlsRef.current;
     if (!controls) return;
 
-    // 实境原型（?proto=1）：相机绕地球缓慢公转且始终看向它。
-    // 地球的世界坐标是 1.5e11 米量级，相机离它 1e7 米 —— 这个比例的减法
-    // 只要发生在 float32 里就会抖。地球被 lookAt 钉在屏幕中心，
-    // 屏幕上任何偏移都只可能来自精度误差，这就是抖动断言量的东西。
-    if (spec.unit === "meter") {
-      const earth = reg.groups.get("earth");
-      if (earth) {
-        // 原型模式下相机由这里独占：OrbitControls 每帧 update() 会把相机拉回它自己的
-        // 球坐标状态，必须关掉，否则手动摆放的机位会被覆盖。
-        controls.enabled = false;
-        earth.getWorldPosition(scratch.dest);
-        let dist = PROTO_DIST;
-
-        /*
-         * 机位必须落在「地球→太阳」这个方向上，不能挂在世界固定角上。
-         * 之前的写法用 performance.now()*0.0003 转方位角，而地球公转角速度是
-         * 2π/18 = 0.349 rad/s —— 两者几乎同速，方位差被锁死在 ~0。
-         * 结果相机永远停在地球背光侧（实测 toSun·toCam = −0.98），
-         * 片元着色器的 shade 地板 0.08 把整颗球压到 RGB(2,3,5)，
-         * 比清屏色 #07090e 还暗 —— 画面全黑的真正原因就在这里，
-         * 不是相机没到位、不是天体没到位、也不是被 near/far 裁掉。
-         *
-         * 现在：相机站在地球与太阳之间（相位角 0），整面受光；再抬 12° 俯视一点，
-         * 相位角 12° 时最远端点的 dot(N,L) = −sin12° = −0.21，
-         * shade 仍有 0.25，整个轮廓都亮 —— 像素回读的遮罩才能量到真正的圆盘，
-         * 而不是"受光的那一块"。
-         *
-         * 运动：绕「日向轴」滚转 ±10° 做慢摆，再叠 ±1% 的径向呼吸。
-         * 绕日向轴转的好处是与太阳的夹角恒定，受光区域一点不变；纯径向呼吸虽然
-         * 也不改受光，但误差几乎全落在视线方向上，投影上扫不出横向位移（实测对照
-         * 组只差 0.05 px），必须有横向的三维位移才能把 float32 量化扫出来。
-         */
-        scratch.sunDir.copy(scratch.dest).negate().normalize();
-        if (PROTO_HARNESS) {
-          scratch.camDir.copy(scratch.sunDir);
-          scratch.camDir.applyAxisAngle(perpAxis(scratch.sunDir), 0.2126); // 抬 12° 俯视
-          // 绕「日向轴」滚转 ±10°：与太阳的夹角恒定，受光区域完全不变，
-          // 但相机在三维里扫一个锥面，float32 的量化误差才会在屏幕横向扫出来。
-          // 只做径向呼吸的话，误差几乎全落在视线方向上，投影上根本看不见。
-          scratch.camDir.applyAxisAngle(scratch.sunDir, 0.17 * Math.sin(performance.now() * 0.0016));
-          const breath = 1 + 0.01 * Math.sin(performance.now() * 0.00314);
-          camera.position.copy(scratch.dest).addScaledVector(scratch.camDir, STILL ? dist : dist * breath);
-          controls.target.copy(scratch.dest);
-          camera.lookAt(scratch.dest);
-        } else {
-          /*
-           * 实地取景：地月同框，站在日向一侧（太阳在相机背后，两颗都正面受光）。
-           * 之前这里用的是「系统外缘 2.4 倍」的全景位，地球在 7.2e11 m 外只是亚像素 ——
-           * 那不是实境，是一张星图。取景距离的推导见 systems.frameEarthMoon。
-           */
-          const moon = reg.groups.get("moon");
-          const earthR = byId.earth?.radius ?? 6.371e6;
-          if (moon) moon.getWorldPosition(scratch.pos);
-          const pose = frameEarthMoon(
-            { x: scratch.dest.x, y: scratch.dest.y, z: scratch.dest.z },
-            moon ? { x: scratch.pos.x, y: scratch.pos.y, z: scratch.pos.z } : null,
-            earthR,
-          );
-          dist = pose.dist;
-          scratch.target.set(pose.target[0], pose.target[1], pose.target[2]);
-          scratch.camDir.set(pose.dir[0], pose.dir[1], pose.dir[2]);
-          camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
-          controls.target.copy(scratch.target);
-          camera.lookAt(scratch.target);
-        }
-
-        /*
-         * far 必须覆盖整个系统，不能只按"到焦点"算。
-         * 之前 far = max(1.25·d, 16384·near)：d=2.5e7 时上界只有 1.0e8，
-         * 而月球在 3.6e8、太阳在 1.5e11 —— 两颗都在远平面之外，被视锥剔除，
-         * 从来没有渲染过。探针只算屏幕投影不看裁剪面，所以"返回 3 个天体"
-         * 一直是对的，而画面里只有一颗地球。
-         */
-        let farFloor = 0;
-        for (const b of spec.bodies) {
-          const g = reg.groups.get(b.id);
-          if (!g) continue;
-          g.getWorldPosition(scratch.pos);
-          farFloor = Math.max(farFloor, camera.position.distanceTo(scratch.pos) + b.radius * 4);
-        }
-        tightenClipPlanes(camera as THREE.PerspectiveCamera, dist, farFloor * 1.2);
-
-        /*
-         * 米制分支的放锁点。
-         *
-         * 这一支每帧独占相机并提前 return，所以下面「动画跑完 → finishSwitch()」
-         * 那个释放点永远走不到。t16 曾在 App.tsx 里借了一个 320ms 超时来补，
-         * 那是壳层给渲染层擦屁股，现已由 designer 删除 —— 释放点只留这一个。
-         * 正确的点在渲染层：这支的相机没有过渡动画，位置在这一帧就已经摆好，
-         * "动画结束"就等于"这一帧"。
-         *
-         * 在这里放锁是安全的：这支每帧都重写 camera.position，OrbitControls
-         * 就算被放开也挪不动相机，不存在"黑幕里被拖歪"的窗口。
-         * 黑场由壳层负责（渲染层的 dip 已删），这里只管相机和锁。
-         */
-        if (switching === "toReal" && !switchReleased.current) {
-          switchReleased.current = true;
-          useSim.getState().finishSwitch();
-        } else if (switching === null) {
-          switchReleased.current = false;
-        }
-
-        /*
-         * 这一支不看 appliedKey，但必须把 appliedKey/appliedMode 保持成"真话"：
-         * 否则从实地切回沙盘时，appliedMode 还停在 "sandbox"，比对下来会认为
-         * "没换过模式"，重取景不触发，相机就停在上一次的位置。
-         */
-        appliedKey.current = `${wantId.current ?? ""}|${wantReset.current}|${mode}`;
-        appliedMode.current = mode;
-
-        if (DIAG && diagTick.current++ % 20 === 0) {
-          const persp = camera as THREE.PerspectiveCamera;
-          const ndc = scratch.dest.clone().project(camera);
-          // 太阳（原点）→地球 与 地球→相机 两个单位向量的点积：>0 表示看着昼半球
-          const toSun = scratch.sunDir;
-          const toCam = camera.position.clone().sub(scratch.dest).normalize();
-          const lit = toSun.dot(toCam);
-          const ctx = gl.getContext();
-          const bw = gl.domElement.width;
-          const bh = gl.domElement.height;
-          const px = new Uint8Array(4);
-          ctx.readPixels(bw >> 1, bh >> 1, 1, 1, ctx.RGBA, ctx.UNSIGNED_BYTE, px);
-          console.log(
-            "[proto]",
-            JSON.stringify({
-              camToEarth: camera.position.distanceTo(scratch.dest).toExponential(3),
-              near: persp.near.toExponential(3),
-              far: persp.far.toExponential(3),
-              ndc: [ndc.x, ndc.y, ndc.z].map((n) => +n.toFixed(4)),
-              draws: gl.info.render.calls,
-              tris: gl.info.render.triangles,
-              litFace: +lit.toFixed(4),
-              centerRGBA: Array.from(px),
-              legacy: LEGACY_SHADER,
-            }),
-          );
-        }
-      }
-      return;
-    }
+    /*
+     * 米制（实境 / ?proto=1）的相机摆位不在这里 —— 它搬进了 <MeterCamera>。
+     * 那个组件只在自己挂载时存在，本组件只负责沙盘；两套相机不再共享 anim/appliedKey，
+     * 所以这里不需要再"把共享 ref 说成真话"（旧的 appliedKey/appliedMode.upkeep 就是这么来的）。
+     */
 
     // 每帧按焦点距离收窄 near/far：固定值在 1:1 下不可能覆盖 4.87e9 的跨度
     tightenClipPlanes(
@@ -1399,11 +1447,20 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
     /*
      * 模式切换期间禁用拖拽/缩放。放在每帧最前面强制写一次，是因为 drei 的
      * <OrbitControls> 会在自身重渲染时按 props 把开关刷回默认值，只在 useEffect
-     * 里设一次会被它盖掉。动画结束处的恢复也改成看 switching，两处不会互相提前开锁。
+     * 里设一次会被它盖掉。
      */
     if (switching) {
       controls.enableRotate = false;
       controls.enableZoom = false;
+    }
+
+    /*
+     * 不变式（R9，只在 ?diag=1 下检查）：不在切换里、也没有动画在跑时，控制权必须是开的。
+     * 它把旧代码里"回沙盘必然伴随一次 resetToken 动画，所以动画结束处一定能把 enabled
+     * 打开"这个隐含前提变成可观测的：谁把恢复路径弄断了，下一帧就会在控制台看到这行。
+     */
+    if (DIAG && switching === null && !anim.current && !controls.enabled) {
+      console.warn("[cam] 控制权没恢复：无切换、无动画，但 controls.enabled=false");
     }
 
     // 首次摆位：等控件和尺寸都就绪，在这里做才不会错过头
@@ -1414,18 +1471,22 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
       setPosed(true);
     }
 
-    // 选中变化（点芯片 / 深链 / 返回总览）或模式变化 → 起一次镜头动画。
-    // mode 必须进 key：setMode("toReal") 不 bump resetToken，只靠 selectedId|resetToken
-    // 的话切模式根本不重算相机，相机停在原位（t13 收口的三件事之一）。
-    const key = `${wantId.current ?? ""}|${wantReset.current}|${mode}`;
+    /*
+     * 选中变化（点芯片 / 深链 / 返回总览 / refocus）→ 起一次镜头动画。
+     *
+     * key 里**没有 mode**：切模式会让整个组件卸载再重挂（见 Scene 里的三元），重挂时
+     * appliedKey 要么是 null（首次进场 → 直接 applyHome，不起动画），要么是 RETURNING_KEY
+     * （从实境回来 → 起回归动画）。两种情况都已经把"要不要起动画"决定完了，不需要
+     * 再拿 mode 当去重键 —— 旧代码之所以需要，正是因为两套相机共用一个组件、共享 ref。
+     */
+    const key = `${wantId.current ?? ""}|${wantReset.current}`;
     if (posed && appliedKey.current !== key) {
       const initial = appliedKey.current === null;
       appliedKey.current = key;
-      appliedMode.current = mode;
       // 黑场已挪到壳层（渲染层的 dip 已删）：这里只负责相机。
-      // 切进实地不在这里起动画 —— 米制分支每帧直接摆位（见 frameEarthMoon），
-      // 从实地切回沙盘仍然走 startFocus，回到「带着目标的沙盘聚焦位」。
-      if (!initial && mode !== "real") startFocus(controls, wantId.current);
+      // 进实境不在这里起动画（那台相机是 MeterCamera 的事）；从实境切回来则是
+      // appliedKey = RETURNING_KEY（不是 null），所以 initial=false，照常起飞回动画。
+      if (!initial) startFocus(controls, wantId.current);
     }
 
     const delta = Math.min(raw, 0.1);
@@ -1496,13 +1557,15 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
          * 超时兜底在 store 里（1500ms），不归这里。
          */
         const stillSwitching = useSim.getState().switching !== null;
-        controls.enableRotate = !stillSwitching;
-        controls.enableZoom = !stillSwitching;
-        // enabled 与动画同生命周期：动画期间静音（否则 maxDistance=280 的距离夹取
-        // 会把相机从 1e11 拽回 280，和动画互相拉扯），跑完这里必须还回来，
-        // 不然切一次实境回来视角就永久拖不动。
-        controls.enabled = !stillSwitching;
-        if (stillSwitching) useSim.getState().finishSwitch();
+        if (stillSwitching) {
+          // 动画先于放锁结束：保持静音，放锁后由 switching effect 的无动画分支恢复。
+          controls.enableRotate = false;
+          controls.enableZoom = false;
+          controls.enabled = false;
+          useSim.getState().finishSwitch();
+        } else {
+          releaseControls(controls);
+        }
         if (!current.home && current.toId) {
           followId.current = current.toId;
           const obj = reg.groups.get(current.toId);
@@ -1954,6 +2017,58 @@ function PickLayer() {
   return null;
 }
 
+/*
+ * ?trace=1：逐帧记录相机位置 / 目标 / 朝向偏差，用来做「相机层重构前后行为等价」的对照。
+ *
+ * 为什么不是 ?diag=1：diag 的沙盘遥测每 30 帧才打一次，米制分支只打「到地球多远」不打机位，
+ * 拆组件那种逐帧比对根本不够用。这里只读、不改变任何相机行为，正常路径上一次分支就返回。
+ *
+ * `window.__camPhase` 由外部夹具在每次交互前写一个阶段标签（临时脚本里做的事），
+ * trace 顺带记下来，比对时按阶段切片即可 —— 两次运行的动画帧数本来就不同，按索引硬对没意义。
+ */
+const TRACE = typeof window !== "undefined" && new URLSearchParams(window.location.search).has("trace");
+const TRACE_LIMIT = 4096;
+
+type CamTraceEntry = { ph: string; t: number; mode: string; p: number[]; tg: number[]; a: number };
+
+function traceCam(mode: string, camera: THREE.Camera, target: THREE.Vector3 | null) {
+  if (!TRACE) return;
+  const w = window as unknown as { __camTrace?: CamTraceEntry[]; __camPhase?: string };
+  const list = (w.__camTrace ??= []);
+  if (list.length >= TRACE_LIMIT) return;
+  const fwd = new THREE.Vector3();
+  camera.getWorldDirection(fwd);
+  let angle = 0;
+  if (target) {
+    const toTarget = target.clone().sub(camera.position).normalize();
+    angle = THREE.MathUtils.radToDeg(Math.acos(Math.min(1, Math.max(-1, fwd.dot(toTarget)))));
+  }
+  list.push({
+    ph: w.__camPhase ?? "",
+    t: +performance.now().toFixed(1),
+    mode,
+    p: [camera.position.x, camera.position.y, camera.position.z],
+    tg: target ? [target.x, target.y, target.z] : [Number.NaN, Number.NaN, Number.NaN],
+    a: +angle.toFixed(3),
+  });
+}
+
+/**
+ * 相机轨迹记录器。优先级 -1：排在相机组件（-2）之后跑，量到的是当帧最终机位。
+ * **必须是负数**：r3f 里任何 `useFrame(cb, priority > 0)` 都会把自动渲染关掉
+ * （`internal.priority` 非零 → 循环不再 `gl.render`，只剩手动渲染）。我第一版给的 10
+ * 就让整个场景一笔没画：相机数据、探针、贴图全正常，屏幕上却只有 HUD —— 正是
+ * verifier 在 ?proto=1&diag=1 里看到的 `draws: 0, tris: 0`。诊断组件不该有这个权力。
+ */
+function CamTrace({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | null> }) {
+  const camera = useThree((state) => state.camera);
+  const { spec } = useSystem();
+  useFrame(() => {
+    traceCam(spec.unit === "meter" ? "meter" : "sandbox", camera, controlsRef.current?.target ?? null);
+  }, -1);
+  return null;
+}
+
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
@@ -1991,7 +2106,17 @@ function Scene() {
       />
       {decor && <Asteroids />}
       {decor && <Trails />}
-      <CameraRig controlsRef={controlsRef} />
+      {/*
+        相机按「系统单位」二选一挂载，不是运行时 if：米制与沙盘是两套完全不同的相机，
+        同一时刻只有一台存在。这样切模式就等于「卸载一台 + 挂载另一台」，各自只在自己
+        挂载时摆位 —— 不需要任何跨模式共享的状态，也就没有"谁该把 ref 补写成真话"。
+      */}
+      {spec.unit === "meter" ? (
+        <MeterCamera controlsRef={controlsRef} />
+      ) : (
+        <SandboxCamera controlsRef={controlsRef} />
+      )}
+      <CamTrace controlsRef={controlsRef} />
       <OrbitControls
         ref={controlsRef}
         enablePan={false}
