@@ -75,6 +75,7 @@ export function Hud() {
 /* ────────────────────────────── 沙盘：导航台 ────────────────────────────── */
 
 function SandboxHud() {
+  const compact = useCompact();
   return (
     <>
       <HudHeader trailing={<Epoch />} />
@@ -82,10 +83,10 @@ function SandboxHud() {
       <Chips />
       <Moons />
       <div className="relative min-h-0 flex-1">
-        <SandboxCard />
+        <SandboxCard compact={compact} />
         <EmptyHint />
       </div>
-      <Dock />
+      <Dock compact={compact} />
     </>
   );
 }
@@ -156,27 +157,79 @@ function Chips() {
   const select = useSim((state) => state.select);
   const { byId, chips } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [edge, setEdge] = useState({ left: false, right: false });
+
+  /*
+   * 渐隐提示：判据是**真的溢出了没有**，不是"宽度小于某个数"。
+   * 390 宽下 9 颗只露 5.4 颗，右侧必须告诉人还有东西；1280 宽下没溢出，两层遮罩都不出现。
+   * 判据跟实际滚动位置走，所以滑到最右时右箭头自动消失、滑回来左箭头自动出现。
+   */
+  const measure = useCallback(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    const left = el.scrollLeft > 2;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+    setEdge((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+  }, []);
+
+  useEffect(() => {
+    const el = rowRef.current;
+    if (!el) return;
+    measure();
+    el.addEventListener("scroll", measure, { passive: true });
+    const ro = new ResizeObserver(measure); // 转屏、窗口拉伸、字体变化都会走到这里
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", measure);
+      ro.disconnect();
+    };
+  }, [measure]);
+
   return (
-    <div className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
-      {chips.map((body) => {
-        const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
-        const active = selectedId === body.id || moonOfThis;
-        return (
-          <button
-            key={body.id}
-            id={`chip-${body.id}`}
-            type="button"
-            className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
-              active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
-            }`}
-            aria-pressed={active}
-            onClick={() => select(body.id)}
-          >
-            <span className="size-2 rounded-full" style={{ backgroundColor: body.swatch }} />
-            {body.name}
-          </button>
-        );
-      })}
+    <div className="relative">
+      <div
+        ref={rowRef}
+        id="chip-row"
+        className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6"
+      >
+        {chips.map((body) => {
+          const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
+          const active = selectedId === body.id || moonOfThis;
+          return (
+            <button
+              key={body.id}
+              id={`chip-${body.id}`}
+              type="button"
+              className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
+                active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
+              }`}
+              aria-pressed={active}
+              onClick={() => select(body.id)}
+            >
+              <span className="size-2 rounded-full" style={{ backgroundColor: body.swatch }} />
+              {body.name}
+            </button>
+          );
+        })}
+      </div>
+      {/* 右侧：还有天体没展开。箭头 + 渐隐同时给，因为"隐约看到半颗"和"知道还有东西"是两件事 */}
+      {edge.right && (
+        <div
+          data-fade="right"
+          className="pointer-events-none absolute inset-y-0 right-0 z-[1] flex w-12 items-center justify-end bg-gradient-to-l from-black/80 via-black/40 to-transparent pr-1"
+        >
+          <ChevronRight className="size-4 text-muted" aria-hidden />
+          <span className="sr-only">右侧尚有天体，横向滑动展开</span>
+        </div>
+      )}
+      {/* 左侧：已经滑开了，反向同款，但不要箭头（箭头会让人以为这是"前进"） */}
+      {edge.left && (
+        <div
+          data-fade="left"
+          className="pointer-events-none absolute inset-y-0 left-0 z-[1] w-8 bg-gradient-to-r from-black/80 via-black/40 to-transparent"
+        />
+      )}
     </div>
   );
 }
@@ -227,15 +280,33 @@ function Moons() {
 
 /**
  * 卡片外壳。手机端是底部抽屉（原来贴在顶部，选中行星时正好盖住星球）；
- * 竖屏时镜头会把星球抬到上半屏，配合这里每屏最多 44% 高度。
+ * 竖屏时镜头会把星球抬到上半屏。
+ *
+ * 结构是「手柄 + 滚动区」两层，**手柄在滚动区外面**：
+ * 一开始把手柄做成 `sticky top-0` 放在滚动区里，滚动时正文会从手柄上方的内边距条里露出来
+ * （实测：卡片顶部能看到被裁掉半行字）。手柄挪出来以后，正文只在自己的框里滚。
+ * 宽屏（`md:`）那张卡没有手柄，只有滚动区 —— 视觉与 1.1.0 完全一致（`p-4` 从 article 挪到了
+ * 滚动区里，渲染结果相同）。
  */
-function CardShell({ id, children }: { id: string; children: ReactNode }) {
+function CardShell({
+  id,
+  maxHeight,
+  handle,
+  children,
+}: {
+  id: string;
+  maxHeight?: string;
+  handle?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <article
       key={id}
-      className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 max-h-[44dvh] overflow-y-auto rounded-xl border border-line bg-elevated p-4 md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
+      style={maxHeight ? { maxHeight } : undefined}
+      className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 flex max-h-[44dvh] flex-col overflow-hidden rounded-xl border border-line bg-elevated md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
     >
-      {children}
+      {handle}
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">{children}</div>
     </article>
   );
 }
@@ -252,11 +323,11 @@ function CardHead({ body, close }: { body: Body; close: ReactNode }) {
   );
 }
 
-function CardBody({ body }: { body: Body }) {
+function CardBody({ body, stackFacts = false }: { body: Body; stackFacts?: boolean }) {
   return (
     <>
       <p className="mt-2 text-sm leading-relaxed text-fg">{body.blurb}</p>
-      <dl className="mt-3 grid grid-cols-2 gap-2 md:gap-3">
+      <dl className={`mt-3 grid gap-2 md:gap-3 ${stackFacts ? "grid-cols-1" : "grid-cols-2"}`}>
         {body.facts.map((fact) => (
           <div key={fact.label} className="rounded-md bg-bg px-3 py-2">
             <dt className="text-xs text-muted">{fact.label}</dt>
@@ -283,17 +354,133 @@ function CloseButton({ className = "" }: { className?: string }) {
   );
 }
 
-function SandboxCard() {
+/* ── 详情卡的三档高度（窄屏） ── */
+
+type SheetStop = "peek" | "half" | "full";
+const SHEET_STOPS: SheetStop[] = ["peek", "half", "full"];
+const SHEET_MAX: Record<SheetStop, string> = { peek: "28dvh", half: "44dvh", full: "76dvh" };
+/** 手柄的读屏文本。视觉上只有一个握把条 —— 握把条不需要翻译，读屏需要一句话。 */
+const SHEET_LABEL: Record<SheetStop, string> = { peek: "收起", half: "半屏", full: "全屏" };
+
+/**
+ * 详情卡抽屉的三档高度。
+ *
+ * 为什么用 `maxHeight` 而不是 `height`：档位是**上限**，不是硬高，内容少的天体不该撑出一片空白。
+ * 由此带来一个必须处理的后果：内容装不满时，更大的档位可能渲染出和上一档一样的高度。
+ * 390×844 实测：每个天体的卡片内容都是 351 px，而「半屏」上限 44dvh = 371 px ——
+ * 如果「全屏」只是把上限提到 76dvh，按下去画面一点不变。**留一个按了没反应的档位，
+ * 比少一个档位更糟**，所以「全屏」不只是变高：它把四格事实改成单列（阅读模式），
+ * 多出来的空间用来换可读性，而不是换空白。这样三档在任何视口下渲染高度都不同。
+ *
+ * 拖动手感：跟手期间用像素，松手吸附到最近的一档；只点不拖则循环到下一档。
+ */
+function CardHandle({
+  stop,
+  onCycle,
+  onDragStart,
+  onDragMove,
+  onDragEnd,
+}: {
+  stop: SheetStop;
+  onCycle: () => void;
+  onDragStart: (clientY: number, height: number) => void;
+  onDragMove: (clientY: number) => void;
+  onDragEnd: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={`详情卡高度：${SHEET_LABEL[stop]}`}
+      aria-expanded={stop !== "peek"}
+      className="hud-btn flex h-11 w-full shrink-0 items-center justify-center rounded-t-xl bg-elevated"
+      onPointerDown={(event) => {
+        const article = event.currentTarget.closest("article");
+        onDragStart(event.clientY, article?.getBoundingClientRect().height ?? 0);
+        event.currentTarget.setPointerCapture(event.pointerId);
+      }}
+      onPointerMove={(event) => onDragMove(event.clientY)}
+      onPointerUp={onDragEnd}
+      onPointerCancel={onDragEnd}
+      onClick={onCycle}
+    >
+      <span className="h-1 w-10 rounded-full bg-line" aria-hidden />
+    </button>
+  );
+}
+
+function SandboxCard({ compact }: { compact: boolean }) {
   const selectedId = useSim((state) => state.selectedId);
   const requestReset = useSim((state) => state.requestReset);
   const { byId } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
+  const [stop, setStop] = useState<SheetStop>("half");
+  const [dragPx, setDragPx] = useState<number | null>(null);
+  const drag = useRef<{ y0: number; h0: number; moved: boolean } | null>(null);
+  /**
+   * 拖完松手时浏览器还会补一个 click。不挡掉的话"拖动吸附"和"点击循环"会连着触发两次，
+   * 手感是"松手后又自己跳了一档"。所以拖过就吃掉紧随其后的那一次 click。
+   */
+  const skipClick = useRef(false);
+
+  const renderedH = (s: SheetStop) =>
+    (parseFloat(SHEET_MAX[s]) / 100) * (typeof window !== "undefined" ? window.innerHeight : 800);
+
   if (!selected) return null;
   return (
-    <CardShell id={selected.id}>
+    <CardShell
+      id={selected.id}
+      maxHeight={compact ? (dragPx === null ? SHEET_MAX[stop] : `${dragPx}px`) : undefined}
+      handle={
+        compact ? (
+          <CardHandle
+            stop={stop}
+            onCycle={() => {
+              if (skipClick.current) {
+                skipClick.current = false;
+                return;
+              }
+              drag.current = null;
+              setDragPx(null);
+              setStop((prev) => SHEET_STOPS[(SHEET_STOPS.indexOf(prev) + 1) % SHEET_STOPS.length]!);
+            }}
+            onDragStart={(clientY, height) => {
+              skipClick.current = false;
+              drag.current = { y0: clientY, h0: height, moved: false };
+            }}
+            onDragMove={(clientY) => {
+              const d = drag.current;
+              if (!d) return;
+              const dy = d.y0 - clientY; // 往上拖 = 变高
+              if (Math.abs(dy) > 4) d.moved = true;
+              if (d.moved) setDragPx(Math.min(Math.max(d.h0 + dy, 120), window.innerHeight * 0.9));
+            }}
+            onDragEnd={() => {
+              const d = drag.current;
+              drag.current = null;
+              if (!d) return;
+              if (!d.moved) return; // 没拖动 = 交给 onClick 循环
+              skipClick.current = true;
+              const height = dragPx ?? d.h0;
+              let best: SheetStop = stop;
+              let bestDist = Infinity;
+              for (const candidate of SHEET_STOPS) {
+                const dist = Math.abs(renderedH(candidate) - height);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  best = candidate;
+                }
+              }
+              setStop(best);
+              setDragPx(null);
+            }}
+          />
+        ) : undefined
+      }
+    >
       {/* 沙盘的 ✕ 只在手机出现：桌面端下面那颗「返回总览」就是出口 */}
       <CardHead body={selected} close={<CloseButton className="md:hidden" />} />
-      <CardBody body={selected} />
+      {/* 全屏档把事实改成单列：这是"全屏"真正做的事，不然它只是和半屏一样高 */}
+      <CardBody body={selected} stackFacts={compact && stop === "full"} />
       {/* 「做过压缩」是沙盘的免责声明 —— 实境恰恰没有压缩，所以这句只活在这里 */}
       <p className="mt-3 hidden text-xs leading-relaxed text-subtle md:block">
         大小与轨道间距做过压缩，方便同屏观看。卡片上的数字仍是真实资料。
@@ -336,6 +523,57 @@ function EmptyHint() {
 /* ────────────────────────────── 沙盘：底栏 ────────────────────────────── */
 
 /**
+ * 两个布局共用的键。抽出来是为了让"3 键"和"5 键"两套布局**不会各自漂**——
+ * 暂停与总览在两个布局里必须长得一模一样，否则玩家换个窗口宽度就得重新认按钮。
+ */
+function PauseKey({ paused, onToggle }: { paused: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md bg-accent text-sm text-accent-fg"
+      aria-label={paused ? "继续模拟" : "暂停模拟"}
+      aria-pressed={paused}
+      onClick={onToggle}
+    >
+      {paused ? <Play className="size-4" /> : <Pause className="size-4" />}
+      <span className="hidden sm:inline">{paused ? "继续" : "暂停"}</span>
+    </button>
+  );
+}
+
+function OverviewKey({ onReset }: { onReset: () => void }) {
+  return (
+    <button
+      type="button"
+      className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border border-line text-sm text-fg"
+      aria-label="返回总览"
+      onClick={onReset}
+    >
+      <LocateFixed className="size-4" />
+      <span className="hidden sm:inline">总览</span>
+    </button>
+  );
+}
+
+/** 宽屏 5 键里的图层开关（窄屏把它们搬进浮层，长相换成整行）。 */
+function LayerKey({ label, pressed, onToggle, icon }: { label: string; pressed: boolean; onToggle: () => void; icon: ReactNode }) {
+  return (
+    <button
+      type="button"
+      className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
+        pressed ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
+      }`}
+      aria-label={label}
+      aria-pressed={pressed}
+      onClick={onToggle}
+    >
+      {icon}
+      <span className="hidden sm:inline">{label}</span>
+    </button>
+  );
+}
+
+/**
  * 底栏只在沙盘。四样东西各有理由：
  * - 速度滑条 / 暂停：实境的模拟时间不前进（look.freezesTime = true，推进在生产端被跳过），
  *   滑它、按它都没有可见变化（等于坏键）；
@@ -343,8 +581,12 @@ function EmptyHint() {
  *   尾迹/星空/小行星带在实境的 look 里也整体关着（decor / orbitLines = false）；
  * - 总览：实境没有"总览"这个去处。
  * 实境回去的路径只有两条，且都永远可见：徽标的分段控件、Esc。
+ *
+ * **窄屏（<640px）3 键**：暂停 / 图层 / 总览。三个图层开关搬进「图层」浮层 ——
+ * 390 宽下 5 个键每个只有 68px，图标密到手指分不开，而且它们是低频操作（第一次认识之后
+ * 大多只用来确认"我关的是哪一层"）。暂停与总览是高频且紧急的，必须一眼看见。
  */
-function Dock() {
+function Dock({ compact }: { compact: boolean }) {
   const paused = useSim((state) => state.paused);
   const speed = useSim((state) => state.speed);
   const showLabels = useSim((state) => state.showLabels);
@@ -356,8 +598,40 @@ function Dock() {
   const toggleOrbits = useSim((state) => state.toggleOrbits);
   const toggleTrails = useSim((state) => state.toggleTrails);
   const requestReset = useSim((state) => state.requestReset);
+  const [layerOpen, setLayerOpen] = useState(false);
+  const sheetRef = useRef<HTMLDivElement>(null);
+
+  // 宽度跨过 640px 时直接收起浮层：3 键布局不在了，浮层没有锚点
+  useEffect(() => {
+    if (!compact) setLayerOpen(false);
+  }, [compact]);
+
+  // 浮层是浮层：点外面关、Esc 关（Esc 那条用 data-overlay-open 让全局键盘先让路）
+  useEffect(() => {
+    if (!layerOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (sheetRef.current && !sheetRef.current.contains(target)) setLayerOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "Escape") setLayerOpen(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [layerOpen]);
+
+  const layers: { id: string; label: string; pressed: boolean; onToggle: () => void; icon: ReactNode }[] = [
+    { id: "labels", label: "名称", pressed: showLabels, onToggle: toggleLabels, icon: <Tag className="size-4" /> },
+    { id: "orbits", label: "轨道", pressed: showOrbits, onToggle: toggleOrbits, icon: <Orbit className="size-4" /> },
+    { id: "trails", label: "尾迹", pressed: showTrails, onToggle: toggleTrails, icon: <Sparkles className="size-4" /> },
+  ];
+
   return (
-    <footer className="hud-dock pointer-events-auto border-t border-line bg-elevated px-3 pt-3 md:px-6">
+    <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
       <label className="flex items-center gap-3">
         <span className="w-10 text-sm text-muted">速度</span>
         <input
@@ -376,63 +650,70 @@ function Dock() {
         />
         <span className="w-12 text-right text-sm tabular-nums text-fg">{formatSpeed(speed)}</span>
       </label>
-      <div className="mt-1 grid grid-cols-5 gap-1.5">
-        <button
-          type="button"
-          className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md bg-accent text-sm text-accent-fg"
-          aria-label={paused ? "继续模拟" : "暂停模拟"}
-          aria-pressed={paused}
-          onClick={togglePaused}
-        >
-          {paused ? <Play className="size-4" /> : <Pause className="size-4" />}
-          <span className="hidden sm:inline">{paused ? "继续" : "暂停"}</span>
-        </button>
-        <button
-          type="button"
-          className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
-            showLabels ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
-          }`}
-          aria-label="名称"
-          aria-pressed={showLabels}
-          onClick={toggleLabels}
-        >
-          <Tag className="size-4" />
-          <span className="hidden sm:inline">名称</span>
-        </button>
-        <button
-          type="button"
-          className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
-            showOrbits ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
-          }`}
-          aria-label="轨道"
-          aria-pressed={showOrbits}
-          onClick={toggleOrbits}
-        >
-          <Orbit className="size-4" />
-          <span className="hidden sm:inline">轨道</span>
-        </button>
-        <button
-          type="button"
-          className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
-            showTrails ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
-          }`}
-          aria-label="尾迹"
-          aria-pressed={showTrails}
-          onClick={toggleTrails}
-        >
-          <Sparkles className="size-4" />
-          <span className="hidden sm:inline">尾迹</span>
-        </button>
-        <button
-          type="button"
-          className="hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border border-line text-sm text-fg"
-          aria-label="返回总览"
-          onClick={requestReset}
-        >
-          <LocateFixed className="size-4" />
-          <span className="hidden sm:inline">总览</span>
-        </button>
-      </div>
+
+      {compact ? (
+        <>
+          <div className="mt-1 grid grid-cols-3 gap-1.5">
+            <PauseKey paused={paused} onToggle={togglePaused} />
+            <button
+              type="button"
+              className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
+                layerOpen ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
+              }`}
+              aria-label="图层"
+              aria-expanded={layerOpen}
+              aria-haspopup="dialog"
+              onClick={() => setLayerOpen((prev) => !prev)}
+            >
+              <Layers className="size-4" />
+              <span className="hidden sm:inline">图层</span>
+            </button>
+            <OverviewKey onReset={requestReset} />
+          </div>
+
+          {layerOpen && (
+            <div
+              ref={sheetRef}
+              data-overlay-open="true"
+              role="dialog"
+              aria-label="图层开关"
+              className="panel-in absolute inset-x-3 bottom-full z-20 mb-2 grid gap-1.5 rounded-xl border border-line bg-elevated p-2 shadow-lg"
+            >
+              {layers.map((layer) => (
+                <button
+                  key={layer.id}
+                  type="button"
+                  id={`layer-${layer.id}`}
+                  className={`hud-btn inline-flex h-11 items-center gap-2 rounded-md border px-3 text-sm ${
+                    layer.pressed ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
+                  }`}
+                  aria-label={layer.label}
+                  aria-pressed={layer.pressed}
+                  onClick={layer.onToggle}
+                >
+                  {layer.icon}
+                  <span>{layer.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="mt-1 grid grid-cols-5 gap-1.5">
+          <PauseKey paused={paused} onToggle={togglePaused} />
+          {layers.map((layer) => (
+            <LayerKey
+              key={layer.id}
+              label={layer.label}
+              pressed={layer.pressed}
+              onToggle={layer.onToggle}
+              icon={layer.icon}
+            />
+          ))}
+          <OverviewKey onReset={requestReset} />
+        </div>
+      )}
+
       <p className="mt-2 hidden text-xs text-subtle md:block">
         空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
       </p>
