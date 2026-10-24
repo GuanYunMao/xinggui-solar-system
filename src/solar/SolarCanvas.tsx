@@ -389,14 +389,31 @@ const RING_FRAG = /* glsl */ `
   varying vec2 vLocal;
   varying vec3 vNormalW;
   varying vec3 vWorld;
+  float ringHash(float p) { p = fract(p * 0.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+  float ringNoise(float x) {
+    float i = floor(x);
+    float f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(ringHash(i), ringHash(i + 1.0), f);
+  }
   void main() {
     float r = length(vLocal);
     float t = clamp((r - uInner) / (uOuter - uInner), 0.0, 1.0);
-    float bands = 0.28 + 0.72 * abs(sin(t * 52.0));
-    float fine = 0.72 + 0.28 * sin(t * 180.0);
-    float gap = smoothstep(0.0, 0.01, abs(t - 0.62) - 0.012);
-    float alpha = bands * fine * gap;
-    if (alpha < 0.18) discard;
+    /*
+     * t37：环从"几根铁丝"改回"连续带 + 颗粒"。
+     *
+     * 旧写法 0.28 + 0.72*abs(sin(t*52)) 在环宽上切出 ~26 条窄亮线，谷底只有 0.28，
+     * 再叠加 discard(alpha<0.18) —— 屏幕上读起来是几根钢丝，不是环系（captain 盲测图）。
+     * 真实环是大量碎块的连续集合：靠**低频宽窄 + 高频颗粒**读出"碎石感"，
+     * 而不是靠可数的亮线。所以这里换成两层 1D 噪声 + 极细颗粒，alpha 下限抬到 ~0.3：
+     * 除了 Cassini 缝，不再有"整段消失"的地方。
+     */
+    float broad = 0.55 + 0.45 * ringNoise(t * 26.0);
+    float fine = 0.80 + 0.20 * ringNoise(t * 180.0);
+    float grain = 0.92 + 0.08 * ringHash(floor(t * 900.0));
+    float gap = smoothstep(0.0, 0.012, abs(t - 0.62) - 0.014);
+    float alpha = clamp(broad * fine * grain * gap, 0.0, 1.0);
+    if (alpha < 0.10) discard;
     vec3 N = normalize(vNormalW);
     vec3 L = normalize(-vWorld);
     float shade = clamp(abs(dot(N, L)) * 0.55 + 0.45, 0.35, 1.0);
