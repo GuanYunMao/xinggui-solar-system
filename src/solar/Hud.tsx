@@ -4,7 +4,7 @@ import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
 import { APP_ERA_NAME, versionLabel } from "./brand";
 import type { Body } from "./data";
-import { bindSettingsPersistence, loadSettings, useSim } from "./store";
+import { bindSettingsPersistence, daysOf, loadSettings, useSim } from "./store";
 import { useSystem } from "./system-context";
 
 /**
@@ -45,8 +45,65 @@ function useCompact() {
   return compact;
 }
 
-function formatSpeed(speed: number) {
-  return `${speed.toFixed(1)}×`;
+/* ── 时间控件：物理速率 + 对数档位 ── */
+
+/**
+ * 对数刻度的档位（t46）：0.05 → 8 共 8 档，相邻比值 2~2.5。
+ *
+ * 为什么必须对数：线性刻度下 0.05–0.5 这一段只占滑条 6%，手指根本分不出来；
+ * 对数刻度把每一"倍"给到同样宽度，低速段才有可用分辨率。
+ * 用固定档位而不是连续值：读数要说人话，连续值只会给出「1 秒 = 4.13 天」这种数字。
+ */
+const SPEED_STOPS = [0.05, 0.1, 0.2, 0.5, 1, 2, 4, 8] as const;
+const SPEED_MAX = SPEED_STOPS[SPEED_STOPS.length - 1]!;
+
+/** 从实际速度反推档位下标（按对数距离取最近）——这样 store 夹过的值也能落到正确档上。 */
+function stopIndexOf(speed: number) {
+  const target = Math.log(Math.max(speed, 1e-6));
+  let best = 0;
+  let bestDist = Infinity;
+  SPEED_STOPS.forEach((stop, index) => {
+    const dist = Math.abs(Math.log(stop) - target);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = index;
+    }
+  });
+  return best;
+}
+
+/** 单位阶梯的换挡点：数字超过下一单位的 1~1.5 就换档，避免「1 秒 = 72.0 分钟」这种读数。 */
+const UNIT_LADDER = [
+  { unit: "秒", seconds: 1, upTo: 90 },
+  { unit: "分钟", seconds: 60, upTo: 90 * 60 },
+  { unit: "小时", seconds: 3600, upTo: 36 * 3600 },
+  { unit: "天", seconds: 86400, upTo: 730 * 86400 },
+  { unit: "年", seconds: 365.25 * 86400, upTo: Infinity },
+] as const;
+
+/** 1 位小数就够；≥100 时连小数都不给，读数不该比刻度更精确。 */
+function trimNumber(value: number) {
+  if (value >= 100) return String(Math.round(value));
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+/**
+ * 一秒真实时间过去多久。返回 `{ value, unit }`，由调用点拼成「1 秒 = 1 天」。
+ *
+ * ⚠ 换算只有一处：`daysOf(1)` 是 store 导出的「1 模拟秒 = 多少模拟日」，
+ * 乘以 speed 就是「1 实秒 -> 模拟日」。HUD 不重写压缩常数（EARTH_PERIOD / 365.25）。
+ * TODO(engineer2/t44)：store 若暴露 `simDaysPerRealSecond`，这里直接改成读它，
+ * 连 `daysOf(1) * speed` 这一层乘法也交给 store —— 显示层不该知道时间轴怎么压缩的。
+ */
+function formatRate(daysPerRealSecond: number): { value: string; unit: string } {
+  const seconds = Math.max(daysPerRealSecond, 0) * 86400;
+  const step = UNIT_LADDER.find((entry) => seconds < entry.upTo) ?? UNIT_LADDER[UNIT_LADDER.length - 1]!;
+  return { value: trimNumber(seconds / step.seconds), unit: step.unit };
+}
+
+function formatMultiplier(speed: number) {
+  return `×${Number(speed.toFixed(2))}`;
 }
 
 function formatEpoch(days: number) {
@@ -630,25 +687,38 @@ function Dock({ compact }: { compact: boolean }) {
     { id: "trails", label: "尾迹", pressed: showTrails, onToggle: toggleTrails, icon: <Sparkles className="size-4" /> },
   ];
 
+  /* 读数：玩家读的是「这一秒里过去了多久」，倍率只是内部量，缩到第二行。 */
+  const rate = formatRate(daysOf(1) * speed);
+
   return (
     <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
+      {/*
+        速度：对数档位（0.05→8 共 8 档）。
+        滑条值 = 档位下标（0..7），**回读时从实际速度反推下标** —— store 把 0.05 夹成 0.2 时，
+        旋钮会退回 0.2 那一档，而不是停在一个不存在的档上假装能到。
+      */}
       <label className="flex items-center gap-3">
-        <span className="w-10 text-sm text-muted">速度</span>
+        <span className="w-10 shrink-0 text-sm text-muted">速度</span>
         <input
           className="speed-range min-w-0 flex-1"
           type="range"
-          min={0.2}
-          max={8}
-          step={0.1}
-          value={speed}
-          aria-valuemin={0.2}
-          aria-valuemax={8}
+          min={0}
+          max={SPEED_STOPS.length - 1}
+          step={1}
+          value={stopIndexOf(speed)}
+          aria-valuemin={SPEED_STOPS[0]}
+          aria-valuemax={SPEED_MAX}
           aria-valuenow={speed}
-          aria-valuetext={formatSpeed(speed)}
+          aria-valuetext={`1 秒 = ${rate.value} ${rate.unit}`}
           aria-label="模拟速度"
-          onChange={(event) => setSpeed(Number(event.target.value))}
+          onChange={(event) => setSpeed(SPEED_STOPS[Number(event.target.value)] ?? speed)}
         />
-        <span className="w-12 text-right text-sm tabular-nums text-fg">{formatSpeed(speed)}</span>
+        <span className="flex w-20 shrink-0 flex-col items-end justify-center leading-tight">
+          <span className="text-xs tabular-nums text-fg">
+            1 秒 = {rate.value} {rate.unit}
+          </span>
+          <span className="text-[10px] tabular-nums text-subtle">{formatMultiplier(speed)}</span>
+        </span>
       </label>
 
       {compact ? (
