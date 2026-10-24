@@ -636,15 +636,18 @@ function paintGasGiant(
             const d = Math.hypot(du, dv);
             if (d >= 1.55) continue;
             /*
-             * 淡色领圈（t9）：真实大红斑外围有一圈比色带更亮的浅色边，
+             * 淡色领圈（t9 引入，t37 收尾）：真实大红斑外围有一圈比色带更亮的浅色边，
              * 它是"有形的斑"和"一坨渐变"在低分辨率下最可分的那一条。
-             * 画在 rim 之外：d≈1.05 最亮，到 1.55 消失。238 的浅奶油压在褐带上才看得出来。
+             *
+             * t37 实测：旧写法 `mix(r, 238, collar * 0.5)` 只混 50%，领圈渲染出来
+             * R176/G116/B89，比旁边的亮带 R204/G177/B148 还暗 —— "淡"读不出来。
+             * **只改一个变量**：混合系数 0.5 → 1.0（颜色不动），领圈变成实心的浅奶油环。
              */
             const collar = smoothstep(1.55, 1.08, d) * (1 - smoothstep(1.1, 0.9, d));
             if (collar > 0.002) {
-              r = mix(r, 238, collar * 0.5);
-              g = mix(g, 224, collar * 0.5);
-              b = mix(b, 198, collar * 0.5);
+              r = mix(r, 238, collar);
+              g = mix(g, 224, collar);
+              b = mix(b, 198, collar);
             }
             // 边界收紧（旧 1.12/0.72）：闭口更清楚，低分辨率下不糊成一圈光
             const rim = smoothstep(1.04, 0.86, d);
