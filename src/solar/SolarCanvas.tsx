@@ -1558,8 +1558,16 @@ function CameraRig({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl |
 }
 
 /**
- * 验收探针：把 15 个天体的屏幕投影暴露成纯函数，供 verify.mjs 做数值断言
+ * 验收探针：把天体在屏幕上的投影暴露成纯函数，供 verify.mjs 做数值断言
  * （命中矩阵、跟随抖动）。只读、无副作用，生产环境也就是多挂一个全局函数。
+ *
+ * **投影只有一份实现**：这里直接调 pick.ts 的 projectCandidates()，与用户真正
+ * 能点中的判定同源。改造前这里自己算一份线性近似 `radiusPx = R/d · focal`，
+ * 和拾取器的精确式 `focal · tan(asin(min(1, R/d)))` 漂移 —— 实测（1280×720）
+ * `?proto=1&dist=1e7` 的地球 600.32 px vs 781.39 px（+30.2%）；相机进到球体里
+ * （dist=6e6 < 地球半径）时旧式给 999.67 px，而真实投影半径是无穷（整个屏幕都是它），
+ * 差了 16 个数量级。验收量的必须是"用户遇到的那套判定"，所以它只能有一份数学。
+ * 顺带拿到与拾取器一致的「相机背后剔除」——见下面 NaN 那一支。
  */
 function Probe() {
   const reg = useRegistry();
@@ -1571,23 +1579,39 @@ function Probe() {
   useEffect(() => {
     const v = new THREE.Vector3();
     const probe = () => {
-      const projected: { id: string; x: number; y: number; z: number; radiusPx: number }[] = [];
+      // 先按 PickLayer 的同一种取数方式收集世界坐标，再交给拾取器的投影
+      const picks: PickBody[] = [];
       for (const body of bodies) {
         const group = reg.groups.get(body.id);
         if (!group) continue;
         group.getWorldPosition(v);
-        const distance = camera.position.distanceTo(v);
+        picks.push({ id: body.id, world: v.clone(), radius: body.radius });
+      }
+      const candidates = projectCandidates(camera as THREE.PerspectiveCamera, size.width, size.height, picks);
+      const byId = new Map(candidates.map((c) => [c.id, c]));
+
+      const projected: { id: string; x: number; y: number; z: number; radiusPx: number }[] = [];
+      for (const body of bodies) {
+        const group = reg.groups.get(body.id);
+        if (!group) continue;
+        const c = byId.get(body.id);
+        if (!c) {
+          /*
+           * 相机背后：拾取器剔除它（点不中、也不该出手型）。但 __solarProbe 的
+           * 对外契约是「系统里挂载了几个天体就返回几条」—— verify 的 hit-matrix
+           * 数 15、proto-real 数 3，两条断言都不许动。所以这里保留一条记录，
+           * 用 NaN 明确表示「没有屏幕位置」，而不是编造一份镜像坐标：后者正是
+           * t13 修掉的幽灵热区（背后的天体被 project() 翻符号镜像回画面，
+           * 看起来在屏幕上、点了却没反应）。
+           */
+          projected.push({ id: body.id, x: Number.NaN, y: Number.NaN, z: Number.NaN, radiusPx: 0 });
+          continue;
+        }
+        // z 只为保持对外字段形状（verify 只读 x/y/id），仍由 three 的 project() 得出；
+        // 它不参与任何判定，所以不是第二份"判定数学"。
+        group.getWorldPosition(v);
         v.project(camera);
-        // 屏幕半径：透视相机的像素焦距 = 视口高一半 / tan(fov/2)
-        const persp = camera as THREE.PerspectiveCamera;
-        const focal = size.height / 2 / Math.tan((persp.fov * Math.PI) / 360);
-        projected.push({
-          id: body.id,
-          x: (v.x * 0.5 + 0.5) * size.width,
-          y: (-v.y * 0.5 + 0.5) * size.height,
-          z: v.z,
-          radiusPx: distance > 0 ? (body.radius / distance) * focal : 0,
-        });
+        projected.push({ id: body.id, x: c.x, y: c.y, z: v.z, radiusPx: c.radiusPx });
       }
       return projected;
     };
