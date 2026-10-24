@@ -25,6 +25,14 @@ type Settings = {
   showLabels?: boolean;
   showOrbits?: boolean;
   showTrails?: boolean;
+  /**
+   * HUD chrome（顶部天体行 + 底栏）空闲自动收起（t12）。
+   *
+   * 默认开：用户原话是「鼠标不移动到上面时，它缩起来，防止挡住界面」。
+   * 但**必须留一个能关的口**——自动收起一旦被当成 bug，就会有人找不到按钮；
+   * 关掉之后两处 chrome 常显，行为退回 1.2.1。
+   */
+  hudAutoHide?: boolean;
 };
 
 function clampSpeed(value: number) {
@@ -126,6 +134,16 @@ export function daysOf(simSeconds: number) {
 }
 
 /**
+ * 实境距离读数的节流（t22）：每 100ms 最多写一次 = 10Hz。
+ *
+ * 为什么放 store 而不是让每个调用方自己节流：`realDistanceM` 的消费者是 HUD，
+ * 每帧写 = HUD 每帧重渲染（`days` 的 250ms 节流就是同一个教训）。口子只有一个，
+ * 节流就只该有一处；`MeterCamera` 每帧调 `setRealDistance` 是安全的。
+ */
+const DISTANCE_MIN_GAP_MS = 100;
+let lastDistanceWrite = 0;
+
+/**
  * HUD 历法写回的节流。
  *
  * 为什么需要它：`simSeconds` 每帧都变，而 Hud 读的是 `state.days`。如果每帧都写 days，
@@ -149,6 +167,8 @@ type SimStore = GateSlice & {
   showLabels: boolean;
   showOrbits: boolean;
   showTrails: boolean;
+  /** 顶部天体行 / 底栏的空闲自动收起（t12）。关掉 = 常显。 */
+  hudAutoHide: boolean;
   selectedId: string | null;
   /**
    * 模拟时间，**时间的唯一真值**（秒）。公转、自转、太阳 uTime、HUD 历法全部从它派生。
@@ -171,11 +191,20 @@ type SimStore = GateSlice & {
   prevSpeed: number;
   /** 切换中被拦下的选择，动画落定后再应用。 */
   queuedSelectId: string | null;
+  /**
+   * 实境：相机到**当前取景目标**的距离（米）。t22 开的口子，t23 的 MeterCamera 往里喂。
+   *
+   * `null` = 还没有可信读数（第一帧、相机没摆位、刚切模式）。界面必须把 null 当成
+   * 「不知道」而不是 0 —— 0 会被格式化成「0 米」，那是谎言。
+   */
+  realDistanceM: number | null;
   togglePaused: () => void;
   setSpeed: (speed: number) => void;
   toggleLabels: () => void;
   toggleOrbits: () => void;
   toggleTrails: () => void;
+  /** t12：自动收起的开关（持久化，走 bindSettingsPersistence）。 */
+  toggleHudAutoHide: () => void;
   select: (id: string | null) => void;
   /** 唯一的时间推进点：每帧由 Simulation 调；`paused` 时自吞。 */
   advanceSim: (dt: number) => void;
@@ -184,6 +213,16 @@ type SimStore = GateSlice & {
    * `number` = 模拟秒；`Date` = 以 `SIM_EPOCH_MS` 为 t=0 换算成秒。
    */
   setSimTime: (when: number | Date) => void;
+  /**
+   * 实境距离读数（t22 开的口子，t23 的 MeterCamera 每帧调）。
+   *
+   * 三件事收在这一处，调用方不用各写一遍：
+   *  - **10Hz 节流**：每帧调也只有 ~10 次/秒真的写进 store，否则 HUD 每帧重渲染
+   *    （`days` 的 250ms 节流是同一个教训）；
+   *  - **非有限值不写**：NaN / Infinity 一路污染到界面就没法查了；
+   *  - **null 立即生效**：切模式 / 相机没摆位时立刻清空，不走节流。
+   */
+  setRealDistance: (meters: number | null) => void;
   /** 只重取景：不清目标。返回沙盘时要的就是这个。 */
   refocus: () => void;
   /** 原子地「设目标 + 重取景」，一次 set 只让 CameraRig 起一次动画。 */
@@ -259,6 +298,7 @@ export const useSim = create<SimStore>((set, get) => {
   showLabels: true,
   showOrbits: true,
   showTrails: true,
+  hudAutoHide: true,
   selectedId: null,
   simSeconds: 0,
   days: 0,
@@ -269,6 +309,7 @@ export const useSim = create<SimStore>((set, get) => {
   switching: null,
   prevSpeed: DEFAULT_SPEED,
   queuedSelectId: null,
+  realDistanceM: null,
   gateLit: [],
   gateUnlocked: false,
   gateUnlockedAt: null,
@@ -303,6 +344,8 @@ export const useSim = create<SimStore>((set, get) => {
     set((s) => ({ showTrails: !s.showTrails }));
     if (!get().showTrails) get().hitGate("layer");
   },
+  // t12：自动收起的开关。不记门、不算进度——它是无障碍/习惯偏好，不是玩法。
+  toggleHudAutoHide: () => set((s) => ({ hudAutoHide: !s.hudAutoHide })),
 
   // 切换中禁「选择」：切模式那一刻发一个「场景里还不存在」的目标是 bug 温床。
   // 拦下来存一个，落定后再应用（只存一个，后到的覆盖先到的）。
@@ -357,6 +400,21 @@ export const useSim = create<SimStore>((set, get) => {
     set({ simSeconds: seconds, days: daysOf(seconds) });
   },
 
+  setRealDistance: (meters) => {
+    // null = 「不知道」：立即清空，不走节流（切模式时界面要立刻停止显示旧读数）
+    if (meters === null) {
+      lastDistanceWrite = 0;
+      if (get().realDistanceM !== null) set({ realDistanceM: null });
+      return;
+    }
+    // NaN / Infinity 一律不写：一路污染到界面就没法查了
+    if (!Number.isFinite(meters)) return;
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now - lastDistanceWrite < DISTANCE_MIN_GAP_MS) return; // 10Hz
+    lastDistanceWrite = now;
+    set({ realDistanceM: meters });
+  },
+
   refocus: () => set((s) => ({ resetToken: s.resetToken + 1 })),
   // 必须一次 set 同时改两个字段：分两次会让 CameraRig 在相邻两帧看到 key 变两次，
   // 起两次聚焦动画（SolarCanvas 的去重键是 `${selectedId}|${resetToken}`）。
@@ -374,7 +432,8 @@ export const useSim = create<SimStore>((set, get) => {
     if (mode === "real") {
       // 硬门：没解锁就没有这个目的地。入口只会在 UI 层被禁用，这里再守一层。
       if (!isUnlocked(s)) return;
-      set({ mode: "real", switching: "toReal", prevSpeed: s.speed, speed: 1, paused: false });
+      // 切模式时清空距离读数：旧目标（沙盘的太阳）的距离喂给实境是假数
+      set({ mode: "real", switching: "toReal", prevSpeed: s.speed, speed: 1, paused: false, realDistanceM: null });
       armSwitchTimeout();
       return;
     }
@@ -386,6 +445,7 @@ export const useSim = create<SimStore>((set, get) => {
       speed: s.prevSpeed || DEFAULT_SPEED,
       selectedId: s.selectedId,
       resetToken: s.resetToken + 1,
+      realDistanceM: null,
     });
     armSwitchTimeout();
   },
@@ -408,6 +468,7 @@ export const useSim = create<SimStore>((set, get) => {
       showLabels: settings.showLabels ?? true,
       showOrbits: settings.showOrbits ?? true,
       showTrails: settings.showTrails ?? true,
+      hudAutoHide: settings.hudAutoHide ?? true,
     }),
 
   hitGate: (slot) => {
@@ -494,6 +555,7 @@ export function bindSettingsPersistence() {
       showLabels: state.showLabels,
       showOrbits: state.showOrbits,
       showTrails: state.showTrails,
+      hudAutoHide: state.hudAutoHide,
     });
     if (next === prev) return;
     prev = next;

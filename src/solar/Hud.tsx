@@ -1,8 +1,8 @@
-import { ChevronDown, ChevronRight, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, ChevronUp, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode, type RefObject } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
-import { APP_ERA_NAME, versionLabel } from "./brand";
+import { APP_ERA_NAME, snapshotTag, versionLabel } from "./brand";
 import type { Body } from "./data";
 import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
 import { useSystem } from "./system-context";
@@ -43,6 +43,189 @@ function useCompact() {
     return () => mq.removeEventListener("change", onChange);
   }, []);
   return compact;
+}
+
+/* ─────────────────── t12：chrome（顶部天体行 + 底栏）的空闲收起 ─────────────────── */
+
+/**
+ * 用户原话：「顶上那一排星球可点击按钮做成一个可以伸缩的开关——鼠标不移动到上面时，
+ * 它缩起来，防止挡住界面；包括界面底下的操作台。」
+ *
+ * 两条独立状态（顶部 / 底栏），同一套规则：
+ *
+ *  - **桌面（指针精细）**：指针离开该区域 `CHROME_IDLE_MS` 后收起；指针移回（矩形命中）或点把手展开。
+ *    计时器**只在真的发生过 pointermove 之后才上膛**——页面刚打开、自动化夹具直接
+ *    `locator("#chip-earth").click()` 时，芯片必须还在（否则既有 pass 会集体超时）。
+ *  - **窄屏（触屏没有 hover）**：轻点空白收起、点把手展开。**绝不靠 hover 隐藏**：
+ *    手指没有 hover，按 hover 做等于永久隐藏。
+ *  - 浮层开着（`data-overlay-open`）、指针按着、键盘焦点在该区域里 → 一律不收起。
+ *  - `hudAutoHide` 关掉 → 两处常显（把手不渲染），行为退回 1.2.1。
+ *
+ * N 取值（2.0s）的依据，别凭手感改：面板入场 `panel-in` 是 400ms，芯片
+ * `scrollIntoView` 平滑滚动约 300ms；N 必须大于这两者之和的 2 倍，否则会「边看边收」。
+ * 下限：< 1.5s 时读模拟历/找芯片的途中就会闪。上限：> 3s 用户会以为界面坏了、开始乱点。
+ * 2s 正好落在中间，且给「指针停着不动」留了一段不短的可读时间。
+ *
+ * 为什么用 window 级 pointermove + 矩形命中，而不是 `onPointerEnter`：
+ * HUD 根是 `pointer-events-none`，收起的条本身**不该吃点击**（那是画布的选择热区，
+ * 见 t11 的命中矩阵）。矩形判定让「移回就展开」照样成立，而点击仍然漏给画布。
+ */
+const CHROME_IDLE_MS = 2000;
+
+type ChromeApi = {
+  /** 顶部天体行（含卫星行）是否收起 */
+  top: boolean;
+  /** 底栏是否收起 */
+  dock: boolean;
+  topRef: RefObject<HTMLDivElement | null>;
+  dockRef: RefObject<HTMLDivElement | null>;
+  expandTop: () => void;
+  expandDock: () => void;
+};
+
+const ChromeContext = createContext<ChromeApi | null>(null);
+const useChrome = () => useContext(ChromeContext);
+
+/** 浮层开着时禁止自动收起：图层浮层、设定时刻、校准面板都挂 `data-overlay-open`。 */
+const overlayOpen = () =>
+  typeof document !== "undefined" && Boolean(document.querySelector('[data-overlay-open="true"]'));
+
+function useChromeState({ compact, autoHide }: { compact: boolean; autoHide: boolean }): ChromeApi {
+  const [top, setTop] = useState(false);
+  const [dock, setDock] = useState(false);
+  const topRef = useRef<HTMLDivElement | null>(null);
+  const dockRef = useRef<HTMLDivElement | null>(null);
+
+  // 关掉自动收起 → 两处常显（并把已经收起的展开）
+  useEffect(() => {
+    if (autoHide) return;
+    setTop(false);
+    setDock(false);
+  }, [autoHide]);
+
+  useEffect(() => {
+    if (!autoHide || compact) return;
+    const timers = { top: 0, dock: 0 };
+    let pressing = false;
+    let touched = false; // 只有真的移动过指针才上膛（见上面「计时器只在 pointermove 后」）
+    const inside = (ref: RefObject<HTMLDivElement | null>, x: number, y: number) => {
+      const r = ref.current?.getBoundingClientRect();
+      return Boolean(r && r.width > 0 && r.height > 0 && x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 4 && y <= r.bottom + 4);
+    };
+    const focusInside = (ref: RefObject<HTMLDivElement | null>) => {
+      const active = document.activeElement;
+      if (!ref.current || !active || !ref.current.contains(active)) return false;
+      /*
+       * 只有**键盘给的焦点**才拦住收起。鼠标点过的按钮也留焦点，但 Chromium 不把它算
+       * `:focus-visible`（t11 实测：纯鼠标点击后 matches 为 false）；若按 `contains` 一刀切，
+       * 「点一下芯片 → 鼠标移开」就永远不收起——正好把这个功能最主力的场景弄废。
+       * 键盘 Tab 进来时 `focusin` 会把该区展开，所以这里放行是安全的。
+       */
+      return typeof active.matches === "function" && active.matches(":focus-visible");
+    };
+    const arm = (key: "top" | "dock", ref: RefObject<HTMLDivElement | null>, collapse: (v: boolean) => void) => {
+      window.clearTimeout(timers[key]);
+      timers[key] = window.setTimeout(() => {
+        if (!touched || pressing || overlayOpen() || focusInside(ref)) return;
+        collapse(true);
+      }, CHROME_IDLE_MS);
+    };
+    const onMove = (event: PointerEvent) => {
+      if (event.pointerType === "touch") return; // 触屏不参与 hover 收起
+      touched = true;
+      if (inside(topRef, event.clientX, event.clientY)) {
+        window.clearTimeout(timers.top);
+        setTop(false);
+      } else {
+        arm("top", topRef, setTop);
+      }
+      if (inside(dockRef, event.clientX, event.clientY)) {
+        window.clearTimeout(timers.dock);
+        setDock(false);
+      } else {
+        arm("dock", dockRef, setDock);
+      }
+    };
+    const onDown = () => {
+      pressing = true;
+    };
+    const onUp = () => {
+      pressing = false;
+    };
+    // 指针在窗口外抬起（拖出窗口）时不能永远"按着"：cancel 与 up 同义
+    const onCancel = () => {
+      pressing = false;
+    };
+    const onFocus = (event: FocusEvent) => {
+      const target = event.target as Node | null;
+      if (target && topRef.current?.contains(target)) setTop(false);
+      if (target && dockRef.current?.contains(target)) setDock(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+    window.addEventListener("focusin", onFocus, true);
+    return () => {
+      window.clearTimeout(timers.top);
+      window.clearTimeout(timers.dock);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
+      window.removeEventListener("focusin", onFocus, true);
+    };
+  }, [autoHide, compact]);
+
+  /*
+   * 窄屏：轻点空白收起。三个坑要一起绕开：
+   *  1. 画布上的 tap 会先走 PickLayer 选中 —— 所以延到下一拍看「选中态变没变」，
+   *     变了说明点的是天体，不是空白（不收起）；
+   *  2. 拖动转视角不是轻点 —— 位移 > 8px 一律不算；
+   *  3. **按下那一刻浮层开着**的这一次轻点，只负责关浮层。浮层自己会在 pointerdown 关掉，
+   *     等到 pointerup 再判 `overlayOpen()` 已经是 false 了 —— 不加这条，一边关浮层一边把
+   *     chrome 收掉，一次轻点干两件事。
+   */
+  useEffect(() => {
+    if (!autoHide || !compact) return;
+    let x0 = 0;
+    let y0 = 0;
+    let overlayAtDown = false;
+    const onDown = (event: PointerEvent) => {
+      x0 = event.clientX;
+      y0 = event.clientY;
+      overlayAtDown = overlayOpen();
+    };
+    const onUp = (event: PointerEvent) => {
+      if (Math.hypot(event.clientX - x0, event.clientY - y0) > 8) return;
+      if (overlayAtDown || overlayOpen()) return;
+      const target = event.target as Element | null;
+      // chrome 自己的空白（标题条、抬头、底栏内边距）不算"空白"：在那里轻点不该把它收掉
+      if (target?.closest("[data-hud-chrome], button, input, textarea, select, article, [data-overlay-open]")) return;
+      const before = useSim.getState().selectedId;
+      window.setTimeout(() => {
+        if (useSim.getState().selectedId !== before) return;
+        if (overlayOpen()) return;
+        setTop(true);
+        setDock(true);
+      }, 0);
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointerup", onUp, true);
+    return () => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("pointerup", onUp, true);
+    };
+  }, [autoHide, compact]);
+
+  return {
+    top,
+    dock,
+    topRef,
+    dockRef,
+    expandTop: () => setTop(false),
+    expandDock: () => setDock(false),
+  };
 }
 
 /* ── 时间控件：物理速率 + 对数档位 ── */
@@ -157,18 +340,25 @@ export function Hud() {
 
 function SandboxHud() {
   const compact = useCompact();
+  const autoHide = useSim((state) => state.hudAutoHide);
+  const chrome = useChromeState({ compact, autoHide });
   return (
-    <>
-      <HudHeader trailing={<Epoch />} />
-      {/* 芯片行是「9 个可去的天体」的导航台 —— 只有沙盘有这个语义 */}
-      <Chips compact={compact} />
-      <Moons />
+    <ChromeContext.Provider value={chrome}>
+      {/* 顶部区：抬头 + 天体行 + 卫星行。收起时这些不进树，只剩把手（见 Chips） */}
+      <div ref={chrome.topRef} data-hud-chrome="top" className="shrink-0">
+        <HudHeader trailing={<Epoch />} />
+        {/* 芯片行是「9 个可去的天体」的导航台 —— 只有沙盘有这个语义 */}
+        <Chips compact={compact} />
+        <Moons />
+      </div>
       <div className="relative min-h-0 flex-1">
         <SandboxCard compact={compact} />
         <EmptyHint />
       </div>
-      <Dock compact={compact} />
-    </>
+      <div ref={chrome.dockRef} data-hud-chrome="dock" className="shrink-0">
+        <Dock compact={compact} />
+      </div>
+    </ChromeContext.Provider>
   );
 }
 
@@ -255,6 +445,7 @@ function Chips({ compact }: { compact: boolean }) {
    */
   const [open, setOpen] = useState(false);
   const expanded = compact ? open : true;
+  const chrome = useChrome();
 
   /*
    * 渐隐提示：判据是**真的溢出了没有**，不是"宽度小于某个数"。
@@ -280,6 +471,43 @@ function Chips({ compact }: { compact: boolean }) {
       ro.disconnect();
     };
   }, [measure, expanded]);
+
+  /*
+   * 从把手展开时把当前选中那颗滚回视野（t12）。
+   * `useKeepChipVisible` 只在 selectedId 变化时跑；收起期间选中态没变，
+   * 展开那一刻行是从头开始挂载的，不补这一下就会停在最左边。
+   */
+  useEffect(() => {
+    if (!expanded) return;
+    const id = useSim.getState().selectedId;
+    if (!id) return;
+    document.getElementById(`chip-${id}`)?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+  }, [expanded]);
+
+  /*
+   * 收起态：整行换成**一枚可发现的把手**（不是凭空消失）。
+   * 把手是按钮（≥44px 高），点它展开；鼠标移回顶部区由 useChromeState 的矩形判定负责。
+   */
+  if (chrome?.top) {
+    return (
+      <div className="relative mt-2 md:mt-3">
+        <div className="px-4 pb-1 md:px-6">
+          <button
+            type="button"
+            className="hud-btn chrome-in pointer-events-auto inline-flex h-11 items-center gap-2 rounded-full border border-line bg-elevated px-3 text-sm text-fg md:h-8 md:text-xs"
+            aria-label="展开天体列表"
+            aria-expanded={false}
+            onClick={chrome.expandTop}
+          >
+            <span className="tracking-[0.15em] text-muted">天体</span>
+            <span className="max-w-[8rem] truncate">{selected ? selected.name : "未选择"}</span>
+            <span className="text-subtle">全部 {chips.length}</span>
+            <ChevronDown className="size-3.5" aria-hidden />
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative mt-2 md:mt-3">
@@ -371,7 +599,10 @@ function Moons() {
       : selected
     : undefined;
   const moons = group && group.id !== "sun" ? (byParent.get(group.id) ?? []) : [];
+  const chrome = useChrome();
   if (moons.length === 0) return null;
+  // 顶部收起时卫星行跟着一起收（它是同一块 chrome，不能留半行悬在那儿）
+  if (chrome?.top) return null;
   return (
     <div className="chip-row pointer-events-auto mt-1 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6">
       <span className="inline-flex h-9 shrink-0 items-center text-xs text-subtle">
@@ -414,11 +645,14 @@ function CardShell({
   id,
   maxHeight,
   handle,
+  onBodyClick,
   children,
 }: {
   id: string;
   maxHeight?: string;
   handle?: ReactNode;
+  /** 窄屏：点卡片本体也能开合（t13）。桌面不传，避免和「返回总览」抢点击。 */
+  onBodyClick?: (event: ReactMouseEvent<HTMLDivElement>) => void;
   children: ReactNode;
 }) {
   return (
@@ -428,7 +662,9 @@ function CardShell({
       className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 flex max-h-[44dvh] flex-col overflow-hidden rounded-xl border border-line bg-elevated md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
     >
       {handle}
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">{children}</div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4" onClick={onBodyClick}>
+        {children}
+      </div>
     </article>
   );
 }
@@ -555,13 +791,45 @@ function SandboxCard({ compact }: { compact: boolean }) {
   const requestReset = useSim((state) => state.requestReset);
   const { byId } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
-  const [stop, setStop] = useState<SheetStop>("half");
+  /*
+   * 开合状态**按天体记**（t13）：同一颗再次选中时保持上次的开合。
+   *
+   * 记录活在这个组件里 —— 它在沙盘内一直挂着（没选中时只是 return null），
+   * 切到实境才卸载。跨模式丢状态可以接受（那时卡片本来就不在），
+   * 跨天体串状态不行（看木星时收起，切换回地球不该继承"收起"）。
+   */
+  const [stopByBody, setStopByBody] = useState<Record<string, SheetStop>>({});
+  const [collapsedByBody, setCollapsedByBody] = useState<Record<string, boolean>>({});
   const [dragPx, setDragPx] = useState<number | null>(null);
   const drag = useRef<{ x0: number; y0: number; h0: number; active: boolean } | null>(null);  /**
    * 拖完松手时浏览器还会补一个 click。不挡掉的话"拖动换档"和"点击切换"会连着触发两次，
    * 手感是"松手后又自己跳了一档"。所以拖过就吃掉紧随其后的那一次 click。
    */
   const skipClick = useRef(false);
+
+  const bodyId = selected?.id ?? "";
+  /** 当前天体的档位（没记录过 = 半屏）。 */
+  const stop: SheetStop = stopByBody[bodyId] ?? "half";
+  const setStop = (next: SheetStop) => setStopByBody((prev) => ({ ...prev, [bodyId]: next }));
+  /** 宽屏收起态，同样按天体记。默认展开。 */
+  const desktopCollapsed = collapsedByBody[bodyId] ?? false;
+  const setDesktopCollapsed = (value: boolean) => setCollapsedByBody((prev) => ({ ...prev, [bodyId]: value }));
+
+  /*
+   * 窄屏：点卡片本体也能开合（t13）。手指很难精准戳中那根 44px 的把手，
+   * 那就让整张卡都算把手 —— 点文字、点空白都行；**按钮/链接不算**（返回总览、✕）。
+   * 拖过（换档/滚动）之后的合成 click 不吃这一下：那会变成"一滚动就收起"。
+   */
+  const onBodyTap = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!compact) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("button, a, input, textarea, select")) return;
+    if (skipClick.current) {
+      skipClick.current = false;
+      return;
+    }
+    setStop(stop === "bar" ? "half" : "bar");
+  };
 
   /** 档位上限换算成像素：rem 按根字号，dvh 按视口高。 */
   const capPx = (s: SheetStop) => {
@@ -576,10 +844,36 @@ function SandboxCard({ compact }: { compact: boolean }) {
   };
 
   if (!selected) return null;
+
+  /*
+   * 宽屏收起态（t13）：一条窄栏，保留「色点 + kind + 名称」。
+   * 它和展开态同一位置（top-4 right-6 w-80），所以收起时画面右侧只少了一条，
+   * 不会跳位置。点它展开。
+   */
+  if (!compact && desktopCollapsed) {
+    return (
+      <button
+        type="button"
+        className="panel-in pointer-events-auto absolute top-4 right-6 flex w-80 items-center gap-2.5 rounded-xl border border-line bg-elevated px-3 py-2 text-left"
+        aria-label={`展开${selected.name}详情`}
+        aria-expanded={false}
+        onClick={() => setDesktopCollapsed(false)}
+      >
+        <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: selected.swatch }} aria-hidden />
+        <span className="min-w-0 flex-1">
+          <span className="block text-[11px] leading-none text-muted">{selected.kind}</span>
+          <span className="font-display mt-1 block truncate text-base leading-tight text-fg">{selected.name}</span>
+        </span>
+        <ChevronDown className="size-4 shrink-0 text-subtle" aria-hidden />
+      </button>
+    );
+  }
+
   return (
     <CardShell
       id={selected.id}
       maxHeight={compact ? (dragPx === null ? SHEET_MAX[stop] : `${dragPx}px`) : undefined}
+      onBodyClick={compact ? onBodyTap : undefined}
       handle={
         compact ? (
           <CardHandle
@@ -593,7 +887,7 @@ function SandboxCard({ compact }: { compact: boolean }) {
               setDragPx(null);
               // 点击只做一件事：收起 ⇄ 展开。不是"循环三档"——
               // 轻点一下把卡片从半屏跳到全屏，是用户没要求的位移。
-              setStop((prev) => (prev === "bar" ? "half" : "bar"));
+              setStop(stop === "bar" ? "half" : "bar");
             }}
             onDragStart={(x, y, height) => {
               skipClick.current = false;
@@ -626,7 +920,19 @@ function SandboxCard({ compact }: { compact: boolean }) {
               setDragPx(null);
             }}
           />
-        ) : undefined
+        ) : (
+          /* 宽屏：卡片顶部一条 28px 的收起条（"抓手"）。鼠标目标小一点没关系，它整条都是按钮 */
+          <button
+            type="button"
+            className="hud-btn flex h-7 w-full shrink-0 items-center justify-center gap-1 rounded-t-xl bg-elevated text-[11px] text-subtle"
+            aria-label="收起详情卡"
+            aria-expanded={true}
+            onClick={() => setDesktopCollapsed(true)}
+          >
+            <ChevronUp className="size-3.5" aria-hidden />
+            收起
+          </button>
+        )
       }
     >
       {/* 沙盘的 ✕ 只在手机出现：桌面端下面那颗「返回总览」就是出口 */}
@@ -688,7 +994,8 @@ function PauseKey({ paused, onToggle }: { paused: boolean; onToggle: () => void 
       onClick={onToggle}
     >
       {paused ? <Play className="size-4" /> : <Pause className="size-4" />}
-      <span className="hidden sm:inline">{paused ? "继续" : "暂停"}</span>
+      {/* t12：窄屏也出字（原来 `hidden sm:inline`，390 下只剩 `| |`，第一次拿手机的人猜不出来） */}
+      <span>{paused ? "继续" : "暂停"}</span>
     </button>
   );
 }
@@ -702,7 +1009,7 @@ function OverviewKey({ onReset }: { onReset: () => void }) {
       onClick={onReset}
     >
       <LocateFixed className="size-4" />
-      <span className="hidden sm:inline">总览</span>
+      <span>总览</span>
     </button>
   );
 }
@@ -720,7 +1027,7 @@ function LayerKey({ label, pressed, onToggle, icon }: { label: string; pressed: 
       onClick={onToggle}
     >
       {icon}
-      <span className="hidden sm:inline">{label}</span>
+      <span>{label}</span>
     </button>
   );
 }
@@ -944,6 +1251,10 @@ function Dock({ compact }: { compact: boolean }) {
   const toggleOrbits = useSim((state) => state.toggleOrbits);
   const toggleTrails = useSim((state) => state.toggleTrails);
   const requestReset = useSim((state) => state.requestReset);
+  // t12：自动收起的开关（持久化在 settings 里，见 store 的 hudAutoHide）
+  const autoHide = useSim((state) => state.hudAutoHide);
+  const toggleAutoHide = useSim((state) => state.toggleHudAutoHide);
+  const chrome = useChrome();
   /** 切换模式期间禁拨时间（相机正在换系统，此时改时间等于在动画中途换片场）。 */
   const switching = useSim((state) => state.switching);
   const [layerOpen, setLayerOpen] = useState(false);
@@ -994,6 +1305,47 @@ function Dock({ compact }: { compact: boolean }) {
    * 不是 `daysOf(1) * speed`，那是"每模拟秒多少天"，t44 改基准后两者差 20.3 倍。
    */
   const rate = formatRate(daysPerRealSecond(speed));
+
+  /*
+   * t12：快照号在窄屏的去处。
+   * 抬头在 320 下只剩 23.4px 余量（t5 ④ 实测），`snap.10` 要 ~52px，塞进抬头就会把模拟历挤掉；
+   * 所以窄屏（<640，抬头那个 `.eyebrow` 本来就是 `hidden sm:inline`）把快照号放到**底栏**：
+   * 展开态与收起态的细条里各有一份，任何时刻都看得见。正式版没有后缀 → 两处都不渲染，
+   * 1.2.1 的抬头布局一个像素都不变。
+   */
+  const versionTag = snapshotTag(__APP_VERSION__);
+
+  /*
+   * 收起态（t12）：底栏缩成一条**可发现的细条**，不是消失。
+   * 高度：窄屏 h-11（44px，手指点得中）+ py-1；宽屏 h-8（鼠标）。
+   * 读数留下来 —— 它是"时间在跑"的唯一常显证据，藏掉会让人以为卡死。
+   */
+  if (chrome?.dock) {
+    return (
+      <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 md:px-6">
+        <div className="flex items-center justify-center gap-2 py-1">
+          <button
+            type="button"
+            className="hud-btn chrome-in-dock inline-flex h-11 items-center gap-2 rounded-full border border-line px-3 text-xs text-muted md:h-8"
+            aria-label="展开操作台"
+            aria-expanded={false}
+            onClick={chrome.expandDock}
+          >
+            <ChevronUp className="size-4" aria-hidden />
+            <span>操作台</span>
+            <span className="tabular-nums text-subtle">
+              1 秒 = {rate.value} {rate.unit}
+            </span>
+          </button>
+          {versionTag && (
+            <span data-version-tag className="shrink-0 text-[10px] tabular-nums tracking-wider text-subtle">
+              {versionTag}
+            </span>
+          )}
+        </div>
+      </footer>
+    );
+  }
 
   return (
     <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
@@ -1046,7 +1398,7 @@ function Dock({ compact }: { compact: boolean }) {
               onClick={() => setLayerOpen((prev) => !prev)}
             >
               <Layers className="size-4" />
-              <span className="hidden sm:inline">图层</span>
+              <span>图层</span>
             </button>
             <OverviewKey onReset={requestReset} />
           </div>
@@ -1077,6 +1429,26 @@ function Dock({ compact }: { compact: boolean }) {
               ))}
             </div>
           )}
+
+          {/* t12：自动收起的开关。窄屏塞在第 4 行——它必须能被关掉，否则"找不到按钮"就成了新 bug */}
+          <div className="mt-1.5 flex items-center gap-2">
+            <button
+              type="button"
+              className="hud-btn inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border border-line text-xs text-muted"
+              aria-pressed={autoHide}
+              aria-label={`自动收起${autoHide ? "已开" : "已关"}`}
+              onClick={toggleAutoHide}
+            >
+              自动收起
+              <span className={autoHide ? "text-fg" : "text-subtle"}>{autoHide ? "开" : "关"}</span>
+            </button>
+            {/* 快照号：窄屏不塞抬头（会把模拟历挤掉），放这儿，两个状态都看得见 */}
+            {versionTag && (
+              <span data-version-tag className="shrink-0 text-[10px] tabular-nums tracking-wider text-subtle">
+                {versionTag}
+              </span>
+            )}
+          </div>
         </>
       ) : (
         <div className="mt-1 grid grid-cols-5 gap-1.5">
@@ -1094,9 +1466,30 @@ function Dock({ compact }: { compact: boolean }) {
         </div>
       )}
 
-      <p className="mt-2 hidden text-xs text-subtle md:block">
-        空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
-      </p>
+      {/*
+        t12：宽屏的提示行 + 自动收起开关。
+        用 `!compact &&` 而不是 `hidden md:flex`：后者会在窄屏 DOM 里留一个 h=0 的
+        同 aria-label 按钮，`querySelector('button[aria-label^="自动收起"]')` 会先拿到它，
+        以后写断言必踩。结构上不存在，才是真的不存在。
+      */}
+      {!compact && (
+        <div className="mt-2 flex items-center justify-between gap-3">
+          <p className="text-xs text-subtle">
+            空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
+          </p>
+          {/* t12：自动收起的开关。宽屏放在提示行右侧，不占额外高度 */}
+          <button
+            type="button"
+            className="hud-btn inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-line px-2 text-xs text-muted"
+            aria-pressed={autoHide}
+            aria-label={`自动收起${autoHide ? "已开" : "已关"}`}
+            onClick={toggleAutoHide}
+          >
+            自动收起
+            <span className={autoHide ? "text-fg" : "text-subtle"}>{autoHide ? "开" : "关"}</span>
+          </button>
+        </div>
+      )}
     </footer>
   );
 }

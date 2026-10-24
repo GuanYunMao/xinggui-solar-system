@@ -120,6 +120,40 @@
   }
 }
 
+/*
+ * t12：chrome 收/展的入场。收起是「从树里拿掉」（结构上不存在），所以只有展开需要动效；
+ * 时长/曲线都用既有 --motion-* 变量，reduced-motion 在文件底部统一关掉。
+ */
+.chrome-in {
+  animation: chrome-in var(--motion-fast) var(--ease-smooth-out);
+}
+
+.chrome-in-dock {
+  animation: chrome-in-dock var(--motion-fast) var(--ease-smooth-out);
+}
+
+@keyframes chrome-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes chrome-in-dock {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .star-label {
   display: block;
   font-family: var(--font-sans);
@@ -179,6 +213,11 @@
 
 @media (prefers-reduced-motion: reduce) {
   .panel-in {
+    animation: none;
+  }
+
+  .chrome-in,
+  .chrome-in-dock {
     animation: none;
   }
 
