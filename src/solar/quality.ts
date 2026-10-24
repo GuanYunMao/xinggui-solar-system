@@ -36,15 +36,29 @@ export type Tier = {
  * T2 是**桌面起手档**：它的 texCap 1024 恰好等于现役观感在聚焦档实际用到的尺寸
  * （聚焦一颗行星的圆盘约 320 CSS px × dpr 1.6 ≈ 512 设备像素 → budget 804 → 取 1024），
  * 所以桌面默认观感一个像素都没降；T3 留给"把一颗星拉到占满屏"的情况。
- * T0 是手机起手档：dpr 1.25 是红线（手机不得低于它），texCap 256 只影响放大后的清晰度，
- * 总览档本来就全在 128 的下限上，一分钱都省不下来也不该省。
+ * T0 是手机起手档：**红线是"手机实际生效 dpr ≥ 1.25"**（详见下面 MOBILE_DPR_FLOOR），
+ * texCap 256 只影响放大后的清晰度，总览档本来就全在 128 的下限上，一分钱都省不下来也不该省。
+ *
+ * 为什么 T0 的 dprCap 写 1.28 而不是 1.25：画布宽只能是整数设备像素，three 的
+ * `setPixelRatio` 实际是 `canvas.width = floor(cssW × dpr)`。390 宽 × 1.25 = 487.5 →
+ * 487 像素 → 实际 dpr 1.249，**红线被破了自己不知道**。1.28 给整数取整留出余量：
+ * 390 × 1.28 = 499.2 → 499 → 1.279 ≥ 1.25。代价约 +5% 画布像素，换红线真的成立。
+ * 其余档位的 cap 不是红线（1.6 只为控像素量），所以不需要余量。
  */
 export const TIERS: readonly Tier[] = [
-  { id: 0, name: "省电", texCap: 256, dprCap: 1.25 },
+  { id: 0, name: "省电", texCap: 256, dprCap: 1.28 },
   { id: 1, name: "平衡", texCap: 512, dprCap: 1.6 },
   { id: 2, name: "高清", texCap: 1024, dprCap: 1.6 },
   { id: 3, name: "视网膜", texCap: 2048, dprCap: 1.6 },
 ];
+
+/**
+ * 手机实际生效 dpr 的红线。断言对象是**实测值**（`__solarQuality().effectiveDpr`），
+ * 不是配置里的 `dprCap` —— 上面那个整数取整的坑就是这么来的。
+ * 只对 `(pointer: coarse)` 的设备成立；dpr=1 的桌面上画布就是 1.0，没有"抬到 1.25"的道理
+ * （那是凭空多光栅 56% 的像素）。
+ */
+export const MOBILE_DPR_FLOOR = 1.25;
 
 /**
  * 自适应阈值。
@@ -286,9 +300,35 @@ export function noteGpu(renderer: string) {
   if (typeof console !== "undefined") console.log(`[quality] gpu（仅诊断）: ${renderer}`);
 }
 
+/**
+ * 画布实际生效的像素尺寸。**这是实测值，不是配置值** —— 断言红线只能断言它。
+ *
+ * 为什么要从 DOM 读而不是从 tier 推：`dprCap` 只是上限，真实值由
+ * `clamp(devicePixelRatio, 1, dprCap)` 再被 three 的 `canvas.width = floor(cssW × dpr)`
+ * 取整决定。390 宽 × 1.25 = 487.5 → 487 → 1.249，红线就是这么破的。
+ */
+function canvasMetrics() {
+  if (typeof document === "undefined") return null;
+  const cv = document.querySelector("canvas") as HTMLCanvasElement | null;
+  if (!cv) return null;
+  const cssW = cv.clientWidth;
+  const cssH = cv.clientHeight;
+  const devW = cv.width;
+  const devH = cv.height;
+  return {
+    canvasCss: { w: cssW, h: cssH },
+    canvasDevice: { w: devW, h: devH },
+    effectiveDpr: cssW > 0 ? Math.round((devW / cssW) * 1000) / 1000 : null,
+    /** 只对 coarse（手机）成立的红线判断；桌面 dpr=1 天经地义，不参与 */
+    pointerCoarse: typeof window !== "undefined" ? window.matchMedia("(pointer: coarse)").matches : false,
+    mobileDprFloor: MOBILE_DPR_FLOOR,
+  };
+}
+
 /** `window.__solarQuality()` 的内容 */
 export function qualityReport() {
   const t = tierOf();
+  const canvas = canvasMetrics();
   return {
     tier: state.tier,
     name: t.name,
@@ -304,6 +344,11 @@ export function qualityReport() {
     history: state.history,
     lastEvalAt: Math.round(lastEvalAt),
     thresholds: { ...QUALITY_HYSTERESIS, warmupFrames },
+    canvasCss: canvas?.canvasCss ?? null,
+    canvasDevice: canvas?.canvasDevice ?? null,
+    effectiveDpr: canvas?.effectiveDpr ?? null,
+    pointerCoarse: canvas?.pointerCoarse ?? false,
+    mobileDprFloor: MOBILE_DPR_FLOOR,
   };
 }
 
