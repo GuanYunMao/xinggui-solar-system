@@ -547,34 +547,41 @@ function Simulation({ ready = true }: { ready?: boolean }) {
 
 function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
   /*
-   * 轨道线在地球这种「天体正好压在自己轨道上」的画面里会**横穿球面**（t51）。
+   * 轨道线不能穿过球面、也**不能出现可见的缺口**（t52 修正 t51 的回归）。
    *
-   * 根因不是深度测试没开：`LineBasicMaterial` 默认 `depthTest: true`，球面是 opaque
-   * 也写了深度。问题是几何本身 —— 天体就站在环上，环的**近侧半圈**在遮挡关系上确实
-   * 在球体前面，深度测试会老老实实把它画出来，于是看起来像一根杆子捅穿行星。
+   * 事实：`LineBasicMaterial` 默认 `depthTest: true`，球体不透明也写深度 —— 所以
+   * "远侧被挡住 / 近侧可见"本来就已经成立。t51 想藏掉的其实是"近侧那半圈正好横穿盘面"，
+   * 但它用 `setDrawRange` 硬切了一个缺口，玩家看到的是一条断线（回归）。
    *
-   * 改法：把环画成两遍（参数 0..2 覆盖整圈两次），每帧用 `setDrawRange` 只留
-   * 「天体前后留 1.7 倍半径」之外的那一段（单次 draw call，不新增 shader program，
-   * 也不给每帧加 vertex 重算）。天体附近的缺口 = 线在球体后面时不可见、在球体别处
-   * 仍然照常可见，正是验收要的两件事。
+   * 现在改成**逐顶点 alpha 淡出**（顶点色 vec4，alpha 参与混合）：
+   * 环照常画整圈，只在天体参数位置两侧的淡出带里把 alpha 从 1 渐变到 0。
+   * 为什么选这条而不是"按相机方向只处理近侧半圈"：后者要每帧判断"这段在不在近侧"，
+   * 而环是天体自己的轨道、天体总在环上 —— 近侧判断会随相机抖动在阈值附近跳变，
+   * 反而制造闪烁；alpha 淡出是纯连续的，没有判据可跳。
+   * 代价：每帧重写 181 个顶点的 alpha（约 700 个 float），比 setDrawRange 贵一点点，
+   * 但不需要新 shader program（t41 量过一个 program 首编译 20–40ms）。
    */
   const RING_SEGMENTS = 180;
   const line = useMemo(() => {
     const pts: number[] = [];
-    // 两遍：参数 p ∈ [0, 2]，于是「挖掉一段」等价于一个连续的 draw range
-    for (let i = 0; i <= RING_SEGMENTS * 2; i++) {
+    const cols: number[] = [];
+    for (let i = 0; i <= RING_SEGMENTS; i++) {
       const angle = (i / RING_SEGMENTS) * Math.PI * 2;
       const lx = Math.cos(angle) * body.orbitRadius;
       const lz = Math.sin(angle) * body.orbitRadius;
       pts.push(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+      cols.push(1, 1, 1, 1);
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+    // itemSize 4 → three 自动开 USE_COLOR_ALPHA，vColor.a 参与片元输出
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(cols, 4));
     geo.computeBoundingSphere();
     const mat = new THREE.LineBasicMaterial({
       color: selected ? "#e8edf4" : "#8b97a8",
       transparent: true,
       opacity: selected ? 0.9 : isMoon(body) ? 0.22 : 0.32,
+      vertexColors: true,
       // 显式写出来：线要参与深度测试（被球体挡住）、但不写深度（避免遮挡后面的半透明）
       depthTest: true,
       depthWrite: false,
@@ -583,18 +590,31 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
     mesh.frustumCulled = false;
     return mesh;
   }, [body, selected]);
-  // 缺口半宽：1.7 倍天体半径换算成「参数」单位（= 角度/2π）
-  const gapHalf = useMemo(
-    () => Math.max(0.004, (body.radius * 1.7) / (body.orbitRadius * Math.PI * 2)),
+  // 淡出带（参数单位 = 角度/2π）：从 1.1 倍半径（贴面）到 1.6 倍半径（全亮）。
+  // 带子必须窄：t51 的硬缺口看起来是"断线"，但带宽 2.2 倍半径又会让人以为线在半空中消失了。
+  const fadeOuter = useMemo(
+    () => Math.max(0.006, (body.radius * 1.6) / (body.orbitRadius * Math.PI * 2)),
     [body.radius, body.orbitRadius],
   );
+  const fadeInner = fadeOuter * 0.69; // ≈ 1.1 倍半径处
   useFrame(() => {
-    const geo = line.geometry;
+    const attr = line.geometry.getAttribute("color") as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
     // 天体在环上的参数位置：与 Simulation 的相位公式同源（angle = t/period·2π + phase）
     const tParam = (((simTimeNow() / body.period + body.phase / (Math.PI * 2)) % 1) + 1) % 1;
-    const start = Math.round((tParam + gapHalf) * RING_SEGMENTS);
-    const count = Math.max(2, Math.round((1 - gapHalf * 2) * RING_SEGMENTS) + 1);
-    geo.setDrawRange(start, count);
+    let changed = false;
+    for (let i = 0; i <= RING_SEGMENTS; i++) {
+      const p = i / RING_SEGMENTS;
+      let d = Math.abs(p - tParam);
+      if (d > 0.5) d = 1 - d; // 环是闭合的
+      const t = Math.min(1, Math.max(0, (d - fadeInner) / Math.max(fadeOuter - fadeInner, 1e-6)));
+      const a = t * t * (3 - 2 * t); // smoothstep：无折角，肉眼看不到"断开"
+      if (Math.abs(arr[i * 4 + 3]! - a) > 0.01) {
+        arr[i * 4 + 3] = a;
+        changed = true;
+      }
+    }
+    if (changed) attr.needsUpdate = true;
   });
   useEffect(
     () => () => {
