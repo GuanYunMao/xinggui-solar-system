@@ -26,10 +26,10 @@ npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒�
 
 | pass | 验什么 | 判据 | 红了先看哪 |
 | --- | --- | --- | --- |
-| `desktop` | 1280×720：画布起来、恰好 1 个 canvas、无横向溢出、点「地球」后卡片标题是「地球」、**画布不是全黑** | 结构性 + 像素 | `results[]` 里该条的 `errors` / `overflowX` / `selected` / `canvasPixels` |
-| `mobile` | 390×844 @3x 触屏视口同上（不点选） | 结构性 + 像素 | 同上 |
-| `mobile-selected` | 手机视口 + 点选 | 结构性 + 像素 | 同上 |
-| `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏）、**画布不是全黑** | 结构性 + 像素 | 该条 `errors`；漏资源会在控制台报 404 |
+| `desktop` | 1280×720：画布起来、恰好 1 个 canvas、无横向溢出、点「地球」后卡片标题是「地球」、**画布不是全黑**、**手机 dpr 红线（桌面不判）** | 结构性 + 像素 | `results[]` 里该条的 `errors` / `overflowX` / `selected` / `canvasPixels` / `quality` |
+| `mobile` | 390×844 @3x 触屏视口同上（不点选）+ **`effectiveDpr ≥ mobileDprFloor`** | 结构性 + 像素 | 同上；dpr 红线看该条 `quality.effectiveDpr` |
+| `mobile-selected` | 手机视口 + 点选 + **dpr 红线** | 结构性 + 像素 | 同上 |
+| `single-file` | `release/巡星.html` 用 `file://` 直接打开（单文件版资源没漏）、**画布不是全黑**、dpr 红线 | 结构性 + 像素 | 该条 `errors`；漏资源会在控制台报 404 |
 | `frame-time` | 稳态帧时间相对**本次运行的机器基线**的比值 | **数值** | `results[frame-time].normalized`，见下节 |
 | `hit-matrix` | 探针投影出的天体数（判）；屏幕重叠对数（**只记录**） | **数值** | 见下面「哪些数字不许当判据」 |
 | `follow-jitter` | 选中地球后 90 帧，目标屏幕位置峰峰值 < 0.5px | **数值** | 抖动说明相机跟随里混进了逐帧噪声 |
@@ -93,6 +93,20 @@ npm run check          # = 单文件冒烟 + 形状判据（静态扫描，秒�
 **画布像素体检共挂在 5 条 pass 上**（`desktop` / `mobile` / `mobile-selected` / `single-file` /
 `proto-real`，`judgeCanvasPixels` 2 个调用点），见下节「画布像素体检（抓整屏黑）」——
 它抓的是「数据层全对、眼睛看到一片黑」这类回归。`proto-jitter` 另有独立回读，不计入这 5 条。
+
+**手机 dpr 红线挂在 4 条 pass 上**（`desktop` / `mobile` / `mobile-selected` / `single-file`，
+`judgeQuality` 1 个调用点，`run()` 里）——但**只在 `pointerCoarse === true` 时判**：
+桌面 dpr=1 天经地义，硬抬到 1.25 等于凭空多烧 56% 光栅。实测（2026-10-24）：
+
+| 视口 | pointerCoarse | 画布设备像素 / CSS | effectiveDpr | 判定 |
+| --- | --- | --- | --- | --- |
+| 桌面 1280×720 dpr1 | false | 1280×720 / 1280×720 | **1.000** | 不判 |
+| 手机 390×844 dpr3 | **true** | 499×1080 / 390×844 | **1.279** ≥ 1.25 | **PASS** |
+
+断言对象是**实测值**（`canvas.width / clientWidth` 由 DOM 现算），**不许**从配置读 `dprCap`：
+上一版就是配 1.25、实测 1.249 —— `canvas.width = floor(390 × 1.25) = 487` → 1.249，红线被破了自己不知道。
+这就是 T0 的 `dprCap` 写 1.28 的原因（390×1.28 = 499 → 1.279）。`__solarQuality` 探针**没了直接红**，
+否则这条红线又回到「没有任何机器在守」的状态。
 
 ## 形状判据（`check-shape.mjs`）
 
@@ -316,12 +330,12 @@ Select-String -Path scripts/verify.mjs -Pattern 'judgeCanvasPixels\(' | Where-Ob
 
 ## frame-time 的红线怎么读
 
-判的不是绝对毫秒，是比值。三个判据共用一把尺子：分母 = 本次机器基线。
+判的不是绝对毫秒，是比值。**两个判据**共用一把尺子：分母 = 本次机器基线。
 
 ```
 normalized.ema  = steady.ema ÷ denominatorMs   阈值 1.6
 normalized.p95  = steady.p95 ÷ denominatorMs   阈值 2.5
-hitch：超过 max(50ms, 2.5 × denominatorMs) 的帧，150 帧里最多允许 2 次
+hitch（超阈帧数）：只记录 + 告警，**不判红**（2026-10-24 t45 改，理由见下）
 ```
 
 `denominatorMs` 取两次基线里较大的那个：一次在遥测页**开起来之前**测，一次在**关掉之后**测。
@@ -332,8 +346,24 @@ hitch：超过 max(50ms, 2.5 × denominatorMs) 的帧，150 帧里最多允许 2
 
 分母 = `max(raster.ema, vsync.ema)`。空循环那一路是**兜底**：闲机器上 8 个 pass 可能塞进一帧、
 被 vsync 钉住，这时断言自动退化成「场景 ≤ 1.6 × vsync」——没信息的时候不假装有信息。
-p95 和 hitch 共用 `2.5 × 分母` 这个常数，和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，
-所以 hitch 仍按 50ms 地板算。
+p95 的 `2.5 × 分母` 和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，所以 hitch 阈值仍按 50ms 地板算。
+
+### hitch 为什么不再判红（t45）
+
+它量的是「150 帧里有几帧超过 `max(50ms, 2.5 × 分母)`」，是**观测量**：被超的那几帧在共享机器上
+主要由 CPU 争抢决定，跟产品改了什么没关系。实测证据（同一份代码、同一台机器）：
+
+- peak 时 `median 34.3ms / 归一化 EMA 1.05（通过）`，却 `hitch 5 > 2`，同期 22 个浏览器进程，**重跑即绿**；
+- 本机 10 次历史运行里 `baselineHitches` 常为 0，而场景仍可能 5 次 ——
+  所以「按基线占比归一化」这条路**救不了**（0 的倍数还是 0），先排除。
+
+它原有的信号已被归一化的 `EMA`（≤1.6×）与 `p95`（≤2.5×）覆盖：那两条是同一次运行内自比、
+标定过余量、盲区写明的。**没有放宽任何阈值数字**，改的是判据类型。
+
+**代价（必须知道）**：`<5%` 帧的**稀疏卡顿不再判红**——p95 是 95 分位，管不到 2% 的尖峰。
+真要看这类问题：`normalized.hitch` / `hitchExceeded` 仍在 results 里，超告警线会打一行
+`（注意）frame-time: 稳态 hitch N 次 > 告警线`；连续多次都超时再怀疑产品侧的周期性阻塞（贴图重建之类）。
+若将来要把它重新变成判据，建议用「场景 p95 × 1.5」当阈值而不是绝对次数——那才是同一条分布内的自比。
 
 红了先按这个顺序看：
 
@@ -343,8 +373,8 @@ p95 和 hitch 共用 `2.5 × 分母` 这个常数，和旧判据同源：60Hz �
    （单帧光栅量真涨了，比如有人往每帧里塞了贴图重建）。
 3. `steady.ema`（绝对 ms）和 `legacy.wouldFail` 只是留档：`wouldFail: true` 但全绿是**正常**的，
    它记录「旧规矩在同样这份采样上会红」，用来对比，不参与判定。
-4. `normalized.baselineHitches`：同一把尺子量基线页。它也不为 0 说明这台机器本身在抖，
-   此时的 hitch 结论不作数。
+4. `normalized.hitch` / `hitchExceeded`：只作趋势与告警；同一把尺子量基线页的
+   `baselineHitches` 也不为 0 时，说明这台机器整体在抖，那几帧更不能算产品的账。
 
 阈值 1.6 的来历写在 `verify.mjs` 顶部注释里：旧断言 `EMA ≤ 26ms` 在 60Hz 机器上等于
 26/16.7 = 1.56×，新阈值取 1.6 保持同等严格度。

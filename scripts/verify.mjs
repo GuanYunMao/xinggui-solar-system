@@ -98,7 +98,7 @@ const EMA_RATIO_MAX = 1.6;
 const P95_RATIO_MAX = 2.5;
 const HITCH_MIN_MS = 50;
 const HITCH_FACTOR = 2.5;
-const HITCH_ALLOWANCE = 2; // 150 帧里允许 2 次越线（贴图/GC 这类一次性阻塞），3 次及以上算系统性的
+const HITCH_ALLOWANCE = 2; // **告警线**（不再判红，t45）：150 帧里超过 2 次就提醒，但不进 failures
 
 const CAL_HTML = `<!doctype html><html><body style="margin:0;background:#000;overflow:hidden">
 <canvas id="c" width="1280" height="720" style="width:1280px;height:720px"></canvas>
@@ -225,10 +225,10 @@ async function measureBaseline(browser) {
 const denomOf = (baseline) => Math.max(baseline.raster.ema, baseline.vsync.ema);
 
 // 判定：绝对值只记录，不判红；判的是「场景 ÷ 基线」的比值。
-// 三个判据共用一把尺子：分母 = 本次机器基线，所有阈值都是它的倍数。
+// 两个判据共用一把尺子：分母 = 本次机器基线，阈值都是它的倍数。
 //   EMA  ≤ 1.6 × 分母   —— 稳态帧率
 //   p95  ≤ 2.5 × 分母   —— 不能有一半的帧慢到 2.5 倍
-//   hitch: 超过 2.5 × 分母（且不低于 50ms 地板）的帧，最多 2 次
+//   hitch（超阈帧数）**只记录 + 告警，不判红**（t45，理由见下方那段注释）
 // 2.5 这个数在 50ms 地板上和旧判据同源：60Hz 机器上 2.5 × 16.7 = 42ms < 50，仍按 50ms 算。
 function judgeFrameTime(ft, steadyDeltas, baselines) {
   const denominator = Math.max(...baselines.map(denomOf));
@@ -274,9 +274,21 @@ function judgeFrameTime(ft, steadyDeltas, baselines) {
       `frame-time: 归一化 p95 ${n.p95}× > ${P95_RATIO_MAX}×（分母 ${n.denominatorMs}ms，场景 ${ft.steady.p95}ms）`,
     );
   }
-  if (hitches > HITCH_ALLOWANCE) {
-    failures.push(
-      `frame-time: 稳态 hitch ${hitches} 次 > ${HITCH_ALLOWANCE} 次（阈值 ${n.hitchThresholdMs}ms，基线页同时段 ${baselineHitches} 次）`,
+  // ——— hitch：从「判红」降级为「记录 + 告警」（t45）———
+  // 为什么不判红：它是**观测量**，量的是「150 帧里有几帧超过 2.5×机器基线」，而被超的那几帧
+  // 在共享机器上主要由 CPU 争抢决定。实测证据（同一份代码、同一天）：
+  //   peak 时 median 34.3ms / 归一化 EMA 1.05（通过）/ 却 hitch 5 > 2，同期 22 个浏览器进程，
+  //   重跑即绿。历史 10 次运行里 `baselineHitches` 常为 0 而场景仍可能 5 次 ——
+  //   所以「按基线占比归一化」救不了（0 的倍数还是 0），这条路先排除。
+  // 它原有的信号已被归一化的 EMA（≤1.6×）与 p95（≤2.5×）覆盖：那两条是同一次运行内自比、
+  // 标定过余量、盲区写明的。hitch 只保留趋势与告警，见 README「frame-time 的红线怎么读」。
+  // 代价（写在 README 里）：<5% 帧的稀疏卡顿不再判红（p95 是 95 分位，管不到 2% 的尖峰）。
+  n.hitchExceeded = hitches > HITCH_ALLOWANCE;
+  if (n.hitchExceeded) {
+    console.error(
+      `（注意）frame-time: 稳态 hitch ${hitches} 次 > 告警线 ${HITCH_ALLOWANCE} 次` +
+        `（阈值 ${n.hitchThresholdMs}ms，基线页同时段 ${baselineHitches} 次，稳态 median ${ft.steady.median}ms）` +
+        ` —— 仅告警不判红；连续多次都超时再怀疑产品侧的周期性阻塞`,
     );
   }
 }
@@ -348,6 +360,48 @@ function judgeCanvasPixels(name, px) {
     failures.push(
       `${name}: 画布是黑的（平均亮度 ${px.meanLum}、非黑块占比 ${px.nonBlackRatio}、${px.width}×${px.height}）` +
         ` —— 场景可能一笔没画（先看 __solarProbe 的几何是否正常，再看 draws/tris）`,
+    );
+  }
+}
+
+// ——— 画布质量探针（t45）：手机 dpr 红线 ————————————————
+// 断言对象是**实测值** `__solarQuality().effectiveDpr`（= canvas.width / clientWidth，由 DOM 现算），
+// **不许**从配置里读 `dprCap`：上一版就是配 1.25、实测 1.249 ——
+// `canvas.width = floor(cssW × dpr)`，390×1.25 = 487.5 → 487 → 1.249，红线被破了自己不知道。
+// 只在 `pointerCoarse === true` 时判：桌面 dpr=1 天经地义，硬抬到 1.25 等于凭空多烧 56% 光栅。
+// 分类：**结构量**（DOM 现算的比值，与机器快慢无关），可以判红。
+async function readQuality(page) {
+  return page.evaluate(() => {
+    const api = window.__solarQuality;
+    if (!api) return { available: false, reason: "__solarQuality 不存在" };
+    const q = api();
+    return {
+      available: true,
+      pointerCoarse: Boolean(q.pointerCoarse),
+      effectiveDpr: q.effectiveDpr,
+      mobileDprFloor: q.mobileDprFloor,
+      dprCap: q.dprCap,
+      tier: q.tier,
+      tierName: q.name,
+      canvasCss: q.canvasCss,
+      canvasDevice: q.canvasDevice,
+    };
+  });
+}
+
+function judgeQuality(name, q) {
+  if (!q) return;
+  if (!q.available) {
+    // 探针没了 = 这条红线又没人守了，必须红（否则就是「静默失去一条守卫」）
+    failures.push(`${name}: 读不到 __solarQuality（${q.reason}）—— 手机 dpr 红线会失去守卫`);
+    return;
+  }
+  if (!q.pointerCoarse) return; // 桌面不判
+  const ok = typeof q.effectiveDpr === "number" && q.effectiveDpr >= q.mobileDprFloor;
+  if (!ok) {
+    failures.push(
+      `${name}: 手机 dpr 实测 ${q.effectiveDpr} < 红线 ${q.mobileDprFloor}` +
+        `（画布设备像素 ${q.canvasDevice?.w}×${q.canvasDevice?.h} / CSS ${q.canvasCss?.w}×${q.canvasCss?.h}，tier ${q.tier} 的 dprCap ${q.dprCap}）`,
     );
   }
 }
@@ -459,6 +513,8 @@ async function run(browser, spec) {
 
     // 定稿态再采样：点选后镜头更近，画面内容更多
     result.canvasPixels = await sampleCanvasPixels(page);
+    // 手机 dpr 红线（结构量）：只在 pointer: coarse 的设备上判
+    result.quality = await readQuality(page);
 
     await page.screenshot({ path: path.join(SHOTS, `${spec.name}.png`) });
   } catch (err) {
@@ -471,6 +527,7 @@ async function run(browser, spec) {
   if (result.canvas !== 1) failures.push(`${spec.name}: canvas 数量 ${result.canvas} ≠ 1`);
   if (result.overflowX > 1) failures.push(`${spec.name}: 横向溢出 ${result.overflowX}px`);
   judgeCanvasPixels(spec.name, result.canvasPixels);
+  judgeQuality(spec.name, result.quality);
   if (spec.expectSelected && result.selected !== spec.expectSelected) {
     failures.push(`${spec.name}: 点选后卡片是「${result.selected}」，期望「${spec.expectSelected}」`);
   }
