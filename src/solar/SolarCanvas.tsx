@@ -88,7 +88,8 @@ const READBACK =
 /**
  * `?proto=1` 是**抖动测量的专用机位**（正面受光 + 慢摆），不是产品取景。
  * 实地模式（store.mode === "real"，不带这个参数）用 frameEarthMoon 的地月取景。
- * 两者共用米制分支，但机位语义不同，必须分开。
+ * 两者挂的是同一台 <MeterCamera>，但机位语义不同（夹具要正对受光面、实地要地月同框），
+ * 所以取景路径必须分开 —— 不是两个"分支"，是同一组件里的两条取景语义。
  */
 const PROTO_HARNESS =
   typeof window !== "undefined" && new URLSearchParams(window.location.search).get("proto") === "1";
@@ -872,7 +873,8 @@ function Labels() {
     // 标签投影的焦距与拾取器同源（pick.ts 的 focalPx）——以前这里自己写了一份
     const focal = focalPx(h, persp.fov);
     const nodes = pool.current;
-    // 沙盘里卫星不给标签（会叠成一团）；实境里只给选中的那个
+    // baseOn = HUD 的开关 且 这个系统声明了 look.labels；选中的那颗不受它管（见下面 `on` 的
+    // 定义），卫星则一律不给标签 —— 沙盘里会叠成一团
     const baseOn = showLabels && look.labels;
 
     /*
@@ -1466,10 +1468,10 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     controls.enableZoom = false;
     /*
      * 动画期间必须连 `enabled` 一起关。
-     * OrbitControls 有 `minDistance=1.15 / maxDistance=280` 的距离夹取：相机一旦被
-     * 动画带到 1e11 量级（实地机位），它的 update() 每帧都会把相机拽回 280 单位，
-     * 和动画互相拉扯，最后停在半路。关掉 enabled 等于整套控件静音，
-     * 这正是米制分支的做法；代价是切回来之后必须记得还原，否则视角永久拖不动。
+     * OrbitControls 有距离夹取（`minDistance` 从 1.15 起、按目标天体半径抬到 1.2×，`maxDistance=280`）：
+     * 相机一旦被动画带到 1e11 量级（实地机位），它的 update() 每帧都会把相机拽回 280 单位，
+     * 和动画互相拉扯，最后停在半路。关掉 enabled 等于整套控件静音 —— 米制相机和沙盘相机
+     * 都这么做（两套组件各自管自己的动画）；代价是切回来之后必须记得还原，否则视角永久拖不动。
      */
     controls.enabled = false;
   };

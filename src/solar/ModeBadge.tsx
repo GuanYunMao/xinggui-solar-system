@@ -25,7 +25,8 @@ import { isGateUnlocked, useSim } from "./store";
 
 /**
  * 实境渲染已接通（t16）：`App` 让 `SystemProvider` 跟着 store 的 `mode` 走，
- * 相机侧由 `realPose` + 米制分支接管，所以徽标解锁后就是可用的分段控件。
+ * 相机侧由 `<MeterCamera>` 接管（渲染层按 spec 的 `look.camera` 二选一挂载），
+ * 所以徽标解锁后就是可用的分段控件。
  * 这条开关留着当**总闸**：哪天实境要临时下线，翻回 false 即可，不用拆 UI。
  */
 const REAL_READY = true;

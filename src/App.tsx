@@ -37,7 +37,8 @@ export function App() {
   const [ready, setReady] = useState(false);
   /*
    * 系统跟着 store 的 mode 走（t16）：
-   *  - `mode === "real"` → REAL_PROTO（米制三体），相机已经在 realPose 上按米算好了；
+   *  - `mode === "real"` → REAL_PROTO（米制三体）。相机不归这里管：渲染层按 spec 的
+   *    `look.camera === "meter"` 挂 `<MeterCamera>`，机位由 `systems.frameEarthMoon` 按米算；
    *  - 其余 → 默认沙盘系统（压缩世界单位）。
    *  - `?proto=1` 仍然是**最高优先级**的后门：eagle-eye 调试要的是「不管 store 说什么，
    *    给我看原型」，所以它永远盖过 mode。
@@ -71,11 +72,12 @@ export function App() {
    * 240ms 之后再淡出（`transition-opacity` 只挂在淡出那一支上），
    * 于是硬切被黑场盖住，露出时已经是摆好的实地画面。
    *
-   * 为什么不在 `dip()` 里改（captain 原话是改 dip 的那 3 行）：`dip()` 在
-   * `SolarCanvas.tsx`，是 engineer 的领土，TEAM.md 第一节写死了只读。
-   * 而且 engineer 已经在米制分支里补了「这一帧就 finishSwitch」的释放点（`:1230`），
-   * 所以 dip 里那套 append + rAF 的老时序仍然存在、但被我的黑幕盖着看不出来；
-   * 他愿意的话可以删掉 dip，两边不冲突。
+   * 为什么黑场在壳层而不是渲染层：渲染层原来有个 `dip()`（命令式 append 一层黑 div、
+   * 再等一个 rAF 才把 opacity 设成 1），它是**假黑场** —— 换系统那次 commit 根本没被盖住，
+   * 而 rAF 在后台标签页还不跑。那个函数已经删掉了，全项目只剩这里一份黑幕。
+   * 至于 `switching` 锁的释放点，渲染层用的是 `releaseControls()`：`<MeterCamera>` 和
+   * `<SandboxCamera>` 里各调一次。**这里不写行号** —— 上一版写的是一个具体行号，
+   * 早就漂到 far 裁剪面的代码上去了；写函数名比写数字活得久。
    *
    * 只盖进实地、不盖回沙盘：回沙盘那 0.95s 是设计好的镜头回归，盖住就看不见路了。
    */
