@@ -1344,7 +1344,7 @@ function Trail({ id, color, visible }: { id: string; color: string; visible: boo
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(TRAIL_POINTS * 3), 3));
     g.setDrawRange(0, 0);
-    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5, depthWrite: false });
+    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.26, depthWrite: false });
     const l = new THREE.Line(g, m);
     l.frustumCulled = false;
     return l;
@@ -1787,9 +1787,15 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const fromDist = Math.max(offset.length(), 0.001);
     offset.multiplyScalar(1 / fromDist);
     const body = id ? byId[id] : undefined;
+    /*
+     * 中途换目标时 dur 缩短（t55 B2）。fromPos/fromTarget 本来就取"此刻"，位置连续；
+     * 卡顿来自 `t=0` + easeInOut 的起点速度为 0 —— 等于在切换那一帧把镜头刹停。
+     * 这一段更短，让那次"顿一下"短到看不出来。
+     */
+    const continuing = anim.current !== null;
     anim.current = {
       t: 0,
-      dur: reduced ? 0.01 : 0.95,
+      dur: reduced ? 0.01 : continuing ? 0.55 : 0.95,
       fromPos,
       fromTarget,
       dir: offset,
@@ -1961,7 +1967,21 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
           scratch.dest.y -= halfHeight * 0.55;
         }
         scratch.target.lerpVectors(current.fromTarget, scratch.dest, u);
-        const dist = THREE.MathUtils.lerp(current.fromDist, current.toDist, u);
+        /*
+         * 距离用**对数**插值（t55 B2）。
+         *
+         * 根因：屏幕上星球的视觉大小 ∝ 1/dist。线性插值 118 → 4.8 时，前 90% 的时间
+         * dist 只从 118 掉到 16（球几乎没变大），最后 10% 才从 16 冲到 4.8 ——
+         * 观感就是「先转过去，再突然放大」。取对数后每帧的视觉放大倍率恒定，
+         * 缩放和朝向（由 target 平移带来的转动）从头到尾同步。
+         */
+        const dist = Math.exp(
+          THREE.MathUtils.lerp(
+            Math.log(Math.max(current.fromDist, 1e-3)),
+            Math.log(Math.max(current.toDist, 1e-3)),
+            u,
+          ),
+        );
         scratch.pos.copy(scratch.target).addScaledVector(current.dir, dist);
       }
       controls.target.copy(scratch.target);

@@ -34,7 +34,13 @@
 
 **禁止用 shell 做源码文本手术**（PowerShell `-replace`、`Set-Content`、`sed`、批量脚本改源码）。
 
-这条已经违规三次：`package.json` 的中文描述变乱码、`store.ts` 整文件 mojibake、`starfield.ts` 的注释整片乱码。**不是建议，是硬禁止**——写源码只用 edit/write 工具；`Set-Content` 默认按系统编码写盘，中文注释必坏。
+这条已经违规四次：`package.json` 的中文描述变乱码、`store.ts` 整文件 mojibake、`starfield.ts` 的注释整片乱码、以及有人用 node 写"括号配对切割"撤回改动，把 `SolarCanvas.tsx` 切成 5848 行。**不是建议，是硬禁止**——写源码只用 edit/write 工具；`Set-Content` 默认按系统编码写盘，中文注释必坏。
+
+**配套两条**：
+- 一次要改三处以上，**先 commit 一次**再动手，这样撤回只要 `git checkout -- <单个文件>`
+- 撤回改动**只用 `edit` 改确切文本**，不要用脚本按模式切割——它切错的方向比切对的多
+
+**还有一条更隐蔽的**：`git checkout -- <文件>` 会抹掉**所有人**在这个文件里的未提交改动，不只是你自己的。2026-10-24 就发生过一次：一个人回滚 `SolarCanvas.tsx`，把另一个人的单行改动一起抹了，那人后来重新贴回去才发现。所以在多人共享文件上回滚之前，先 `git diff` 看清楚里面有没有别人的东西。
 
 已经发生两次：一次把 `package.json` 的中文描述改成乱码，一次把 `store.ts` 整个搞成 mojibake 加语法崩。两次都是"图快"。
 
