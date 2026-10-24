@@ -1,4 +1,4 @@
-import { ChevronRight, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
+import { ChevronDown, ChevronRight, Clock, Layers, LocateFixed, Orbit, Pause, Play, Sparkles, Tag } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
@@ -161,7 +161,7 @@ function SandboxHud() {
     <>
       <HudHeader trailing={<Epoch />} />
       {/* 芯片行是「9 个可去的天体」的导航台 —— 只有沙盘有这个语义 */}
-      <Chips />
+      <Chips compact={compact} />
       <Moons />
       <div className="relative min-h-0 flex-1">
         <SandboxCard compact={compact} />
@@ -193,22 +193,30 @@ function RealHud() {
 
 /* ────────────────────────────── 共用：抬头 ────────────────────────────── */
 
-/** 左上 = 图标 + 代际名 + 版本号，**不放全名**（全名唯一的家是启动页，见 App.tsx）。 */
+/**
+ * 抬头。信息只有三层，从主到次：
+ *
+ *   品牌行（图标 + 代际名，版本号宽屏才出）   →   模式徽标   →   模拟历
+ *
+ * 窄屏的取舍：**版本号让位，模拟历不让**。版本号是给开发者看的一次性信息，
+ * 模拟历是玩家一直在读的量；两者都要位置时，先砍前者。
+ * 徽标与历法是同一层（区划 + 读数），所以放在同一个右侧容器里，中间只隔一条细线。
+ */
 function HudHeader({ trailing }: { trailing?: ReactNode }) {
   return (
-    <header className="flex items-center justify-between gap-3 px-4 pt-4 md:px-6 md:pt-6">
+    <header className="flex items-center justify-between gap-2 px-4 pt-3 md:gap-3 md:px-6 md:pt-6">
       <div className="sky-title flex min-w-0 items-center gap-2.5">
-        <h1 className="flex items-center gap-2">
-          <OrbitGlyph className="size-8 shrink-0 text-fg" />
-          <span className="text-base leading-none tracking-[0.2em] text-muted">{APP_ERA_NAME}</span>
+        <h1 className="flex items-center gap-1.5 md:gap-2">
+          <OrbitGlyph className="size-7 shrink-0 text-fg md:size-8" />
+          <span className="text-sm leading-none tracking-[0.2em] text-muted md:text-base">{APP_ERA_NAME}</span>
         </h1>
-        <span className="eyebrow text-[11px] text-subtle">{versionLabel(__APP_VERSION__)}</span>
+        <span className="eyebrow hidden text-[11px] text-subtle sm:inline">{versionLabel(__APP_VERSION__)}</span>
       </div>
       {/*
         右侧单行：模式徽标 + （沙盘的）模拟历。徽标占的是「区划」的位置，
         绝不下放到底栏——底栏 grid-cols-5 已满，而且底栏是玩具区（暂停/图层）。
       */}
-      <div className="pointer-events-auto flex shrink-0 items-center gap-2">
+      <div className="pointer-events-auto flex shrink-0 items-center gap-1.5 md:gap-2">
         <ModeBadge />
         {trailing}
       </div>
@@ -233,18 +241,24 @@ function Epoch() {
 
 /* ────────────────────────────── 共用：选择器 ────────────────────────────── */
 
-function Chips() {
+function Chips({ compact }: { compact: boolean }) {
   const selectedId = useSim((state) => state.selectedId);
   const select = useSim((state) => state.select);
   const { byId, chips } = useSystem();
   const selected = selectedId ? byId[selectedId] : undefined;
   const rowRef = useRef<HTMLDivElement>(null);
   const [edge, setEdge] = useState({ left: false, right: false });
+  /**
+   * 展开态。窄屏默认收起（一行横滑），宽屏恒为展开（换行成网格）。
+   * **同一个组件两种展开状态**，不是两份实现：t26 那条"差异从运行时条件变成结构上不存在"
+   * 在这里的具体落法是「宽度只决定初始展开状态」，决定完之后两端的 DOM 是同一套。
+   */
+  const [open, setOpen] = useState(false);
+  const expanded = compact ? open : true;
 
   /*
    * 渐隐提示：判据是**真的溢出了没有**，不是"宽度小于某个数"。
-   * 390 宽下 9 颗只露 5.4 颗，右侧必须告诉人还有东西；1280 宽下没溢出，两层遮罩都不出现。
-   * 判据跟实际滚动位置走，所以滑到最右时右箭头自动消失、滑回来左箭头自动出现。
+   * 390 宽收起态下 9 颗只露 5.4 颗，右侧必须告诉人还有东西；展开态换行了就不用提示。
    */
   const measure = useCallback(() => {
     const el = rowRef.current;
@@ -259,20 +273,47 @@ function Chips() {
     if (!el) return;
     measure();
     el.addEventListener("scroll", measure, { passive: true });
-    const ro = new ResizeObserver(measure); // 转屏、窗口拉伸、字体变化都会走到这里
+    const ro = new ResizeObserver(measure); // 转屏、窗口拉伸、字体变化、展开/收起都会走到这里
     ro.observe(el);
     return () => {
       el.removeEventListener("scroll", measure);
       ro.disconnect();
     };
-  }, [measure]);
+  }, [measure, expanded]);
 
   return (
-    <div className="relative">
+    <div className="relative mt-2 md:mt-3">
+      {/*
+        窄屏的收起条：一句「天体 · 当前」加重一个展开键。
+        宽屏没有这条 —— 宽屏的 9 颗本来就一屏放得下，多一行标题只是噪声。
+      */}
+      {compact && (
+        <div className="pointer-events-auto flex items-center justify-between gap-2 px-4 pb-1">
+          <p className="flex min-w-0 items-baseline gap-2 text-xs text-subtle">
+            <span className="tracking-[0.15em] text-muted">天体</span>
+            <span className="truncate text-fg">{selected ? selected.name : "未选择"}</span>
+          </p>
+          <button
+            type="button"
+            className="hud-btn inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-line px-2.5 text-xs text-muted"
+            aria-label="天体列表"
+            aria-expanded={open}
+            onClick={() => setOpen((prev) => !prev)}
+          >
+            {expanded ? "收起" : `全部 ${chips.length}`}
+            <ChevronDown className={`size-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden />
+          </button>
+        </div>
+      )}
+
       <div
         ref={rowRef}
         id="chip-row"
-        className="chip-row pointer-events-auto mt-3 flex gap-2 overflow-x-auto px-4 pb-1 md:px-6"
+        className={
+          expanded
+            ? "chip-row pointer-events-auto flex flex-wrap gap-1.5 px-4 pb-1 md:gap-2 md:px-6"
+            : "chip-row pointer-events-auto flex gap-2 overflow-x-auto px-4 pb-1 md:px-6"
+        }
       >
         {chips.map((body) => {
           const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
@@ -437,11 +478,28 @@ function CloseButton({ className = "" }: { className?: string }) {
 
 /* ── 详情卡的三档高度（窄屏） ── */
 
-type SheetStop = "peek" | "half" | "full";
-const SHEET_STOPS: SheetStop[] = ["peek", "half", "full"];
-const SHEET_MAX: Record<SheetStop, string> = { peek: "28dvh", half: "44dvh", full: "76dvh" };
+type SheetStop = "bar" | "half" | "full";
+const SHEET_STOPS: SheetStop[] = ["bar", "half", "full"];
+/**
+ * 「收起」原来给的是 28dvh（≈236px），收起之后仍然是屏幕下方一大块 —— 那不算收。
+ * 现在它是一根**标题条**：把手 44px + 名称行，约 112px，只剩"这是哪颗星"和关闭键。
+ * 用 rem 而不是 dvh：标题条的高度由内容决定，跟视口无关。
+ */
+const SHEET_MAX: Record<SheetStop, string> = { bar: "7rem", half: "44dvh", full: "76dvh" };
 /** 手柄的读屏文本。视觉上只有一个握把条 —— 握把条不需要翻译，读屏需要一句话。 */
-const SHEET_LABEL: Record<SheetStop, string> = { peek: "收起", half: "半屏", full: "全屏" };
+const SHEET_LABEL: Record<SheetStop, string> = { bar: "收起", half: "半屏", full: "全屏" };
+
+/**
+ * **换档的最小位移**。手指在把手上蹭出来的几像素不算拖拽 —— 那只是点击时的手抖。
+ * 低于这个值：位移一律不跟手，松手当点击处理。
+ */
+const DRAG_COMMIT_PX = 40;
+/**
+ * **不算点击的位移**。超过它就不是点击了：松手后浏览器补的那个 `click` 要被吃掉。
+ * 少了这一条，30px 的横向"蹭"仍然会走 `onClick` → 卡片凭空换一档，
+ * 也就是用户报的"轻轻一动就跳走"（实测第一版：15px 就把半屏收成了标题条）。
+ */
+const TAP_SLOP_PX = 5;
 
 /**
  * 详情卡抽屉的三档高度。
@@ -450,39 +508,42 @@ const SHEET_LABEL: Record<SheetStop, string> = { peek: "收起", half: "半屏",
  * 由此带来一个必须处理的后果：内容装不满时，更大的档位可能渲染出和上一档一样的高度。
  * 390×844 实测：每个天体的卡片内容都是 351 px，而「半屏」上限 44dvh = 371 px ——
  * 如果「全屏」只是把上限提到 76dvh，按下去画面一点不变。**留一个按了没反应的档位，
- * 比少一个档位更糟**，所以「全屏」不只是变高：它把四格事实改成单列（阅读模式），
- * 多出来的空间用来换可读性，而不是换空白。这样三档在任何视口下渲染高度都不同。
+ * 比少一个档位更糟**，所以「全屏」不只是变高：它把四格事实改成单列（阅读模式）。
  *
- * 拖动手感：跟手期间用像素，松手吸附到最近的一档；只点不拖则循环到下一档。
+ * 手势（t53 第 8 条）三档分明：
+ *  - 位移 < `TAP_SLOP_PX`：点击，收起 ⇄ 展开；
+ *  - 位移 ≥ `TAP_SLOP_PX` 但 < `DRAG_COMMIT_PX`：什么都不做（**并吃掉 click**）；
+ *  - 竖向位移 ≥ `DRAG_COMMIT_PX`：跟手，松手换一档。
+ * 横向拖拽不换档：这是一张竖着收放的抽屉，横着蹭没有对应动作。
  */
 function CardHandle({
   stop,
-  onCycle,
+  onTap,
   onDragStart,
   onDragMove,
   onDragEnd,
 }: {
   stop: SheetStop;
-  onCycle: () => void;
-  onDragStart: (clientY: number, height: number) => void;
-  onDragMove: (clientY: number) => void;
+  onTap: () => void;
+  onDragStart: (x: number, y: number, height: number) => void;
+  onDragMove: (x: number, y: number) => void;
   onDragEnd: () => void;
 }) {
   return (
     <button
       type="button"
       aria-label={`详情卡高度：${SHEET_LABEL[stop]}`}
-      aria-expanded={stop !== "peek"}
-      className="hud-btn flex h-11 w-full shrink-0 items-center justify-center rounded-t-xl bg-elevated"
+      aria-expanded={stop !== "bar"}
+      className="hud-btn flex h-11 w-full shrink-0 touch-none items-center justify-center rounded-t-xl bg-elevated"
       onPointerDown={(event) => {
         const article = event.currentTarget.closest("article");
-        onDragStart(event.clientY, article?.getBoundingClientRect().height ?? 0);
+        onDragStart(event.clientX, event.clientY, article?.getBoundingClientRect().height ?? 0);
         event.currentTarget.setPointerCapture(event.pointerId);
       }}
-      onPointerMove={(event) => onDragMove(event.clientY)}
+      onPointerMove={(event) => onDragMove(event.clientX, event.clientY)}
       onPointerUp={onDragEnd}
       onPointerCancel={onDragEnd}
-      onClick={onCycle}
+      onClick={onTap}
     >
       <span className="h-1 w-10 rounded-full bg-line" aria-hidden />
     </button>
@@ -496,15 +557,23 @@ function SandboxCard({ compact }: { compact: boolean }) {
   const selected = selectedId ? byId[selectedId] : undefined;
   const [stop, setStop] = useState<SheetStop>("half");
   const [dragPx, setDragPx] = useState<number | null>(null);
-  const drag = useRef<{ y0: number; h0: number; moved: boolean } | null>(null);
-  /**
-   * 拖完松手时浏览器还会补一个 click。不挡掉的话"拖动吸附"和"点击循环"会连着触发两次，
+  const drag = useRef<{ x0: number; y0: number; h0: number; active: boolean } | null>(null);  /**
+   * 拖完松手时浏览器还会补一个 click。不挡掉的话"拖动换档"和"点击切换"会连着触发两次，
    * 手感是"松手后又自己跳了一档"。所以拖过就吃掉紧随其后的那一次 click。
    */
   const skipClick = useRef(false);
 
-  const renderedH = (s: SheetStop) =>
-    (parseFloat(SHEET_MAX[s]) / 100) * (typeof window !== "undefined" ? window.innerHeight : 800);
+  /** 档位上限换算成像素：rem 按根字号，dvh 按视口高。 */
+  const capPx = (s: SheetStop) => {
+    const raw = SHEET_MAX[s];
+    const n = parseFloat(raw);
+    if (raw.endsWith("rem")) {
+      const root = typeof window !== "undefined" ? parseFloat(getComputedStyle(document.documentElement).fontSize) : 16;
+      return n * root;
+    }
+    const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+    return (n / 100) * vh;
+  };
 
   if (!selected) return null;
   return (
@@ -515,43 +584,45 @@ function SandboxCard({ compact }: { compact: boolean }) {
         compact ? (
           <CardHandle
             stop={stop}
-            onCycle={() => {
+            onTap={() => {
               if (skipClick.current) {
                 skipClick.current = false;
                 return;
               }
               drag.current = null;
               setDragPx(null);
-              setStop((prev) => SHEET_STOPS[(SHEET_STOPS.indexOf(prev) + 1) % SHEET_STOPS.length]!);
+              // 点击只做一件事：收起 ⇄ 展开。不是"循环三档"——
+              // 轻点一下把卡片从半屏跳到全屏，是用户没要求的位移。
+              setStop((prev) => (prev === "bar" ? "half" : "bar"));
             }}
-            onDragStart={(clientY, height) => {
+            onDragStart={(x, y, height) => {
               skipClick.current = false;
-              drag.current = { y0: clientY, h0: height, moved: false };
+              drag.current = { x0: x, y0: y, h0: height, active: false };
             }}
-            onDragMove={(clientY) => {
+            onDragMove={(x, y) => {
               const d = drag.current;
               if (!d) return;
-              const dy = d.y0 - clientY; // 往上拖 = 变高
-              if (Math.abs(dy) > 4) d.moved = true;
-              if (d.moved) setDragPx(Math.min(Math.max(d.h0 + dy, 120), window.innerHeight * 0.9));
+              const dy = d.y0 - y; // 往上拖 = 变高
+              // 只要离开"点击"的容差，这一次手势就不该在松手后变成 click
+              if (Math.abs(dy) >= TAP_SLOP_PX || Math.abs(x - d.x0) >= TAP_SLOP_PX) skipClick.current = true;
+              if (!d.active) {
+                // 死区：竖向没到 DRAG_COMMIT_PX 就一动不动。横向怎么蹭都不换档（这是一张竖抽屉）。
+                if (Math.abs(dy) < DRAG_COMMIT_PX) return;
+                d.active = true;
+              }
+              setDragPx(Math.min(Math.max(d.h0 + dy, capPx("bar")), window.innerHeight * 0.9));
             }}
             onDragEnd={() => {
               const d = drag.current;
               drag.current = null;
               if (!d) return;
-              if (!d.moved) return; // 没拖动 = 交给 onClick 循环
-              skipClick.current = true;
+              if (!d.active) return; // 没越过死区：什么都不做（click 已被吃掉）
               const height = dragPx ?? d.h0;
-              let best: SheetStop = stop;
-              let bestDist = Infinity;
-              for (const candidate of SHEET_STOPS) {
-                const dist = Math.abs(renderedH(candidate) - height);
-                if (dist < bestDist) {
-                  bestDist = dist;
-                  best = candidate;
-                }
-              }
-              setStop(best);
+              const index = SHEET_STOPS.indexOf(stop);
+              // 只走一档：往上拖就高一档，往下拖就低一档，撞到端点就停
+              const direction = height > capPx(stop) ? 1 : -1;
+              const next = SHEET_STOPS[Math.min(SHEET_STOPS.length - 1, Math.max(0, index + direction))]!;
+              setStop(next);
               setDragPx(null);
             }}
           />
@@ -703,6 +774,11 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
   /** 用户改过输入框之前，字段跟着时钟走；改过之后就不许再被覆盖（否则打到一半的字被抹掉）。 */
   const [edited, setEdited] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
+  /**
+   * 触发键自己也要算"里面"。否则：pointerdown 落在时计键上 → 外面的监听先把它关掉 →
+   * 紧接着的 click 又把它打开 —— 表现为"再点一次关不掉"。同一类 bug 见 Dock 的图层浮层。
+   */
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // 面板开着、用户还没动手时，把「当前」同步进输入框：仪表上的数字该是活的钟，不是快照。
   useEffect(() => {
@@ -721,7 +797,10 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
     if (!open) return;
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
-      if (panelRef.current && !panelRef.current.contains(target)) setOpen(false);
+      if (panelRef.current?.contains(target)) return;
+      // 触发键不算"外面"：它自己会 toggle，两边都动就会互相抵消
+      if (triggerRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.code === "Escape") setOpen(false);
@@ -754,6 +833,7 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
   return (
     <>
       <button
+        ref={triggerRef}
         type="button"
         className={`hud-btn inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-md border ${
           open ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
@@ -868,6 +948,14 @@ function Dock({ compact }: { compact: boolean }) {
   const switching = useSim((state) => state.switching);
   const [layerOpen, setLayerOpen] = useState(false);
   const sheetRef = useRef<HTMLDivElement>(null);
+  /**
+   * 「图层」键自己也算"里面"。
+   *
+   * 第 10 条 bug 的根因就在这里：外面的监听在 **pointerdown** 关浮层，
+   * 而触发键的 **click** 稍后才把 `layerOpen` 翻成 true —— 一次点击里一关一开，
+   * 净效果是"再点一次关不掉"。让触发键走"外面"的判定外面去，它自己负责 toggle。
+   */
+  const layerBtnRef = useRef<HTMLButtonElement>(null);
 
   // 宽度跨过 640px 时直接收起浮层：3 键布局不在了，浮层没有锚点
   useEffect(() => {
@@ -879,7 +967,9 @@ function Dock({ compact }: { compact: boolean }) {
     if (!layerOpen) return;
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
-      if (sheetRef.current && !sheetRef.current.contains(target)) setLayerOpen(false);
+      if (sheetRef.current?.contains(target)) return;
+      if (layerBtnRef.current?.contains(target)) return;
+      setLayerOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.code === "Escape") setLayerOpen(false);
@@ -945,6 +1035,7 @@ function Dock({ compact }: { compact: boolean }) {
           <div className="mt-1 grid grid-cols-3 gap-1.5">
             <PauseKey paused={paused} onToggle={togglePaused} />
             <button
+              ref={layerBtnRef}
               type="button"
               className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
                 layerOpen ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
