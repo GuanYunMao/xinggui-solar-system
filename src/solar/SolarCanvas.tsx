@@ -630,6 +630,12 @@ function Simulation({ ready = true }: { ready?: boolean }) {
     const t = useSim.getState().simSeconds;
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
+      /*
+       * 轨道角（正圆参数化）。**这个角也是潮汐锁定时自转的唯一出处**（见下面 spins 段）：
+       * 锁定不是"周期相等"，是"自转角由轨道角派生"。两条独立时钟即使周期相同，
+       * 方向 / 相位一错，近地面就会漂 —— 月球那条用户报的 bug 就是这么来的（t51）。
+       */
+      const orbitAngle = body.elements ? null : (t / body.period) * Math.PI * 2 + body.phase;
       if (group && body.orbitRadius > 0) {
         if (body.elements) {
           /*
@@ -641,7 +647,7 @@ function Simulation({ ready = true }: { ready?: boolean }) {
           const p = positionFromElements(body.elements, daysOf(t) * 86400);
           group.position.set(p.x, p.y, p.z);
         } else {
-          const angle = (t / body.period) * Math.PI * 2 + body.phase;
+          const angle = orbitAngle!;
           const lx = Math.cos(angle) * body.orbitRadius;
           const lz = Math.sin(angle) * body.orbitRadius;
           /*
@@ -656,8 +662,26 @@ function Simulation({ ready = true }: { ready?: boolean }) {
       if (!look.spins) continue;
       const spin = reg.spins.get(body.id);
       if (spin) {
-        const rate = body.locked ? (Math.PI * 2) / body.period : body.spin;
-        spin.rotation.y = t * rate;
+        if (body.locked && orbitAngle !== null) {
+          /*
+           * 潮汐锁定：自转角**由轨道角派生**（t51 修）。数据没错（六颗卫星都是
+           * `locked: true`、`spin: 0`，速率本来就取 2π/period），错的是**耦合**：
+           *
+           *  - 位置用 (cos a, sin a) 参数化，等价于绕 +Y 的 **−a** 旋转；
+           *  - 旧写法 `t·2π/period` 是 **+a**。
+           * 两者方向相反 ⇒ 相对角速度 = 2×(2π/period)：月球每公转一圈，正脸相对地球
+           * 转两圈 —— 用户看到的「月球和地球的相对转动有问题」。
+           *
+           * `π − a` 的两件事：
+           *  - 负号 = 自转跟着轨道走（锁定）；
+           *  - +π = 把朝向地球的那一面从 local −X（u=0 的接缝）换成 local +X
+           *    （u=0.5 = moon.jpg 的圆心 = 熟悉的月海正面）。没有这一项也"锁定"，
+           *    但近地面会是贴图的接缝，看起来像一道错位的竖条。
+           */
+          spin.rotation.y = Math.PI - orbitAngle;
+        } else {
+          spin.rotation.y = t * body.spin;
+        }
       }
       const clouds = reg.clouds.get(body.id);
       if (clouds) clouds.rotation.y = t * body.spin * 1.35;
