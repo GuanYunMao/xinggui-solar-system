@@ -2024,6 +2024,39 @@ function nearestBodyRadius(reg: Registry, bodies: readonly Body[], target: THREE
 }
 
 /**
+ * 这一下 wheel 是不是该留给 DOM？（批判位 t43 的 F1，本轮 t47）
+ *
+ * 背景：滚轮监听挂在 window 上之后，指针停在 HUD 上也会缩放 —— 这是要的（芯片行/抬头/
+ * 底栏都不是可滚容器）；但详情卡正文是 `overflow-y-auto`，指针在那里滚轮必须留给它。
+ *
+ * **判据只有一条**：从事件目标往上找，有没有一个**竖直方向真的还能滚**的祖先 ——
+ *  `overflow-y` 是 auto/scroll/overlay、`scrollHeight > clientHeight`、且**这个方向还有余量**
+ *  （往下滚时还没到底、往上滚时还没到顶）。
+ * 为什么不写选择器清单：HUD 一改结构清单就静默失效，而"这份 pass 采不到的状态"正是 F1
+ * 逃过 22 条 pass 的原因。scrollHeight/clientHeight 是浏览器自己算的，结构怎么变都成立。
+ *
+ * 余量判断是必要的：只剩 1px 可滚的容器（比如卡片刚好差一行）不该把一路滚轮全吃掉。
+ * 滚动链条照浏览器的规矩走：内层到顶/到底之后交给外层，外层也不能滚才轮到场景缩放。
+ */
+function wheelWantsScroll(ev: WheelEvent): boolean {
+  const dy = ev.deltaY;
+  if (!Number.isFinite(dy) || dy === 0) return false;
+  const target = ev.target;
+  let node: Element | null = target instanceof Element ? target : null;
+  while (node) {
+    const style = getComputedStyle(node);
+    const canScrollY = style.overflowY === "auto" || style.overflowY === "scroll" || style.overflowY === "overlay";
+    if (canScrollY && node.scrollHeight > node.clientHeight + 1) {
+      const room = node.scrollHeight - node.clientHeight;
+      if (dy > 0 && node.scrollTop < room - 1) return true;
+      if (dy < 0 && node.scrollTop > 1) return true;
+    }
+    node = node.parentElement;
+  }
+  return false;
+}
+
+/**
  * 沙盘相机：OrbitControls 那一套（首次摆位、聚焦动画、跟随天体、总览回位、竖屏视野）。
  *
  * 只在沙盘系统挂载 —— 切进米制时它整个卸载（见 Scene 里的三元）。这是 R2 拆分的核心：
@@ -2107,14 +2140,26 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
 
     /*
      * wheel：只记目标视距与指针位置，不碰相机（相机在帧里跟随）。
-     * `passive` 是安全的：OrbitControls 的 enableZoom 已经是 false，它的 wheel 监听在
-     * `scope.enableZoom === false` 处直接 return，不会 preventDefault，也不会和这里抢；
-     * 页面本身不滚动（body overflow hidden）。
+     *
+     * **监听挂在 window，不是 canvas**（批判位 t43 的 F1，本轮 t47 修；根因就在这条边界）：
+     * 挂 canvas 时，指针停在 HUD 芯片上滚轮一格都不会动 —— 事件的目标是芯片，根本到不了
+     * canvas 的监听（实测：点完 #chip-earth 指针还停在芯片上，连滚 4 格 distTarget 恒 4.80000）。
+     * 而"点完星、手还停在芯片上就开始滚"正是用户最常做的事。
+     *
+     * 挂 window 之后要回答一个新问题：**这一下滚轮是不是该留给 DOM？** 判据只有一条 ——
+     * 从事件目标往上找，有没有一个**竖直方向真的还能滚**的祖先（见 wheelWantsScroll）。
+     * 不用选择器清单：HUD 一改结构清单就失效，而"采不到的状态"正是这条 F1 逃过 22 条 pass 的原因。
+     *
+     * `passive` 仍然安全：OrbitControls 的 enableZoom 是 false，它的 wheel 监听在
+     * `scope.enableZoom === false` 处直接 return，不会 preventDefault；我们也不 preventDefault，
+     * 所以要留给 DOM 的滚动（详情卡正文）浏览器照常处理。
      */
     const onWheel = (ev: WheelEvent) => {
       const controls = controlsRef.current;
       // t34：输入锁看 camLocked（OrbitControls 已停用，不能再借它的 enabled）
       if (!controls || camLocked.current || useSim.getState().switching !== null) return;
+      // t47：指针在"真的能滚"的容器上时，这一下滚轮归它（详情卡正文、列表…）
+      if (wheelWantsScroll(ev)) return;
       const now = performance.now();
       const gap = now - zoomLastWheelAt.current;
       zoomLastWheelAt.current = now;
@@ -2130,7 +2175,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
         zoomPointer.current.active = true;
       }
     };
-    el.addEventListener("wheel", onWheel, { passive: true });
+    window.addEventListener("wheel", onWheel, { passive: true });
 
     /*
      * 双指捏合（手机）：enableZoom=false 把 OrbitControls 的 pinch 也一起关了，
@@ -2187,7 +2232,7 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     window.addEventListener("pointerup", onPinchEnd);
     window.addEventListener("pointercancel", onPinchEnd);
     return () => {
-      el.removeEventListener("wheel", onWheel);
+      window.removeEventListener("wheel", onWheel);
       el.removeEventListener("pointerdown", onPinchDown);
       window.removeEventListener("pointermove", onPinchMove);
       window.removeEventListener("pointerup", onPinchEnd);
@@ -2531,7 +2576,13 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
      *  2) 当前视距按一阶跟随 exp 曲线追 ref：step = (ref − logD)·(1 − e^(−dt/τ))；
      *  3) step 只在**朝目标飞近**（step < 0）时乘渐进阻力 —— 贴脸往外恒 1（t40 修的方向不对称）；
      *  4) 沿"相机→target"的视轴推相机，**target 一个字节都不动**（t34 的唯一主人语义）。
-     * 位置必须写在 drei 的 controls.update()（优先级 -1）之前 —— 本回调是 -2。
+     *
+     * 回调优先级是 -2，但**这里已经没有"必须先于 controls.update() 写"这条约束了**（F2 的账）：
+     * drei 的 `<OrbitControls>` 每帧只有一行 `if (controls.enabled) controls.update()`
+     * （node_modules/@react-three/drei/core/OrbitControls.js:29-30），而 t34 起
+     * `enabled` 常驻 false —— 那句 update 恒不执行，它现在只是 target 的**存储**。
+     * -2 现在只影响两件真存在的事：① 排在 r3f 渲染之前（一帧里算完再画）；
+     * ② 排在 `<CamTrace>`（-1）之前 —— trace 量到的是当帧最终机位（见那边的注释）。
      *
      * 保留 t47 的三个语义：
      *  - 硬底线 hardMin = max(1.15, 最近天体半径×1.2)：滚到底也钻不进太阳里（1.2×3.8 = 4.56），
