@@ -9,6 +9,7 @@
  */
 
 import type { Body } from "./data";
+import { MOON_MU, MU_SUN, periodDays, type OrbitalElements } from "./kepler";
 
 /**
  * 一个系统的**观感 / 行为声明**（R3）。
@@ -63,16 +64,85 @@ export type SystemSpec = {
 export type { Body };
 
 /**
- * 最小验证原型：太阳 / 地球 / 月球，全部真实数值、单位是米。
- * 数据来源：NASA Fact Sheet（太阳半径 695,700 km、地球 6,371 km、月球 1,737.4 km）。
- * 轨道用圆轨道近似 —— 原型只验证相机与深度精度，不验证开普勒解。
+ * 最小验证原型：太阳 / 地球 / 月球 + 冥王星 / 哈雷两个样本，全部真实数值、单位是米。
+ *
+ * t14 起**实境用六根数 + 开普勒解**（沙盘不动，仍然是正圆示意图）。
+ * 数据来源：
+ *  - 太阳/地球/月球半径：NASA Fact Sheet；
+ *  - 地球/月球根数：J2000 标准平均根数；
+ *  - 冥王星/哈雷：JPL Small-Body Database（SBDB）的 osculating elements，
+ *    用返回的 `n` 换算到 J2000（`M0 = M_epoch + n·(JD2000 − JD_epoch)`）。
+ *    任务书里的旧值（冥王星 39.48/0.249/17.16、哈雷 17.8/0.967/162.3）与 JPL 现值
+ *    差 0.3% 量级，这里一律用 JPL（源）并在 t14 报告里留记录。
+ *
+ * **周期不在数据里手写**：`period` 由 `periodDays(elements)` 现算（开普勒第三定律，
+ * 全局系数 μ_sun / μ_earth 在 kepler.ts），卡片里的"公转"也由同一个数格式化，
+ * 保证"卡片 = 模型"且模型只认 `a`。
+ */
+const AU = 1.496e11;
+const deg = (d: number) => (d * Math.PI) / 180;
+
+const elements = (
+  a: number,
+  e: number,
+  i: number,
+  om: number,
+  w: number,
+  M0: number,
+  mu: number,
+): OrbitalElements => ({ a, e, i: deg(i), om: deg(om), w: deg(w), M0: deg(M0), mu });
+
+/** 地球（日心、黄道 J2000）。 */
+const EARTH_ELEMENTS = elements(
+  1.00000011 * AU,
+  0.0167086,
+  0.00005,
+  -11.26064,
+  114.20783,
+  357.52911,
+  MU_SUN,
+);
+/** 月球（地心、黄道 J2000；a = 384,399 km）。 */
+const MOON_ELEMENTS = elements(3.84399e8, 0.0549, 5.145, 125.08, 318.15, 134.963, MOON_MU);
+/** 冥王星（JPL SBDB，换算到 J2000）。 */
+const PLUTO_ELEMENTS = elements(
+  39.58862938517124 * AU,
+  0.2518378778576892,
+  17.14771140999114,
+  110.2923840543057,
+  113.7090015158565,
+  14.7741,
+  MU_SUN,
+);
+/** 哈雷（JPL SBDB，换算到 J2000；i = 162° → 逆行）。 */
+const HALLEY_ELEMENTS = elements(
+  17.92863504856923 * AU,
+  0.9679359956953211,
+  162.1905300439129,
+  59.09894720612437,
+  112.2414314637764,
+  65.9012,
+  MU_SUN,
+);
+
+/** 卡片里的"公转"：从模型周期直接格式化（t14 口径 A：卡片描述的是玩家看的这台模型）。 */
+function periodFact(el: OrbitalElements): { label: string; value: string } {
+  const d = periodDays(el);
+  return d >= 365.25 * 2
+    ? { label: "公转", value: `${(d / 365.25).toFixed(1)} 年` }
+    : { label: "公转", value: `${d.toFixed(2)} 日` };
+}
+
+/**
+ * 三体原型（`?proto=1` 的测量夹具 + 产品实境的地月部分）。
+ * 位置不再用圆轨道：六根数 → 开普勒解（见 SolarCanvas 的 Simulation）。
  */
 export const REAL_PROTO_BODIES: Body[] = [
   {
     id: "sun",
     name: "太阳",
     kind: "恒星 · G2V",
-    blurb: "真实单位原型，仅用于验证相机与深度精度。",
+    blurb: "太阳系的中心恒星。实境里它是坐标原点，所有日心轨道都绕它解。",
     radius: 6.957e8,
     orbitRadius: 0,
     period: 1,
@@ -83,36 +153,45 @@ export const REAL_PROTO_BODIES: Body[] = [
     focus: 6.957e9,
     swatch: "#f0c27a",
     texture: "sun",
-    facts: [{ label: "半径", value: "695,700 km" }],
+    facts: [
+      { label: "半径", value: "695,700 km" },
+      { label: "质量占比", value: "99.86%" },
+    ],
   },
   {
     id: "earth",
     name: "地球",
     kind: "类地行星",
-    blurb: "真实单位原型。1 AU = 1.496e11 m。",
+    blurb: "日心轨道用 J2000 六根数，周期由开普勒第三定律从 a 导出。",
     radius: 6.371e6,
-    orbitRadius: 1.496e11,
-    period: 18,
+    orbitRadius: EARTH_ELEMENTS.a,
+    period: periodDays(EARTH_ELEMENTS),
     phase: 0,
-    inclination: 0,
+    inclination: EARTH_ELEMENTS.i,
     obliquity: 0.408,
     spin: 0.95,
     parent: "sun",
     focus: 3e7,
     swatch: "#6aa2d8",
     texture: "earth",
-    facts: [{ label: "轨道", value: "1.496e11 m" }],
+    elements: EARTH_ELEMENTS,
+    facts: [
+      periodFact(EARTH_ELEMENTS),
+      { label: "轨道", value: "1.0000 AU" },
+      { label: "偏心率", value: "0.0167" },
+      { label: "直径", value: "12,742 km" },
+    ],
   },
   {
     id: "moon",
     name: "月球",
     kind: "天然卫星",
-    blurb: "真实单位原型。地月距离 3.844e8 m。",
+    blurb: "地心轨道用 J2000 六根数（a = 384,399 km），周期同样由 a 导出。",
     radius: 1.7374e6,
-    orbitRadius: 3.844e8,
-    period: 2.55,
-    phase: 0.6,
-    inclination: 0.089,
+    orbitRadius: MOON_ELEMENTS.a,
+    period: periodDays(MOON_ELEMENTS),
+    phase: 0,
+    inclination: MOON_ELEMENTS.i,
     obliquity: 0.117,
     spin: 0,
     locked: true,
@@ -120,7 +199,78 @@ export const REAL_PROTO_BODIES: Body[] = [
     focus: 1e7,
     swatch: "#c5c1b8",
     texture: "moon",
-    facts: [{ label: "地月距离", value: "3.844e5 km" }],
+    elements: MOON_ELEMENTS,
+    facts: [
+      periodFact(MOON_ELEMENTS),
+      { label: "地月距离", value: "384,399 km" },
+      { label: "倾角", value: "5.15°" },
+      { label: "直径", value: "3,474 km" },
+    ],
+  },
+];
+
+/**
+ * 产品实境（t14）：地月 + 冥王星 / 哈雷两个样本。
+ *
+ * 为什么和 `REAL_PROTO` 分两个 spec：
+ *  - `?proto=1` 是**抖动测量夹具**，它的断言数"3 个天体"；产品实境多了两个样本，
+ *    夹具不该跟着变（那会把测量夹具的契约推到另一条任务上）；
+ *  - 夹具的 `look.orbitLines` 必须是 false（几何体在米制下的量级问题，见 REAL_PROTO 注释），
+ *    而实境要真轨道线。
+ * 两份 spec 共用 `REAL_PROTO_BODIES` 的三体数据，只多两条样本 + 一个开关。
+ */
+export const REAL_SYSTEM_BODIES: Body[] = [
+  ...REAL_PROTO_BODIES,
+  {
+    id: "pluto",
+    name: "冥王星",
+    kind: "矮行星 · 柯伊伯带",
+    blurb: "实境样本：倾角 17.15°、偏心率 0.252，轨道明显穿出黄道面。",
+    radius: 1.1883e6,
+    orbitRadius: PLUTO_ELEMENTS.a,
+    period: periodDays(PLUTO_ELEMENTS),
+    phase: 0,
+    inclination: PLUTO_ELEMENTS.i,
+    obliquity: deg(122.5),
+    spin: 0.03,
+    parent: "sun",
+    focus: 1.5e9,
+    swatch: "#c8b6a2",
+    texture: "pluto",
+    elements: PLUTO_ELEMENTS,
+    facts: [
+      periodFact(PLUTO_ELEMENTS),
+      { label: "半长轴", value: "39.59 AU" },
+      { label: "偏心率", value: "0.2518" },
+      { label: "倾角", value: "17.15°" },
+      { label: "直径", value: "2,376.6 km" },
+    ],
+  },
+  {
+    id: "halley",
+    name: "哈雷彗星",
+    kind: "周期彗星 · 逆行",
+    blurb: "实境样本：e=0.968、i=162°（逆行），近日点 0.575 AU。彗核只有 5.5 km，盘面上靠标记点定位。",
+    radius: 5.5e3,
+    orbitRadius: HALLEY_ELEMENTS.a,
+    period: periodDays(HALLEY_ELEMENTS),
+    phase: 0,
+    inclination: HALLEY_ELEMENTS.i,
+    obliquity: 0,
+    spin: 0.2,
+    parent: "sun",
+    focus: 5e8,
+    swatch: "#a8c0d8",
+    texture: "halley",
+    elements: HALLEY_ELEMENTS,
+    /* 彗核在实境的任何视距下都是亚像素：这里是一个**UI 注记点**，不是天体本体。 */
+    marker: { size: 6, color: "#e8f2ff" },
+    facts: [
+      periodFact(HALLEY_ELEMENTS),
+      { label: "近日点", value: "0.575 AU" },
+      { label: "倾角", value: "162.19°（逆行）" },
+      { label: "彗核", value: "约 5.5 km" },
+    ],
   },
 ];
 
@@ -151,6 +301,21 @@ export const REAL_PROTO: SystemSpec = {
     camera: "meter",
   },
   bodies: REAL_PROTO_BODIES,
+};
+
+/**
+ * 产品实境（t14）：地月 + 冥王星 / 哈雷两个样本，轨道线打开。
+ *
+ * look 与 REAL_PROTO 只差 `orbitLines`：样本的看点就是轨道本身（冥王星穿黄道面、
+ * 哈雷逆行），所以实境必须有轨道线；夹具（REAL_PROTO）保持关闭，避免影响既有的
+ * proto-real / proto-jitter 测量契约。
+ */
+export const REAL_SYSTEM: SystemSpec = {
+  id: "real",
+  name: "实境",
+  unit: "meter",
+  look: { ...REAL_PROTO.look, orbitLines: true },
+  bodies: REAL_SYSTEM_BODIES,
 };
 
 /**

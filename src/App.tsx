@@ -6,7 +6,7 @@ import { markVisited } from "./solar/progress";
 import { APP_FULL_NAME } from "./solar/brand";
 import { useSim } from "./solar/store";
 import { SystemProvider } from "./solar/system-context";
-import { REAL_PROTO } from "./solar/systems";
+import { REAL_PROTO, REAL_SYSTEM } from "./solar/systems";
 
 /**
  * 壳层组件：与 Grok 原工程的 `src/routes/index.tsx` 逐行对应，
@@ -47,7 +47,19 @@ export function App() {
    */
   const mode = useSim((state) => state.mode);
   const inReal = mode === "real";
-  const system = PROTO || inReal ? REAL_PROTO : undefined;
+  /*
+   * t14：产品实境用 `REAL_SYSTEM`（地月 + 冥王星/哈雷，轨道线打开）；
+   * `?proto=1` 仍然指向三体测量夹具 `REAL_PROTO` —— 它和产品实境是两份 spec，
+   * 因为夹具的断言数"3 个天体"、且它必须关掉 orbitLines（见 systems.ts 的注释）。
+   *
+   * `?diag=1&system=real` 是**只在诊断下**的取景口：截图/验收要拍实境样本时，
+   * 不必先走一遍解锁门槛。产品路径不读它（`DIAG` 为假时恒为 false）。
+   */
+  const DIAG_SYSTEM_REAL =
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).has("diag") &&
+    new URLSearchParams(window.location.search).get("system") === "real";
+  const system = PROTO ? REAL_PROTO : inReal || DIAG_SYSTEM_REAL ? REAL_SYSTEM : undefined;
 
   useEffect(() => {
     setReady(true);

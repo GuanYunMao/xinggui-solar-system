@@ -5,7 +5,8 @@ import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { simTimeNow } from "./clock";
 import { isMoon, type Body } from "./data";
-import { useSim } from "./store";
+import { daysOf, useSim } from "./store";
+import { eccentricAnomaly, orbitPoints, periodDays, positionFromElements } from "./kepler";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, focalPx, halfSpanAt, projectCandidates, resolvePick, type PickBody } from "./pick";
 import { farFloorFor, frameEarthMoon, tightenClipPlanes, type VisibleBody } from "./systems";
@@ -109,11 +110,18 @@ const LEGACY_SHADER =
  *
  * 抖动测量不用这个默认值，用 ?dist=1.2e7（圆盘左右缘刚好还在画面内，f/视距 最大）。
  */
-const PROTO_DIST = (() => {
-  const raw = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dist");
+const PROTO_DIST = (() => {  const raw = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("dist");
   const n = raw ? Number(raw) : NaN;
   return Number.isFinite(n) && n > 0 ? n : 2.5e7;
 })();
+
+/**
+ * t14：实境样本的 diag 取景（`?diag=1&view=pluto|halley`）。
+ * **只在 `?diag=1` 下读**；产品路径不认这个参数。取景放在黄道面附近，
+ * 让地球轨道线（=黄道参照）与样本轨道线同框 —— 这是"看得见穿黄道面"的唯一办法，
+ * 因为产品实境相机只框地月（见 systems.frameEarthMoon）。
+ */
+const DIAG_VIEW = DIAG ? new URLSearchParams(window.location.search).get("view") : null;
 
 /** ?still=1：相机完全钉死。用来量"测量本身的噪声底"，不参与正常断言。 */
 const STILL =
@@ -524,10 +532,21 @@ function Simulation({ ready = true }: { ready?: boolean }) {
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
       if (group && body.orbitRadius > 0) {
-        const angle = (t / body.period) * Math.PI * 2 + body.phase;
-        const lx = Math.cos(angle) * body.orbitRadius;
-        const lz = Math.sin(angle) * body.orbitRadius;
-        group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+        if (body.elements) {
+          /*
+           * 实境（t14）：六根数 → 开普勒解。
+           * 时间轴：`simSeconds = 0` ↔ J2000.0；`daysOf` 是 store 里唯一的"模拟秒 → 天"
+           * 换算，这里乘 86400 变秒。实境 `freezesTime: true`，所以位置是"进入那一刻"的
+           * 真实历元位置（不是动画）。
+           */
+          const p = positionFromElements(body.elements, daysOf(t) * 86400);
+          group.position.set(p.x, p.y, p.z);
+        } else {
+          const angle = (t / body.period) * Math.PI * 2 + body.phase;
+          const lx = Math.cos(angle) * body.orbitRadius;
+          const lz = Math.sin(angle) * body.orbitRadius;
+          group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+        }
       }
       if (!look.spins) continue;
       const spin = reg.spins.get(body.id);
@@ -561,16 +580,29 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
    * 代价：每帧重写 181 个顶点的 alpha（约 700 个 float），比 setDrawRange 贵一点点，
    * 但不需要新 shader program（t41 量过一个 program 首编译 20–40ms）。
    */
-  const RING_SEGMENTS = 180;
+  const RING_SEGMENTS = body.elements ? 360 : 180;
   const line = useMemo(() => {
     const pts: number[] = [];
     const cols: number[] = [];
-    for (let i = 0; i <= RING_SEGMENTS; i++) {
-      const angle = (i / RING_SEGMENTS) * Math.PI * 2;
-      const lx = Math.cos(angle) * body.orbitRadius;
-      const lz = Math.sin(angle) * body.orbitRadius;
-      pts.push(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
-      cols.push(1, 1, 1, 1);
+    if (body.elements) {
+      /*
+       * 实境（t14）：真椭圆 + 倾角 + Ω/ω。采样由 `kepler.orbitPoints` 给，
+       * 按**偏近点角 E** 等分（不是按平近点角）—— 等 ΔE 的点间距变化最小，
+       * 近日点附近不会挤成一坨。360 段：冥王星 39 AU 的椭圆在广角下也不显折线。
+       */
+      const raw = orbitPoints(body.elements, RING_SEGMENTS);
+      for (let i = 0; i <= RING_SEGMENTS; i++) {
+        pts.push(raw[i * 3]!, raw[i * 3 + 1]!, raw[i * 3 + 2]!);
+        cols.push(1, 1, 1, 1);
+      }
+    } else {
+      for (let i = 0; i <= RING_SEGMENTS; i++) {
+        const angle = (i / RING_SEGMENTS) * Math.PI * 2;
+        const lx = Math.cos(angle) * body.orbitRadius;
+        const lz = Math.sin(angle) * body.orbitRadius;
+        pts.push(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
+        cols.push(1, 1, 1, 1);
+      }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
@@ -592,16 +624,22 @@ function OrbitPath({ body, selected }: { body: Body; selected: boolean }) {
   }, [body, selected]);
   // 淡出带（参数单位 = 角度/2π）：从 1.1 倍半径（贴面）到 1.6 倍半径（全亮）。
   // 带子必须窄：t51 的硬缺口看起来是"断线"，但带宽 2.2 倍半径又会让人以为线在半空中消失了。
-  const fadeOuter = useMemo(
-    () => Math.max(0.006, (body.radius * 1.6) / (body.orbitRadius * Math.PI * 2)),
-    [body.radius, body.orbitRadius],
-  );
+  const fadeOuter = useMemo(() => {
+    if (body.elements) {
+      // 椭圆用近日点距离做局部尺度：那里曲率最大、淡出带要最窄
+      const peri = body.elements.a * (1 - body.elements.e);
+      return Math.max(0.006, (body.radius * 1.6) / (peri * Math.PI * 2));
+    }
+    return Math.max(0.006, (body.radius * 1.6) / (body.orbitRadius * Math.PI * 2));
+  }, [body]);
   const fadeInner = fadeOuter * 0.69; // ≈ 1.1 倍半径处
   useFrame(() => {
     const attr = line.geometry.getAttribute("color") as THREE.BufferAttribute;
     const arr = attr.array as Float32Array;
-    // 天体在环上的参数位置：与 Simulation 的相位公式同源（angle = t/period·2π + phase）
-    const tParam = (((simTimeNow() / body.period + body.phase / (Math.PI * 2)) % 1) + 1) % 1;
+    // 天体在环上的参数位置：与采样同源（有根数时按 E/(2π)，否则按平近点角参数）
+    const tParam = body.elements
+      ? (((eccentricAnomaly(body.elements, daysOf(simTimeNow()) * 86400) / (Math.PI * 2)) % 1) + 1) % 1
+      : (((simTimeNow() / body.period + body.phase / (Math.PI * 2)) % 1) + 1) % 1;
     let changed = false;
     for (let i = 0; i <= RING_SEGMENTS; i++) {
       const p = i / RING_SEGMENTS;
@@ -1016,6 +1054,36 @@ function PlanetSurface({ body }: { body: Body }) {
  * 界面语汇（标签/卡片/芯片），不该用几何体。
  */
 
+/**
+ * UI 注记点（t14）。
+ *
+ * 哈雷彗核半径 5.5 km：在 0.6–35 AU 的实境视野里，任何物理尺寸的球都是亚像素。
+ * 这**不是天体本体**，是星图软件标注暗天体的那种点：
+ *  - `sizeAttenuation: false`：固定屏幕像素（6px），不随视距缩放；
+ *  - `depthTest: false`：被前景挡住也要看得见（它是注记，不是物体）；
+ *  - 一个顶点的 Points，无贴图、无新 shader。
+ */
+function NucleusMarker({ size, color }: { size: number; color: string }) {
+  const geo = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0], 3));
+    return g;
+  }, []);
+  const mat = useMemo(
+    () =>
+      new THREE.PointsMaterial({
+        color,
+        size,
+        sizeAttenuation: false,
+        transparent: true,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    [size, color],
+  );
+  return <points geometry={geo} material={mat} frustumCulled={false} />;
+}
+
 function BodyNode({
   body,
   showOrbits,
@@ -1053,6 +1121,11 @@ function BodyNode({
       </group>
       {/* 热区已经挪到屏幕空间（见 pick.ts）：这里不再画那个世界空间的透明球壳 */}
       {body.texture !== "sun" && <Atmosphere body={body} />}
+      {/*
+       * UI 注记点（t14）：只给"本体小到看不见"的天体（哈雷彗核 5.5 km）。
+       * **这不是天体本体**，是星图软件式的标记：固定 6px、不随距离缩放、不吃深度。
+       */}
+      {body.marker && <NucleusMarker size={body.marker.size} color={body.marker.color} />}
       {kids.map((kid) => (
         <group key={kid.id}>
           {showOrbits && <OrbitPath body={kid} selected={selectedId === kid.id} />}
@@ -1553,6 +1626,36 @@ function MeterCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl
     // 这台相机每帧独占相机：OrbitControls 每帧 update() 会把相机拉回它自己的球坐标状态，
     // 必须关掉，否则手动摆放的机位会被覆盖。
     controls.enabled = false;
+
+    /*
+     * t14 diag 取景：`?diag=1&view=pluto|halley`。目标取**太阳（黄道原点）**，
+     * 相机压在黄道面附近（仰角 6°/15°），让地球轨道线（黄道参照）与样本轨道同框。
+     * 距离按样本的远日点选：冥王星 1.95e13 m（130 AU）、哈雷 6.8e12 m（45 AU）。
+     * 只在 DIAG 下生效；产品相机一行不变。
+     */
+    if (DIAG_VIEW === "pluto" || DIAG_VIEW === "halley") {
+      const q = new URLSearchParams(window.location.search);
+      const num = (key: string, fallback: number) => {
+        const v = Number(q.get(key));
+        return Number.isFinite(v) && v > 0 ? v : fallback;
+      };
+      const base = DIAG_VIEW === "pluto" ? { dist: 1.95e13, el: 6, az: 28 } : { dist: 6.8e12, el: 15, az: 38 };
+      const dist = num("dist", base.dist);
+      const el = (num("el", base.el) * Math.PI) / 180;
+      const az = (num("az", base.az) * Math.PI) / 180;
+      scratch.target.set(0, 0, 0);
+      scratch.camDir.set(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az));
+      camera.position.copy(scratch.target).addScaledVector(scratch.camDir, dist);
+      controls.target.copy(scratch.target);
+      camera.lookAt(scratch.target);
+      tightenClipPlanes(
+        camera as THREE.PerspectiveCamera,
+        dist,
+        farFloorFor(visibleExtents(reg, spec.bodies), camera.position),
+      );
+      return;
+    }
+
     earth.getWorldPosition(scratch.dest);
     let dist = PROTO_DIST;
 
@@ -2480,6 +2583,38 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
     (window as unknown as { __solarCamera?: typeof cameraApi }).__solarCamera = cameraApi;
 
     /*
+     * t14 六根数探针：只暴露实境天体的根数、模型周期、当前位置。
+     * 验收要**独立重算** `365.256·a^1.5` 再和 `periodDays` 比，不能吃实现里的中间值；
+     * 哈雷的逆行角动量也从 `pos`（两个历元）算。沙盘天体没有 elements → 空数组。
+     */
+    const keplerApi = () => {
+      const tSec = daysOf(useSim.getState().simSeconds) * 86400;
+      return bodies
+        .filter((b) => b.elements)
+        .map((b) => {
+          const el = b.elements!;
+          const p = positionFromElements(el, tSec);
+          return {
+            id: b.id,
+            a: el.a,
+            e: el.e,
+            i: el.i,
+            om: el.om,
+            w: el.w,
+            M0: el.M0,
+            mu: el.mu,
+            /** 模型周期（天），由 periodDays 现算 */
+            periodDays: periodDays(el),
+            /** 数据层写进 Body 的 period（同源，供交叉核对） */
+            period: b.period,
+            facts: b.facts,
+            pos: [p.x, p.y, p.z],
+          };
+        });
+    };
+    (window as unknown as { __solarKepler?: typeof keplerApi }).__solarKepler = keplerApi;
+
+    /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
      * 算亮斑的水平质心。为什么不是别的做法：
      *
@@ -2662,6 +2797,7 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
       delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;
       delete (window as unknown as { __solarCamera?: typeof cameraApi }).__solarCamera;
+      delete (window as unknown as { __solarKepler?: typeof keplerApi }).__solarKepler;
     };
   }, [reg, camera, gl, bodies, size.height, size.width, controlsRef]);
 
@@ -2893,6 +3029,41 @@ function pinnedBootStage(): number | null {
   return n;
 }
 
+/**
+ * t14 diag-only 黄道参照环（10/20/30/40 AU）。
+ *
+ * **不是产品元素**：只在 `?diag=1&view=pluto|halley` 的取景里挂载，用来在截图里把
+ * 黄道面（z=0）画出来。产品实境的黄道参照是地球轨道线（i≈0），这里多几圈只是让
+ * "冥王星轨道穿过黄道面"在静态图里可指。不新增 shader，就是四条线环。
+ */
+function EclipticRings() {
+  const group = useMemo(() => {
+    const g = new THREE.Group();
+    const AU = 1.496e11;
+    for (const au of [10, 20, 30, 40]) {
+      const pts: number[] = [];
+      const R = au * AU;
+      for (let i = 0; i <= 240; i++) {
+        const a = (i / 240) * Math.PI * 2;
+        pts.push(Math.cos(a) * R, 0, Math.sin(a) * R);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(pts, 3));
+      const mat = new THREE.LineBasicMaterial({
+        color: "#3b4d6b",
+        transparent: true,
+        opacity: 0.6,
+        depthWrite: false,
+      });
+      const line = new THREE.Line(geo, mat);
+      line.frustumCulled = false;
+      g.add(line);
+    }
+    return g;
+  }, []);
+  return <primitive object={group} />;
+}
+
 function Scene() {
   const showOrbits = useSim((state) => state.showOrbits);
   const showLabels = useSim((state) => state.showLabels);
@@ -3036,6 +3207,8 @@ function Scene() {
       {/* 第 2 帧：星空 + 银河带（STAR / BAND 两个 program） */}
       {look.decor && stage >= 2 && <Stars />}
       <Probe controlsRef={controlsRef} />
+      {/* t14：只在 diag 取景里画黄道参照环（产品路径没有这个组件） */}
+      {DIAG_VIEW && <EclipticRings />}
       <PickLayer />
       <Labels />
       {/* ready 只有到全量才置位：验收与首帧截图看到的必须是完整场景（钉住期数时按期数算） */}

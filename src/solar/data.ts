@@ -16,6 +16,18 @@ export type Body = {
   spin: number;
   locked?: boolean;
   parent?: string;
+  /**
+   * 六根数（t14，可选）。**只有实境的天体带它**：沙盘仍然是"正圆 + 示意图简化"（t24）。
+   * 有 `elements` 时，位置由 `kepler.ts` 的开普勒解开，`orbitRadius/phase/period` 的
+   * 正圆公式不再参与；`period` 仍然要在数据层填（由 `periodSeconds` 派生），
+   * 因为旋转/淡出/探针都用它。单位与坐标系见 kepler.ts 顶部。
+   */
+  elements?: import("./kepler").OrbitalElements;
+  /**
+   * UI 标记（t14）：给"本体小到看不见"的天体用（哈雷彗核 5.5 km）。**这不是天体本体**，
+   * 是星图软件式的注记点；渲染成固定屏幕尺寸的点，不随距离缩放。
+   */
+  marker?: { size: number; color: string };
   focus: number;
   swatch: string;
   texture:
@@ -33,7 +45,10 @@ export type Body = {
     | "europa"
     | "ganymede"
     | "callisto"
-    | "titan";
+    | "titan"
+    /** t14：实境样本。画笔画不出来，走 textures.ts 的 default（程序化岩石），不新增资产 */
+    | "pluto"
+    | "halley";
   atmosphere?: { color: Rgb; opacity: number; scale: number };
   rings?: { inner: number; outer: number; color: Rgb };
   facts: { label: string; value: string }[];
