@@ -3,8 +3,8 @@ import { OrbitControls } from "@react-three/drei";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
-import { simClock } from "./clock";
-import { EARTH_PERIOD, isMoon, type Body } from "./data";
+import { simTimeNow } from "./clock";
+import { isMoon, type Body } from "./data";
 import { useSim } from "./store";
 import { useSystem } from "./system-context";
 import { HOT_RADIUS_CSS, projectCandidates, resolvePick, type PickBody } from "./pick";
@@ -415,20 +415,27 @@ function Simulation() {
   const reg = useRegistry();
   // 星系从 context 读：默认还是现在这套太阳系，换星系时这里自动跟着换
   const { bodies, spec } = useSystem();
-  const time = useRef(0);
-  const acc = useRef(0);
   useFrame((_, raw) => {
     const delta = Math.min(raw, 0.1);
-    const state = useSim.getState();
-    if (!state.paused) time.current += delta * state.speed;
-    const t = spec.unit === "meter" ? 0 : time.current;
-    simClock.time = t;
-    // 实境原型只验证相机与深度精度，不自转也不公转：
-    // 地球在 1e7 m 处占屏幕近半，自转会把贴图暗区（深海）转进转出"偏离背景"的遮罩，
-    // 公转会带着月球在画面里乱飞，两者都能把圆盘质心拖出 10~18 px —— 那是纹理和
-    // 别的天体在动，不是渲染在抖。要让 float32 量化暴露出来，靠相机自己的径向呼吸
-    // 就够了（±3% × 1.3e7 m = ±3.9e5 m，约 24 个 16384 m 的量化格）。
-    const spinOn = spec.unit !== "meter";
+    /*
+     * 时间只有一处推进（R4）：这一行是**唯一**的生产端。
+     *
+     * 实境的冻结发生在**这里**——米制系统（实境 / ?proto=1）根本不推进模拟钟。
+     * 改造前是 `const t = spec.unit === "meter" ? 0 : time.current`：消费端把时间读成 0、
+     * 生产端照跑，于是在实境待多久、回沙盘的模拟历就凭空跳过多久
+     * （实测在实境待 6.6 s → 模拟历 +174 日）。
+     */
+    if (spec.unit !== "meter") useSim.getState().advanceSim(delta);
+    /*
+     * 其它一切都从这一份时间派生：公转、自转、云层、小行星带、太阳 uTime（clock.ts 的
+     * simTimeNow）、HUD 历法（advanceSim 里写回 days）。这里不保留任何累加器 ——
+     * 保留一个 useRef 就等于又开了一份真值。
+     *
+     * 米制下 t 是冻结值：天体停在原地、自转停在原角度（这也正是 proto 抖动测量要的：
+     * 圆盘形状与纹理都不动，屏幕上测到的位移只可能来自浮点）。改造前靠 `spinOn` 手工
+     * 跳过自转来达到同样效果；现在 t 冻结了，公式照算一遍结果一样，少一个分支。
+     */
+    const t = useSim.getState().simSeconds;
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
       if (group && body.orbitRadius > 0) {
@@ -438,20 +445,14 @@ function Simulation() {
         group.position.set(lx, Math.sin(body.inclination) * lz, Math.cos(body.inclination) * lz);
       }
       const spin = reg.spins.get(body.id);
-      if (spin && spinOn) {
+      if (spin) {
         const rate = body.locked ? (Math.PI * 2) / body.period : body.spin;
         spin.rotation.y = t * rate;
       }
       const clouds = reg.clouds.get(body.id);
-      if (clouds && spinOn) clouds.rotation.y = t * body.spin * 1.35;
+      if (clouds) clouds.rotation.y = t * body.spin * 1.35;
     }
     if (reg.belt) reg.belt.rotation.y = t * 0.015;
-    acc.current += delta;
-    if (acc.current > 0.25) {
-      acc.current = 0;
-      const days = (t / EARTH_PERIOD) * 365.25;
-      if (Math.abs(days - useSim.getState().days) > 0.2) useSim.getState().setDays(days);
-    }
     if (!window.__solarReady) window.__solarReady = true;
   }, -3);
   return null;
@@ -610,7 +611,7 @@ function SunSurface({ body }: { body: Body }) {
     [mat, shell, sprite],
   );
   useFrame(() => {
-    mat.uniforms.uTime!.value = simClock.time;
+    mat.uniforms.uTime!.value = simTimeNow();
   });
   return (
     <group>
@@ -1700,6 +1701,23 @@ function Probe() {
     (window as unknown as { __solarTextures?: typeof textures }).__solarTextures = textures;
 
     /*
+     * 时间钩子（R4）：读模拟钟 / 拨模拟钟的稳定入口。
+     * 真值在 store.simSeconds，这里只是转发、不持有任何状态 —— 将来的"改时间"UI
+     * 直接调 store.setSimTime，这个钩子是给验收和现场排查用的（跟 __solarProbe 一路货）。
+     */
+    const timeApi = {
+      /** 模拟秒（唯一真值） */
+      now: () => useSim.getState().simSeconds,
+      /** HUD 历法的显示缓存（= daysOf(simSeconds)） */
+      days: () => useSim.getState().days,
+      /** number = 模拟秒；Date = 以 SIM_EPOCH 为 t=0 换算 */
+      set: (when: number | Date) => useSim.getState().setSimTime(when),
+      /** 自转角度（弧度）：证明"自转也跟着同一份时间走"（= simSeconds × spin 速率） */
+      spin: (id: string) => reg.spins.get(id)?.rotation.y ?? null,
+    };
+    (window as unknown as { __solarTime?: typeof timeApi }).__solarTime = timeApi;
+
+    /*
      * 像素回读采样器：整个 draw buffer 读回来，用「与清屏色的偏差」当遮罩，
      * 算亮斑的水平质心。为什么不是别的做法：
      *
@@ -1879,6 +1897,7 @@ function Probe() {
       delete (window as unknown as { __solarPixels?: typeof pixels }).__solarPixels;
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
+      delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
     };
   }, [reg, camera, gl, bodies, size.height, size.width]);
 

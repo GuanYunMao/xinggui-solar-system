@@ -10,6 +10,7 @@ import {
   type GateFailure,
   type GateSlot,
 } from "./gate";
+import { EARTH_PERIOD } from "./data";
 
 const KEY = "xinggui-settings-v1";
 
@@ -31,6 +32,29 @@ function clampSpeed(value: number) {
   return Math.min(8, Math.max(0.2, value));
 }
 
+/**
+ * 模拟钟的历元：`simSeconds = 0` 对应这个日历时刻（J2000.0，天文惯用历元）。
+ *
+ * ⚠ 本项目的轨道相位是手调的，**没有按真实星历标定**：这个历元只决定
+ * `setSimTime(Date)` 怎么换算成秒，不代表"2000-01-01 那天行星真在那个位置"。
+ * 要真日历，得先把 data.ts 的 phase / period 换成 JPL 的初值 —— 那是另一件事。
+ */
+export const SIM_EPOCH_MS = Date.UTC(2000, 0, 1, 12);
+
+/** 模拟秒 → HUD 的「第 N 日」（压缩时间轴：EARTH_PERIOD 秒 = 365.25 日）。 */
+export function daysOf(simSeconds: number) {
+  return (simSeconds / EARTH_PERIOD) * 365.25;
+}
+
+/**
+ * HUD 历法写回的节流。
+ *
+ * 为什么需要它：`simSeconds` 每帧都变，而 Hud 读的是 `state.days`。如果每帧都写 days，
+ * HUD 会每帧重渲染；改造前是 0.25 s 写一次，这里保持同一个刷新率。
+ * 放模块级而不是 state：它只是节流用的时间戳，不是任何 UI 的真相。
+ */
+let lastDaysWrite = 0;
+
 type GateSlice = {
   gateLit: GateSlot[];
   gateUnlocked: boolean;
@@ -47,6 +71,12 @@ type SimStore = GateSlice & {
   showOrbits: boolean;
   showTrails: boolean;
   selectedId: string | null;
+  /**
+   * 模拟时间，**时间的唯一真值**（秒）。公转、自转、太阳 uTime、HUD 历法全部从它派生。
+   * 推进只发生在一处：SolarCanvas 的 Simulation 每帧调 `advanceSim`。
+   */
+  simSeconds: number;
+  /** HUD 历法的**显示缓存**：恒等于 `daysOf(simSeconds)`，节流写回，绝不单独推进。 */
   days: number;
   resetToken: number;
   /*
@@ -68,7 +98,13 @@ type SimStore = GateSlice & {
   toggleOrbits: () => void;
   toggleTrails: () => void;
   select: (id: string | null) => void;
-  setDays: (days: number) => void;
+  /** 唯一的时间推进点：每帧由 Simulation 调；`paused` 时自吞。 */
+  advanceSim: (dt: number) => void;
+  /**
+   * 把模拟钟拨到某一时刻 —— 用户要的「时间以后要能改」的地基（本轮不做 UI）。
+   * `number` = 模拟秒；`Date` = 以 `SIM_EPOCH_MS` 为 t=0 换算成秒。
+   */
+  setSimTime: (when: number | Date) => void;
   /** 只重取景：不清目标。返回沙盘时要的就是这个。 */
   refocus: () => void;
   /** 原子地「设目标 + 重取景」，一次 set 只让 CameraRig 起一次动画。 */
@@ -136,6 +172,7 @@ export const useSim = create<SimStore>((set, get) => {
   showOrbits: true,
   showTrails: true,
   selectedId: null,
+  simSeconds: 0,
   days: 0,
   resetToken: 0,
   hops: 0,
@@ -195,7 +232,35 @@ export const useSim = create<SimStore>((set, get) => {
     }
     set({ selectedId });
   },
-  setDays: (days) => set({ days }),
+  /*
+   * 时间推进：唯一的生产端。**实境的冻结不在这里**（store 不知道系统单位），
+   * 由 Simulation 决定这一帧要不要调它 —— 冻结因此发生在生产端，而不是像改造前那样
+   * 在消费端把时间读成 0（那会让"在实境待 5 分钟再回沙盘，模拟历凭空跳过 5 分钟"）。
+   */
+  advanceSim: (dt) => {
+    const s = get();
+    if (s.paused) return;
+    const next = s.simSeconds + dt * s.speed;
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now - lastDaysWrite >= 250) {
+      lastDaysWrite = now;
+      const d = daysOf(next);
+      if (Math.abs(d - s.days) > 0.2) {
+        set({ simSeconds: next, days: d });
+        return;
+      }
+    }
+    set({ simSeconds: next });
+  },
+
+  setSimTime: (when) => {
+    const seconds = typeof when === "number" ? when : (when.getTime() - SIM_EPOCH_MS) / 1000;
+    // 非有限值一律不写：钟停着是"没反应"，写进去会让整条时间轴变 NaN，
+    // 之后每个天体的位置、每个投影都是 NaN —— 那比不动难查一百倍。
+    if (!Number.isFinite(seconds)) return;
+    lastDaysWrite = 0; // 下一帧立刻把 HUD 对齐（否则最多迟 0.25 s）
+    set({ simSeconds: seconds, days: daysOf(seconds) });
+  },
 
   refocus: () => set((s) => ({ resetToken: s.resetToken + 1 })),
   // 必须一次 set 同时改两个字段：分两次会让 CameraRig 在相邻两帧看到 key 变两次，

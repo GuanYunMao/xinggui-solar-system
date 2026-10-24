@@ -1,10 +1,10 @@
 {
   "name": "xinggui",
   "private": true,
-  "version": "1.1.4-snap.2",
+  "version": "1.1.5",
   "type": "module",
   "description": "巡星·未至之境 —— 可交互的三维太阳系（独立版）",
-  "releaseNote": "拆开两套相机",
+  "releaseNote": "修实境偷跑时间",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build": "vite build && node scripts/package-release.mjs",

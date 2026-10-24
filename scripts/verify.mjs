@@ -494,7 +494,14 @@ try {
     };
     results.push(frameTime); // 引用入列：后面补上 steady / baseline / normalized 会一起落进 JSON
 
-    // A2 命中矩阵：投影 15 个天体，数屏幕距离 < 44 px 的重叠对
+    // A2 命中矩阵：投影的天体数（判）+ 屏幕重叠对数（**只记录，永不判红**）
+    //
+    // bodies 判：探针契约是「挂载了几个天体就返回几条」，15 变了说明数据层漏天体。
+    //   有意增删天体时，这里和 README「探针契约」一起改。
+    // overlapping **不判**：它随轨道相位浮动 —— 2026-10-24 同一天 15 次运行实测 12–17
+    //   （同一份代码，只是模拟时间不同）。一个会随模拟时间变的数字没有「好坏」可言：
+    //   它红了，你既不知道该改相机、改数据，还是改时钟。保留在 results 里只为看趋势。
+    //   **别在本文件的任何地方给 overlapping 加阈值**，包括「大致范围」这种软判据。
     const hits = await numPage.evaluate(() => {
       const bodies = window.__solarProbe?.() ?? [];
       const pairs = [];
@@ -506,8 +513,17 @@ try {
       }
       return { count: bodies.length, pairs };
     });
-    results.push({ pass: "hit-matrix", bodies: hits.count, overlapping: hits.pairs.length, pairs: hits.pairs.slice(0, 6) });
-    if (hits.count !== 15) failures.push(`hit-matrix: 探针只返回 ${hits.count} 个天体，应为 15`);
+    results.push({
+      pass: "hit-matrix",
+      bodies: hits.count,
+      overlapping: hits.pairs.length, // 趋势用，不参与判定
+      pairs: hits.pairs.slice(0, 6),
+    });
+    if (hits.count !== 15) {
+      failures.push(
+        `hit-matrix: 探针只返回 ${hits.count} 个天体，应为 15（数据层漏天体；若是有意增删，改这里 + README 探针契约）`,
+      );
+    }
 
     // A3 跟随抖动：选中地球后连采 90 帧，目标屏幕位置的峰峰值
     await numPage.locator("#chip-earth").click();
