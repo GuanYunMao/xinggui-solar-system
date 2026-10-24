@@ -2858,6 +2858,13 @@ function Scene() {
     (window as unknown as { __solarPlace?: typeof place }).__solarPlace = place;
     return () => {
       delete (window as unknown as { __solarPlace?: typeof place }).__solarPlace;
+      /*
+       * 卸挂时把 diag 旁路复位（t56 复核）。
+       * 说明：`place` 每次调用都会重写这个开关，而且那一行在 faceU / az 两条路径**之前**
+       * 统一执行，所以"一次 diag 摆位之后最小距离永久失效"其实不成立 —— 那条 finding
+       * 是我看错了分支顺序。但卸挂时留一个 true 仍是脏状态，复位它成本为零。
+       */
+      DIAG_PLACE.ignoreMinDistance = false;
     };
   }, [byId, camera]);
 
