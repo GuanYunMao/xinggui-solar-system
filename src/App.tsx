@@ -149,14 +149,20 @@ export function App() {
           - 240ms 后 veilLifted=true → 挂 transition 淡出，露出已经摆好的实地面画。
           挂载时机比 opacity 更重要：这个 div 一直在 DOM 里，只切 class，
           所以不存在"append 到 DOM 之后才等一帧变黑"的窗口（dip 的老毛病）。
+
+          指针事件（t44 收尾）：**不透明期间吃掉指针**，淡出后立刻放开。
+          为什么：进实境的相机没有过渡动画，`switching` 锁在第一帧就放掉了
+          （见 SolarCanvas 的 MeterCamera），于是黑幕还盖着的那 ~220ms 里，
+          HUD 是全活的 —— 玩家看得见一片黑，点下去却可能按到暂停/图层/时计。
+          这一层由壳层负责，不去改渲染层的放锁时机。
         */}
         <div
-          className={`pointer-events-none absolute inset-0 z-[2] bg-black ${
+          className={`absolute inset-0 z-[2] bg-black ${
             inReal
               ? veilLifted
-                ? "opacity-0 transition-opacity duration-200"
-                : "opacity-100"
-              : "opacity-0"
+                ? "pointer-events-none opacity-0 transition-opacity duration-200"
+                : "pointer-events-auto opacity-100"
+              : "pointer-events-none opacity-0"
           }`}
           aria-hidden
         />

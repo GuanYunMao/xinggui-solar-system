@@ -4,7 +4,7 @@ import { ModeBadge } from "./ModeBadge";
 import { OrbitGlyph } from "./BrandMark";
 import { APP_ERA_NAME, versionLabel } from "./brand";
 import type { Body } from "./data";
-import { bindSettingsPersistence, daysOf, loadSettings, useSim } from "./store";
+import { bindSettingsPersistence, DAYS_PER_YEAR, daysPerRealSecond, daysOf, loadSettings, SECONDS_PER_SIM_SECOND, useSim } from "./store";
 import { useSystem } from "./system-context";
 
 /**
@@ -72,13 +72,19 @@ function stopIndexOf(speed: number) {
   return best;
 }
 
-/** 单位阶梯的换挡点：数字超过下一单位的 1~1.5 就换档，避免「1 秒 = 72.0 分钟」这种读数。 */
+/**
+ * 单位阶梯：**取"装得下它的最大单位"**（值是 1 起步），不是"超过下一单位的 1.5 倍才换"。
+ *
+ * 为什么改口径：按 1.5 倍阈值时，1 天 = 86400 秒 < 36 小时，于是「×1」被显示成
+ * 「1 秒 = 24 小时」—— 数字对、单位错，而且和 t44 定的「1.0× = 1 秒 = 1 天」直接打架。
+ * 现在 1 天会落在「天」档：86400 ≥ 86400。
+ */
 const UNIT_LADDER = [
-  { unit: "秒", seconds: 1, upTo: 90 },
-  { unit: "分钟", seconds: 60, upTo: 90 * 60 },
-  { unit: "小时", seconds: 3600, upTo: 36 * 3600 },
-  { unit: "天", seconds: 86400, upTo: 730 * 86400 },
-  { unit: "年", seconds: 365.25 * 86400, upTo: Infinity },
+  { unit: "秒", seconds: 1 },
+  { unit: "分钟", seconds: 60 },
+  { unit: "小时", seconds: 3600 },
+  { unit: "天", seconds: 86400 },
+  { unit: "年", seconds: 365.25 * 86400 },
 ] as const;
 
 /** 1 位小数就够；≥100 时连小数都不给，读数不该比刻度更精确。 */
@@ -91,14 +97,14 @@ function trimNumber(value: number) {
 /**
  * 一秒真实时间过去多久。返回 `{ value, unit }`，由调用点拼成「1 秒 = 1 天」。
  *
- * ⚠ 换算只有一处：`daysOf(1)` 是 store 导出的「1 模拟秒 = 多少模拟日」，
- * 乘以 speed 就是「1 实秒 -> 模拟日」。HUD 不重写压缩常数（EARTH_PERIOD / 365.25）。
- * TODO(engineer2/t44)：store 若暴露 `simDaysPerRealSecond`，这里直接改成读它，
- * 连 `daysOf(1) * speed` 这一层乘法也交给 store —— 显示层不该知道时间轴怎么压缩的。
+ * 入参是 store 的 `daysPerRealSecond(speed)`（每**实**秒推进多少模拟日）——
+ * 换算全在 store 里，HUD 只负责选单位。**这里不要再乘 speed、也不要再碰 daysOf**：
+ * t44 之前这两条路差 20.3 倍（"每模拟秒" vs "每实秒"）。
  */
 function formatRate(daysPerRealSecond: number): { value: string; unit: string } {
   const seconds = Math.max(daysPerRealSecond, 0) * 86400;
-  const step = UNIT_LADDER.find((entry) => seconds < entry.upTo) ?? UNIT_LADDER[UNIT_LADDER.length - 1]!;
+  let step: (typeof UNIT_LADDER)[number] = UNIT_LADDER[0];
+  for (const entry of UNIT_LADDER) if (seconds >= entry.seconds) step = entry;
   return { value: trimNumber(seconds / step.seconds), unit: step.unit };
 }
 
@@ -106,12 +112,30 @@ function formatMultiplier(speed: number) {
   return `×${Number(speed.toFixed(2))}`;
 }
 
+/**
+ * 历法读数（t44 定案）。
+ *
+ * 口径：内部保留小数（`simSeconds` 本来就是浮点），显示层 `年 = floor(days / DAYS_PER_YEAR)`、
+ * `日 = floor(days % DAYS_PER_YEAR) + 1` —— 日是**1 起算**的"年内第几日"，所以 t=0 显示「第 1 日」。
+ * 年长从 store 取（现在是 365.25），HUD 不再写死 365：写死会立刻出现两套历法。
+ */
+function splitEpoch(days: number) {
+  const safe = Math.max(0, days);
+  /*
+   * EPS 是**显示用的舍入保护**，不是时间精度：连续 +1 年 四次之后 `days` 会带浮点误差
+   * （实测 1925.2499999999998，而 1925.25 % 365.25 = 98.9999999999998），
+   * 直接 floor 会显示成「5 年 99 日」——比实际的 100 日少一天。
+   * 1e-6 天 ≈ 0.086 模拟秒，玩家不可能察觉，但足以把 98.999… 抬回 99。
+   */
+  const EPS = 1e-6;
+  const years = Math.floor(safe / DAYS_PER_YEAR + EPS);
+  return { years, day: Math.floor((safe % DAYS_PER_YEAR) + EPS) + 1 };
+}
+
 function formatEpoch(days: number) {
-  const total = Math.max(0, Math.floor(days));
-  const years = Math.floor(total / 365);
-  const rest = total - years * 365;
-  if (years <= 0) return `第 ${rest} 日`;
-  return `${years} 年 ${rest} 日`;
+  const { years, day } = splitEpoch(days);
+  if (years <= 0) return `第 ${day} 日`;
+  return `${years} 年 ${day} 日`;
 }
 
 export function Hud() {
@@ -633,24 +657,20 @@ function LayerKey({ label, pressed, onToggle, icon }: { label: string; pressed: 
 /* ── 设定时刻（t49）：把 store 的 `setSimTime` 接到界面上 ── */
 
 /**
- * 显示用的年长是 **365 天** —— 必须和 `formatEpoch` 的分母一致。
- * 用 365.25 的话，连按四次「+1 年」会多出一天，读数会被自己打脸（"3 年 1 日"）。
- * 历法里没有"月"，所以一步月取 1/12 年 = 30.4167 天：它是"十二个月的年"里的那个月，
+ * 年长与月长都取 store 的（t44 定案：`DAYS_PER_YEAR = 365.25`）。
+ * HUD 不写死 365 —— 写死就会和 `formatEpoch` / `daysOf` 分成两套历法，
+ * 而"两套历法"在玩家眼里就是"这游戏算错了"。
+ *
+ * 一步「月」= `DAYS_PER_YEAR / 12` = 30.4375 天：它是"十二个月的年"里的那个月，
  * 不是日历月 —— 真要日历月，得先有真日历（见 store 里 SIM_EPOCH_MS 那段警告）。
  */
-const DAYS_PER_YEAR = 365;
 const DAYS_PER_MONTH = DAYS_PER_YEAR / 12;
+/** 一年里最后一个"年内第几日"：floor(365.25 % 365.25) 最大只能到 364，+1 得 365。 */
+const DAYS_PER_YEAR_LAST_DAY = Math.floor(DAYS_PER_YEAR);
 
-/** 模拟日 → 模拟秒。用 store 导出的 `daysOf` 反推，**不重写压缩常数**。 */
+/** 模拟日 → 模拟秒。用 store 导出的换算，**不重写压缩常数**。 */
 function simSecondsOfDays(days: number) {
-  return days / daysOf(1);
-}
-
-/** 距离历元的日数 → 历法年/日。与 `formatEpoch` 同一套算法，所以回读永远对得上。 */
-function splitEpoch(days: number) {
-  const total = Math.max(0, Math.floor(days));
-  const years = Math.floor(total / DAYS_PER_YEAR);
-  return { years, days: total - years * DAYS_PER_YEAR };
+  return days * SECONDS_PER_SIM_SECOND;
 }
 
 /** 相对拨动的步长（天）。负数往回拨，但不许早于历元。 */
@@ -679,7 +699,7 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
   const setSimTime = useSim((state) => state.setSimTime);
   const [open, setOpen] = useState(false);
   const [draftYear, setDraftYear] = useState("0");
-  const [draftDay, setDraftDay] = useState("0");
+  const [draftDay, setDraftDay] = useState("1");
   /** 用户改过输入框之前，字段跟着时钟走；改过之后就不许再被覆盖（否则打到一半的字被抹掉）。 */
   const [edited, setEdited] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -689,7 +709,7 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
     if (!open || edited) return;
     const now = splitEpoch(days);
     setDraftYear(String(now.years));
-    setDraftDay(String(now.days));
+    setDraftDay(String(now.day));
   }, [open, edited, days]);
 
   // 切换模式期间禁「拨时间」：相机正在换系统，此时改时间等于在动画中途换片场
@@ -724,9 +744,10 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
   };
 
   const applyDraft = () => {
-    const years = Math.min(9999, Math.max(0, Math.floor(Number(draftYear) || 0)));
-    const rest = Math.min(DAYS_PER_YEAR - 1, Math.max(0, Math.floor(Number(draftDay) || 0)));
-    jumpTo(years * DAYS_PER_YEAR + rest);
+    const years = Math.min(9999, Math.max(0, Math.floor(Number(draftYear) || 1)));
+    // 日是 1 起算的"年内第几日"（与 splitEpoch / formatEpoch 同一口径），所以落回天数时要 -1
+    const day = Math.min(DAYS_PER_YEAR_LAST_DAY, Math.max(1, Math.floor(Number(draftDay) || 1)));
+    jumpTo(years * DAYS_PER_YEAR + (day - 1));
     setEdited(false); // 应用完回到跟随模式：下一个读数由时钟接管
   };
 
@@ -781,8 +802,8 @@ function TimeSetter({ disabled }: { disabled: boolean }) {
               <input
                 type="number"
                 inputMode="numeric"
-                min={0}
-                max={DAYS_PER_YEAR - 1}
+                min={1}
+                max={DAYS_PER_YEAR_LAST_DAY}
                 step={1}
                 value={draftDay}
                 onChange={(event) => {
@@ -877,8 +898,12 @@ function Dock({ compact }: { compact: boolean }) {
     { id: "trails", label: "尾迹", pressed: showTrails, onToggle: toggleTrails, icon: <Sparkles className="size-4" /> },
   ];
 
-  /* 读数：玩家读的是「这一秒里过去了多久」，倍率只是内部量，缩到第二行。 */
-  const rate = formatRate(daysOf(1) * speed);
+  /*
+   * 读数：玩家读的是「这一秒里过去了多久」，倍率只是内部量，缩到第二行。
+   * 用 store 的 `daysPerRealSecond(speed)`（每**实**秒推进多少模拟日）——
+   * 不是 `daysOf(1) * speed`，那是"每模拟秒多少天"，t44 改基准后两者差 20.3 倍。
+   */
+  const rate = formatRate(daysPerRealSecond(speed));
 
   return (
     <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
