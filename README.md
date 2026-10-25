@@ -22,7 +22,7 @@
 
 | | |
 | --- | --- |
-| 线上正式版 | **1.3.2**（`releases/latest` 指向它，tag `v1.3.2`） |
+| 线上正式版 | **1.3.4**（`releases/latest` 指向它，tag `v1.3.4`） |
 | 开发中 | **1.3.4**（开正式号时改这里与 `package.json`，两者逐字相等由 `check-shape` 第 9 条守着） |
 | 产物 | `release/巡星.html`（单文件）、`release/site/`（静态站点） |
 
