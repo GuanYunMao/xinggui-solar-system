@@ -22,8 +22,8 @@
 
 | | |
 | --- | --- |
-| 线上正式版 | **1.3.1**（`releases/latest` 指向它，tag `v1.3.1`） |
-| 开发中 | **1.3.2**（已定号、待发；开下一版时改这里与 `package.json`，两者逐字相等由 `check-shape` 第 9 条守着） |
+| 线上正式版 | **1.3.2**（`releases/latest` 指向它，tag `v1.3.2`） |
+| 开发中 | **1.3.3-snap.1**（快照：只出 Actions artifact，不建 release、不动 latest；开正式号时改这里与 `package.json`，两者逐字相等由 `check-shape` 第 9 条守着） |
 | 产物 | `release/巡星.html`（单文件）、`release/site/`（静态站点） |
 
 固定下载地址，跨版本不变：
