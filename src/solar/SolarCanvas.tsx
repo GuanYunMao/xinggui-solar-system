@@ -2311,13 +2311,23 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     const controls = controlsRef.current;
     if (!controls) return;
     const q = camera.quaternion;
-    // 纵向：绕本地 right
+    // 纵向：绕本地 right（相机的横轴，恒垂直于视轴 —— 任何仰角下都良定义）
     scratch.delta.set(1, 0, 0).applyQuaternion(q);
     scratch.q.setFromAxisAngle(scratch.delta, pitchRad);
     q.premultiply(scratch.q);
-    // 横向：绕本地 up（取转完 pitch 之后的 up —— 逐帧小量，误差可忽略，顺序固定）
-    scratch.delta.set(0, 1, 0).applyQuaternion(q);
-    scratch.q.setFromAxisAngle(scratch.delta, yawRad);
+    /*
+     * 横向：绕**世界 +Y 轴**（t58 修；旧写法绕相机本地 up）。
+     *
+     * 为什么必须换：本地 up 只在赤道附近才接近世界竖直。实测（同一段指针位移）：
+     *  - 仰角 20° 横拖 150°：极角顺带掉了 **-36.8°** —— 那不是"绕星球转"，是斜着翻；
+     *  - 极点附近横拖 520px：极角从 **-78° 翻到 +58°**（横拖变成了"从下方翻到上方"），
+     *    而翻的方向取决于累积的 roll —— 用户报的「疯狂旋转」就是这一步。
+     * 绕世界 +Y 之后：横拖恒为纯方位角（极角不动），极点处退化成绕视轴的 roll（1:1，不放大）。
+     *
+     * 极点仍然**不夹**（t34 的约束保留）：纵向照样绕本地 right 连续翻过极点，
+     * `camera.up` 的世界朝向随之连续旋转 180°（实测单帧 ≤1.4°，没有跳变）。
+     */
+    scratch.q.setFromAxisAngle(Y_AXIS, yawRad);
     q.premultiply(scratch.q);
     const dist = camera.position.distanceTo(controls.target);
     scratch.pos.set(0, 0, 1).applyQuaternion(q).multiplyScalar(dist).add(controls.target);
@@ -3231,6 +3241,15 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
         nearest,
         pos: [+camera.position.x.toFixed(4), +camera.position.y.toFixed(4), +camera.position.z.toFixed(4)],
         fov: persp.fov,
+        /*
+         * 朝向与"上"（t58 追加，纯只读）：极点退化位的诊断要从这两个量算三件事 ——
+         * 总角速度（四元数夹角）、**视轴自转**（绕视轴的 twist = 用户说的"疯狂旋转"）、
+         * 以及 `up` 是否连续。只暴露数值，不改变任何相机行为。
+         */
+        quat: [camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w].map(
+          (n) => +n.toFixed(7),
+        ),
+        up: [camera.up.x, camera.up.y, camera.up.z].map((n) => +n.toFixed(7)),
       };
     };
     (window as unknown as { __solarCamera?: typeof cameraApi }).__solarCamera = cameraApi;
