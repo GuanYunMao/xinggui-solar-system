@@ -166,18 +166,27 @@ export function decodeGate(raw: string): DecodeGateResult {
   }
 
   const payload = decodeChars(normalized.slice(PREFIX.length, PREFIX.length + PAYLOAD_CHARS));
-  // 5 个字符装得下 25 bit，载荷只认 24 bit：最高位被占用 = 这个码不是我们发的
+  // 5 个字符装得下 25 bit，载荷只认 24 bit：最高位被占用 = 这个码不是我们发的。
+  // 这是"载荷空间"的判据、不是"打错了"的判据；面板上 range 与 checksum 都显示「码无效」。
   if (payload >= 2 ** 24) return { ok: false, reason: "range" };
 
-  const version = (payload >>> 13) & 0xf;
-  if (version !== GATE_VERSION) return { ok: false, reason: "version" };
-
+  /*
+   * 校验先于版本（t25 / t8-F2）：CRC 是"这串字符有没有打错"的问题，版本是"这个码属于哪一代"。
+   * 打错一个字的人应该听到「码无效，核对后重填」，而不是「这个码来自别的版本」——
+   * 后者会让玩家以为自己的码过期了，去翻旧存档。实测症状：面板输入框的占位符 XG1-ABCDE-FG
+   * 自己 version 位是 5（CRC 也对不上），旧顺序下随手点「恢复」得到的提示就是"来自别的版本"。
+   *
+   * 调换对**真的老 v1 码**没有影响：它的 CRC 本来就有效，过得了这一关，再被判 version —— 一码归一码。
+   */
   const checkChars = normalized.slice(PREFIX.length + PAYLOAD_CHARS);
   const low = ALPHABET.indexOf(checkChars[0]!);
   const high = ALPHABET.indexOf(checkChars[1]!);
   if (high > 7) return { ok: false, reason: "checksum" };
   const expected = crc8([payload & 0xff, (payload >>> 8) & 0xff, (payload >>> 16) & 0xff]);
   if (low + (high << 5) !== expected) return { ok: false, reason: "checksum" };
+
+  const version = (payload >>> 13) & 0xf;
+  if (version !== GATE_VERSION) return { ok: false, reason: "version" };
 
   /*
    * 保留位必须为 0（1.3.4）：槽位收到 3 个之后，bit 3–12（老槽位的残位 + t20 废止的解锁位）
@@ -187,7 +196,8 @@ export function decodeGate(raw: string): DecodeGateResult {
    * 忽略它才能让「亮满 3 格」成为唯一事实来源。现在整个高位区间都不再有含义，
    * 忽略等于认下任意垃圾位：同一份进度会解出跟原码不同的新码（导出就变了个样）。
    *
-   * 顺序放在校验之后：位翻转应该报 checksum，不该报 range —— 报错要指向真正的毛病。
+   * 顺序放在校验与版本之后：位翻转报 checksum、旧代际报 version，都不该被这一条截胡 ——
+   * 报错要指向真正的毛病。
    */
   const reserved = ((payload >>> 3) & 0x3ff) | (payload >>> 17);
   if (reserved !== 0) return { ok: false, reason: "range" };

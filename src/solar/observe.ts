@@ -258,14 +258,31 @@ export function eclipseWitnessed(fromSimSeconds: number, toSimSeconds: number): 
  */
 
 /**
- * 选中态读法。`selectedId` 是 store 的选中天体；`fromGesture` 说的是
- * **这次选中是不是玩家手势引起的**（URL 深链 `?body=moon` 也会设 selectedId，但那不是行为）。
+ * 选中的来源（t19 引入"是不是手势"，t33 细分到"在哪点的"）。
  *
- * 为什么门必须看第二个字段：零交互走一条链接就能点亮，四把尺子第 1 条（能不能失败）当场不通过。
- * 谁决定 `fromGesture`：store 的 `select` 在**调用那一刻**看页面上有没有发生过指针/键盘/滚轮事件
- * （见 store.ts 的 gestureSeen）。这里只消费那个布尔，不再自己猜。
+ *  - `"url"`：页面加载 / 深链 `?body=…` 带出来的，玩家在这一次选中之前没碰过页面；
+ *  - `"canvas"`：在 3D 画布上点中的（玩家看的是画面本身）；
+ *  - `"hud"`：芯片行、键盘、面板等 HUD 交互。
+ *
+ * 为什么要分三种而不是两种：门·layer 的判据是"两层都不在的时候还点得中一颗行星"，
+ * 而芯片行常驻印着名字 —— 点芯片不算"认出来"。门·time / 门·target 只关心"是不是玩家的动作"，
+ * 用 `watchFromPlayer` 把 `"url"` 排除掉就够了。
+ *
+ * 谁决定它：store 的 `select` 在**调用那一刻**读模块级的输入来源（见 store.ts 的手势探针），
+ * 这里只消费那个字符串，不再自己猜。
  */
-export type GateWatch = { selectedId: string | null; fromGesture: boolean };
+export type SelectionSource = "url" | "canvas" | "hud";
+
+/** 选中态读法（三条门共用一份）。 */
+export type GateWatch = { selectedId: string | null; source: SelectionSource };
+
+/**
+ * 这一次选中是不是玩家做出来的（URL 带出来的不算）。
+ * 三条门都先过这一关：零交互走一条链接就能点亮，四把尺子第 1 条（能不能失败）当场不通过。
+ */
+export function watchFromPlayer(watch: GateWatch): boolean {
+  return watch.source !== "url";
+}
 
 /**
  * 门·time 要玩家盯着看的那个天体（t13）。
@@ -286,20 +303,20 @@ export const TIME_GATE_TARGET = "moon";
  *  - 只看**进入那一帧**的选中态。进入之后再选中、或进入之后取消选中，都不改结论 ——
  *    前者是"没看着它进去"，后者是"已经看见了"，两种都不是误判。
  *  - 选中地球不算：`TIME_GATE_TARGET` 是月球，别把"选中母行星"当成"看着月球"。
- *  - `fromGesture` 为假（深链带出来的选中）不算：URL 不是行为。
+ *  - `source === "url"` 不算：URL 不是行为（画布点选与芯片都算 —— 这一门看的是"有没有跟着它"）。
  *
  * 什么情况会推翻它：
  *  - **选中了但没在看**（切窗口、面板盖住画面）：本判据不管，它只是"目击"的最弱一档。
  *    要管就得有相机 / 视锥信息，属渲染域，1.4.0 再谈。
- *  - **手势检测被自动化骗过**：`fromGesture` 的来源是"页面上出现过 pointerdown/keydown/wheel"，
- *    脚本模拟点击同样满足。要让门对夹具也严格，得让 App 的深链调用显式传来源标记。
+ *  - **输入来源被自动化骗过**：`source` 来自"这一下输入落在哪"，脚本模拟点击同样满足。
+ *    要让门对夹具也严格，得让 App 的深链调用显式传来源标记。
  */
 export function timeGateWitnessed(
   fromSimSeconds: number,
   toSimSeconds: number,
   watch: GateWatch,
 ): boolean {
-  if (watch.selectedId !== TIME_GATE_TARGET || !watch.fromGesture) return false;
+  if (watch.selectedId !== TIME_GATE_TARGET || !watchFromPlayer(watch)) return false;
   return eclipseEntry(fromSimSeconds, toSimSeconds) !== null;
 }
 
@@ -313,12 +330,51 @@ export const TARGET_GATE_BODY = "mercury";
  * 所以累积角 = 累积时间 × 2π / period ⇒ 满 2π 恰好就是满一个 `period`。
  * 水星的 period = 8.2 模拟秒，8× 下 = 8.2 / 0.39425 ≈ 20.8 实秒。
  *
+ * ── 为什么不用 8.575（t33，观察位在 t29 提的那个数）────────────────
+ * 8.575 不是模型量，它是 **8.2 + 0.375**，而 0.375 模拟秒 = 1 次相机飞行的 0.95 实秒 × 0.39425
+ * （8× 下）。也就是说：玩家点下芯片之后相机先飞 0.95 实秒才停稳，他"看见的一圈"是从相机停稳
+ * 那一刻起算的，于是视觉书签落在门亮之后 0.95 实秒。
+ *
+ * 不把 8.575 写进判据，有三条硬理由：
+ *  1. **那不是常数**。相机飞行是弧长驱动（SolarCanvas 的 `FOCUS_RATE = 1.5` 世界单位/实秒，
+ *     起步斜坡 0.12 s），飞多久取决于这次要从哪儿飞到哪儿；`prefers-reduced-motion` 下直接瞬移。
+ *  2. **换速度就失配**。0.95 实秒在 8× 下是 0.375 模拟秒，在 1× 下是 0.047、0.05× 下是 0.0024。
+ *     判据的输入是模拟秒，写死一个只对 8× 成立的偏移 = 在别的档位上错得更离谱。
+ *  3. **它会把"转完一圈"偷换成"转完一圈加一段动画"**。门要证的是轨道角，不是镜头。
+ *
+ * 那么这段差距靠什么补：t33 起**再点同一颗不清零**（`targetWatchAfterSelect`），
+ * 玩家点回水星确认"是这颗"不会把已看的时长作废；镜头飞行的 0.95 秒（8× 下）门照亮，
+ * 玩家还在看，灯亮之后最多 0.95 实秒画面上的那一圈才走满 —— 顺序是"先亮后满"，
+ * 不是"亮早了"：判据数的是从选中那一刻起的真实轨道角。
+ * 要让灯**落在视觉书签之后**，唯一的做法是等相机停稳再开始计时 —— 那要渲染域的状态
+ * （相机在不在飞），不属于这个文件；要做就在 store 层加一条"等相机落定"的闸，别改这里的阈值。
+ *
  * 什么情况会推翻它（**换成椭圆或开普勒就必须回来改**）：
  *  - 角速度不再恒定（实境的六根数、或沙盘哪天换椭圆）⇒ "累积时间" 不等于 "累积角"，
  *    这里必须改成真的积分轨道角（`∫ dθ/dt dt`），否则门会按"时间"亮而不是按"转完一圈"亮。
  *  - 有人改了 `data.ts` 的 mercury.period：这里跟着变，注释里的 20.8 实秒要重算。
  */
 export const TARGET_GATE_ORBIT_SECONDS = BODY_BY_ID[TARGET_GATE_BODY].period;
+
+/**
+ * 选中变化时门·target 的累计怎么处理（纯函数，t33）：**换目标才归零，再点同一颗保持**。
+ *
+ * 为什么不让 store 无条件清零：玩家"点一下确认自己选的是哪颗"是常态动作（观察位 t29 实测），
+ * 无条件清零等于罚他一次确认。只有选中真的换成了别的天体，才算"没在看了"。
+ *
+ * 什么情况会推翻它：
+ *  - **"同一颗"是按 id 判的**：如果哪天加"同一颗的不同视角"（比如点它的卫星）也算换目标，
+ *    这里得改成按"焦点对象"判，而不是按 id 相等。
+ *  - `previous` 是负数或 NaN 时按 0 处理（同一份容错约定见 `accumulateTargetWatch`）。
+ */
+export function targetWatchAfterSelect(
+  previousSimSeconds: number,
+  previousId: string | null,
+  nextId: string | null,
+): number {
+  if (nextId !== previousId) return 0;
+  return Number.isFinite(previousSimSeconds) ? Math.max(0, previousSimSeconds) : 0;
+}
 
 /**
  * 门·target 的累积器（纯函数）：**只看"水星被玩家选中"的那几段**。
@@ -338,7 +394,7 @@ export function accumulateTargetWatch(
   dtSimSeconds: number,
   watch: GateWatch,
 ): number {
-  if (watch.selectedId !== TARGET_GATE_BODY || !watch.fromGesture) return 0;
+  if (watch.selectedId !== TARGET_GATE_BODY || !watchFromPlayer(watch)) return 0;
   const previous = Number.isFinite(previousSimSeconds) ? Math.max(0, previousSimSeconds) : 0;
   if (!Number.isFinite(dtSimSeconds) || dtSimSeconds <= 0) return previous;
   return previous + dtSimSeconds;
@@ -350,18 +406,26 @@ export function targetGateWitnessed(watchedSimSeconds: number): boolean {
 }
 
 /**
- * 门·layer：**名称与轨道都不在**，且这一次选中是玩家自己点的一颗**行星**。
+ * 门·layer：**名称与轨道都不在**，且这一次选中是玩家在**画布上**点的一颗**行星**。
  *
- * 为什么不是"关掉两个开关就亮"（t19 前的口径）：那是"摸过控件"。文案问的是
- * "名称与轨道都不在，还认得出谁" —— 认得出，是能在没有名字和轨道线的画面上选出那颗天体。
- * 所以判据点的是"关掉之后还选得中"，而开关本身一次都不算。
+ * 为什么不是"关掉两个开关就亮"（t19 前的口径）：那是"摸过控件"。判据要的是
+ * **在两层都不在的画面上把一颗行星指出来** —— 选中要靠形状，不靠标签和轨道线。
+ * 所以判据点的是"关掉之后还点得中"，而开关本身一次都不算。
  *
- * 口径（三条都写死）：
- *  - 只认 `parent === "sun"` 的行星；太阳不算（不靠轨道线也认得出，它是中心那颗），
+ * 口径（四条都写死）：
+ *  - 只认 `parent === "sun"` 的行星；太阳不算（它在画面正中被认出来跟轨道线无关），
  *    卫星也不算（卫星行要先选中母行星才出现，那时门已经该亮了）。
+ *  - **只认画布点选**（`source === "canvas"`，t33）：芯片行常驻印着名字，点芯片等于看着答案点，
+ *    "认得出"这一层根本没被考。`"hud"` 与 `"url"` 都不算。
  *  - 顺带：选中之后再把图层打开**不会撤销**已亮的格 —— 门只看点亮那一刻。
- *  - `fromGesture` 为假不算：`?body=earth` 这种链接带出来的选中不是行为
- *    （尤其是图层开关会被持久化，玩家早就关好了，光开链接就能白拿）。
+ *  - `?body=earth` 这种链接带出来的选中不是行为（图层开关会被持久化，玩家早就关好了，
+ *    光开链接就能白拿）—— 包含在上面那条里，`"url"` 不满足 `"canvas"`。
+ *
+ * 已知边界（SolarCanvas 的 t18-C 行为）：点**已经选中的那颗**走的是 `refocus()`
+ * 而不是 `select()`，所以那一下不会把这一格点亮 —— 换一颗点就行（这也正是判据想问的事）。
+ *
+ * 这里只写判据检查什么，不抄界面提示的原文：提示文案改过两轮，抄一份只会让下一个人
+ * 不知道自己在读旧版。
  */
 export function layerGateWitnessed(
   watch: GateWatch,
@@ -369,7 +433,7 @@ export function layerGateWitnessed(
   orbitsVisible: boolean,
 ): boolean {
   if (labelsVisible || orbitsVisible) return false;
-  if (!watch.fromGesture) return false;
+  if (watch.source !== "canvas") return false;
   const body = watch.selectedId === null ? undefined : BODY_BY_ID[watch.selectedId];
   return Boolean(body && body.parent === "sun");
 }

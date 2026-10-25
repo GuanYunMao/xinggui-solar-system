@@ -2,14 +2,18 @@
 /**
  * 1.4.0 规格检查器：`docs/spec-1.4.md` 缺任一段、缺任一个数、或**算错一个数**就 exit 1。
  *
- * 三类判据，缺一类这个脚本就只是 grep：
+ * ⚠ 这个脚本验的是**内部自洽**（公式与表一致），**不验前提**（起点距离、噪声底、阈值来自实测，
+ * 脚本无从知道它们是不是最新一版）。前提的复核清单写在 spec §8 的「人工复核项」表里。
+ * 能现算的都现算了：表内每行的 t、往返 = 2 × 单程、冥王星圆盘半径、标签深度、四个阈值比值。
+ *
+ * 三类判据：
  *   1. 结构   —— 四个决策段在，每段有结论 / 数字 / 推翻条件；
  *   2. 在场   —— 每段的必填数字与该写的标识逐条命中；
- *   3. 算术   —— 自己解析 §3.3 的用时表，按 t = 12·ln(起点/终点) 逐行重算。
+ *   3. 算术   —— 解析 §3.3 的用时表与相带那一行，按 t = 12·ln(起点/终点) 重算。
  *
- * 第 3 类是 t7 驳回来的重点：旧版「30.3 s」是混用两个目标算出来的，而旧脚本只判
- * 「这段有没有这个字符串」，所以它全绿通过了。现在凡是能被算出来的数都由脚本重算：
- * 用时表、往返、冥王星圆盘半径、标签深度、阈值/噪声底比值。**错的数靠算术被抓，不靠人眼。**
+ * 第 3 类是为 t7 那条「30.3 s」准备的：混用目标算出来的数在字符串层面完全合法，
+ * 只有重算才抓得住。t21 又补一条：起点随历元变，验收改成「用探针读到的起点现算」——
+ * 脚本也随之改成先验公式自洽，再验相带的往返关系。
  *
  * 三种跑法：
  *   node scripts/check-spec-1.4.mjs              检查 docs/spec-1.4.md
@@ -31,9 +35,8 @@ const ARITH_TOL = 0.01;
 /**
  * 每个决策段必填的数字/标识。
  *
- * 选词原则：一条 token 对应规格里的一条**判断**，不是对应一个好看的数。
- * 混着纯数字（`72.3 s`）、单位量（`6.3e-5 px`）、带出处的标识（`system-context.tsx`）：
- * 前者防「结论写了但没算」，后者防「数字对但落不了地」。改规格时两边一起改。
+ * 选词原则：一条 token 对应规格里的一条**判断**。混着纯数字（`66.36 s`）、单位量（`6.3e-5 px`）、
+ * 带出处的标识（`system-context.tsx`）：前者防「结论写了但没算」，后者防「数字对但落不了地」。
  */
 const DECISIONS = [
   {
@@ -46,8 +49,9 @@ const DECISIONS = [
       { label: "1e16 m 下顶点方向误差 6.3e-5 px", token: "6.3e-5 px" },
       { label: "星点内存 89.6 KB / 天球 36,864 三角", token: "36,864" },
       { label: "第三处定义点在 system-context.tsx", token: "system-context.tsx" },
-      { label: "REAL_SYSTEM 必须显式 sky: true（spread 会静默继承 false）", token: "sky: true" },
+      { label: "REAL_SYSTEM 必须显式 sky: true", token: "sky: true" },
       { label: "探针要能读到 mounted.stars", token: "mounted.stars" },
+      { label: "绝对深度断言：radius ≥ max_i(球心距离 + 4 R_i)", token: "4 R_i" },
     ],
   },
   {
@@ -58,21 +62,28 @@ const DECISIONS = [
       { label: "动词三拍之二：推进", token: "推进" },
       { label: "动词三拍之三：到达", token: "到达" },
       { label: "速度模型 v = max(视距 / 12, 1e4)", token: "/ 12" },
-      { label: "地月单程（当前历元）72.3 s", token: "72.3 s" },
-      { label: "地月单程（近侧极限）65.3 s", token: "65.3" },
-      { label: "地球→冥王星 181.1 s", token: "181.1" },
-      { label: "真实档地月往返 8.14 日（对照，不是玩家路径）", token: "8.14 日" },
-      { label: "真实档地球→灶神星 1.09 年", token: "1.09 年" },
+      { label: "当前历元实测：月球 5.259e8 → 66.36 s", token: "66.36 s" },
+      { label: "当前历元实测：地球 8.678e8 → 56.78 s", token: "56.78 s" },
+      { label: "月相/偏心率相带 64.0–73.0 s", token: "64.0–73.0 s" },
+      { label: "地球相带 48.4–57.4 s", token: "48.4–57.4 s" },
+      { label: "验收不写死起点，用探针现算", token: "现算" },
+      { label: "三次跑的复位协议", token: "复位" },
       { label: "计时探针 __solarFlight()", token: "__solarFlight" },
+      { label: "真实档地月往返 8.14 日（对照）", token: "8.14 日" },
+      { label: "真实档地球→灶神星 1.09 年", token: "1.09 年" },
+      { label: "不再造距离上限（沙盘 MAX_DISTANCE 不适用）", token: "不新增距离上限" },
     ],
   },
   {
     id: 3,
     title: "连续缩放验收",
     tokens: [
-      { label: "抖动阈值 0.35 px（与 proto-jitter 同一套）", token: "0.35 px" },
-      { label: "0.35 是噪声底 0.067 的 5.2 倍", token: "5.2 倍" },
-      { label: "0.35 是旧注释 0.081 的 4.3 倍", token: "4.3 倍" },
+      { label: "抖动阈值 0.35 px", token: "0.35 px" },
+      { label: "1280×720 验收视口下是 10 倍", token: "0.35 / 0.035 = 10.0" },
+      { label: "1920×1080 下是 5.2 倍", token: "0.35 / 0.067 = 5.2" },
+      { label: "1920×1080 旧底 0.081 是 4.3 倍", token: "0.35 / 0.081 = 4.3" },
+      { label: "1.8e7 夹具点 0.85 倍（会红）", token: "0.35 / 0.410 = 0.85" },
+      { label: "6 个抖动取样点全钉在标定点", token: "dist = 1.2e7" },
       { label: "帧率下限 30 fps", token: "30 fps" },
       { label: "帧间隔闸 p95 ≤ 33.3 ms", token: "33.3 ms" },
       { label: "真机型号 Intel Arc 130T", token: "Arc 130T" },
@@ -81,7 +92,7 @@ const DECISIONS = [
       { label: "缩放跨度 6.12 个量级", token: "6.12" },
       { label: "停稳判据 ZOOM_SETTLE_LOG", token: "ZOOM_SETTLE_LOG" },
       { label: "真机帧率产物 runs/fps-1.4.0-*.json", token: "fps-1.4.0" },
-      { label: "夹具点专用常数：dist=1.8e7 底是 6.1 倍", token: "1.8e7" },
+      { label: "夹具点专用常数：dist=1.8e7 是 6.1 倍", token: "1.8e7" },
     ],
   },
   {
@@ -89,15 +100,28 @@ const DECISIONS = [
     title: "冥王星与哈雷",
     tokens: [
       { label: "冥王星 focus 改到 1.2e7", token: "1.2e7" },
-      { label: "改前圆盘 0.74 px（等于没有）", token: "0.74 px" },
+      { label: "改前圆盘 0.74 px", token: "0.74 px" },
       { label: "改后圆盘 93.3 px", token: "93.3" },
       { label: "哈雷 focus 下 0.0103 px", token: "0.0103 px" },
       { label: "标签 maxDepth 5.76e8", token: "5.76e8" },
       { label: "哈雷数据保留、只从 build 摘", token: "HALLEY_ELEMENTS" },
       { label: "逆行轨道 162.19°", token: "162.19" },
       { label: "冥王星探针 __solarFocus()", token: "__solarFocus" },
+      { label: "动作是双击冥王星（瞬移），不是单击选目标", token: "双击冥王星" },
     ],
   },
+];
+
+/**
+ * 跨段的必填项：这几句不在四个决策段里，但同样是验收的一部分。
+ * 只查「在不在」，不查数值——能算的都在 checkArithmetic 里算过了。
+ */
+const GLOBAL_TOKENS = [
+  { label: "§6 落点记录的动作用双击（与单击选目标分工一致）", token: "双击地球" },
+  { label: "§6 晨昏线判据给了数（亮/暗 luma 比 ≥ 1.5）", token: "luma 比 ≥ 1.5" },
+  { label: "§6 入口机位的决定（不做先落地球近地）", token: "不做「先落地球近地」" },
+  { label: "§8 人工复核项清单", token: "人工复核项" },
+  { label: "文首数值来源声明", token: "数值来源" },
 ];
 
 /** PLAN 第 6 节的禁词表。规格自己也要过语气闸。 */
@@ -148,8 +172,7 @@ function splitDecisions(text) {
 
 /**
  * 解析 §3.3 的用时表。行格式故意收窄，别的表不会被误读：
- *   | 目标 | 4.805e8 m | 7.6452e6 m | 49.7 s | ±10% |
- * 只认「起点终点都是科学计数法 + 单位 m、用时是十进制 + 单位 s」的行。
+ *   | 月球 | 5.259e8 m | 2.08488e6 m | 66.36 s | 相带 64.0–73.0 s |
  */
 function parseFlightTable(text) {
   const at = text.indexOf("### 3.3");
@@ -167,11 +190,24 @@ function parseFlightTable(text) {
   return { rows, reason: rows.length ? "" : "§3.3 里一行用时表都没解析到" };
 }
 
+/** 相带那一行：`月球 **64.0–73.0 s**，往返 **128.1–146.0 s**`。 */
+function parseBand(text) {
+  const moon = /月球\s*\*\*([\d.]+)–([\d.]+)\s*s\*\*/.exec(text);
+  const round = /往返\s*\*\*([\d.]+)–([\d.]+)\s*s\*\*/.exec(text);
+  if (!moon || !round) return null;
+  return {
+    moonLo: Number(moon[1]),
+    moonHi: Number(moon[2]),
+    roundLo: Number(round[1]),
+    roundHi: Number(round[2]),
+  };
+}
+
 /**
- * 算术复算。每一行独立判：表里写的用时必须等于 12·ln(起点/终点)，容差 1%。
- *
- * 这一条就是为「30.3 s」那种数准备的：混用目标算出来的数，在表里永远对不上公式，
- * 而纯字符串检查看不出来——30.3 只是个"正常数字"。
+ * 算术复算。三类：
+ *   a) 表里每行的 t 必须等于 12·ln(起点/终点)，容差 1%；
+ *   b) 往返带的上下界必须分别等于单程带的 2 倍；
+ *   c) 圆盘半径、标签深度、四个阈值比值——能关起门算的现算现比。
  */
 function checkArithmetic(text, ok, bad) {
   const { rows, reason } = parseFlightTable(text);
@@ -197,43 +233,76 @@ function checkArithmetic(text, ok, bad) {
       );
     }
   }
-  if (!worst) worst = 0;
   ok("§3.3 全部用时行复算一致", `最大偏差 ${(worst * 100).toFixed(2)}%`);
 
-  // 往返 = 2 × 单程：月球两行是单程的上下界，往返带的上下界必须是它们的 2 倍。
-  const moons = rows.filter((r) => r.name.includes("月球"));
-  if (moons.length < 2) {
-    bad("地月往返可复算", `月球行只有 ${moons.length} 条，算不出单程上下界`);
+  // b) 往返 = 2 × 单程（从相带那一行现算，不依赖表里有几行月球）
+  const band = parseBand(text);
+  if (!band) {
+    bad("相带可解析", "找不到「月球 **A–B s**，往返 **C–D s**」这一行");
   } else {
-    const times = moons.map((r) => TAU_S * Math.log(r.start / r.end));
-    const lo = 2 * Math.min(...times);
-    const hi = 2 * Math.max(...times);
-    const hasLo = text.includes(lo.toFixed(1));
-    const hasHi = text.includes(hi.toFixed(1));
-    if (hasLo && hasHi) ok("地月往返 = 2 × 单程", `${lo.toFixed(1)} / ${hi.toFixed(1)} s 都在文里`);
-    else
+    const wantLo = 2 * band.moonLo;
+    const wantHi = 2 * band.moonHi;
+    const errLo = Math.abs(band.roundLo - wantLo) / wantLo;
+    const errHi = Math.abs(band.roundHi - wantHi) / wantHi;
+    if (errLo <= ARITH_TOL && errHi <= ARITH_TOL) {
+      ok("往返 = 2 × 单程", `${band.roundLo}–${band.roundHi} = 2 × ${band.moonLo}–${band.moonHi}`);
+    } else {
       bad(
-        "地月往返 = 2 × 单程",
-        `复算得 ${lo.toFixed(1)} / ${hi.toFixed(1)} s，文里${hasLo ? "" : "缺下界"}${hasHi ? "" : "缺上界"}`,
+        "往返 = 2 × 单程",
+        `单程 ${band.moonLo}–${band.moonHi} s 的两倍应是 ${wantLo.toFixed(1)}–${wantHi.toFixed(1)}，文里写 ${band.roundLo}–${band.roundHi} s`,
       );
+    }
   }
 
-  // 冥王星圆盘半径：focal(42°/720 行) × tan(asin(R/d))。
+  // c) 冥王星圆盘半径：focal(42°/720 行) × tan(asin(R/d))
   const focal = 720 / 2 / Math.tan((21 * Math.PI) / 180);
   const plutoPx = focal * Math.tan(Math.asin(1.1883e6 / 1.2e7));
   if (text.includes(plutoPx.toFixed(1))) ok("冥王星圆盘半径复算", `${plutoPx.toFixed(1)} px 在文里`);
   else bad("冥王星圆盘半径复算", `算得 ${plutoPx.toFixed(1)} px，文里没有这个数`);
 
-  // 标签最大可见深度：max(focus×48, radius×200)。
+  // c) 标签最大可见深度：max(focus×48, radius×200)
   const depth = Math.max(1.2e7 * 48, 1.1883e6 * 200);
   if (text.includes(depth.toExponential(2).replace("e+", "e"))) ok("标签深度复算", "5.76e8 在文里");
   else bad("标签深度复算", `算得 ${depth.toExponential(2)}，文里没有`);
 
-  // 阈值与噪声底的比值：0.35 / 0.067 = 5.2，0.35 / 0.081 = 4.3。
-  const r1 = (0.35 / 0.067).toFixed(1);
-  const r2 = (0.35 / 0.081).toFixed(1);
-  if (text.includes(`${r1} 倍`) && text.includes(`${r2} 倍`)) ok("阈值/噪声底比值复算", `${r1} 与 ${r2} 都在文里`);
-  else bad("阈值/噪声底比值复算", `算得 ${r1} / ${r2} 倍，文里对不上`);
+  // c) 四个阈值比值：1280 的 10.0、1920 的 5.2 / 4.3、1.8e7 的 0.85
+  const ratios = [
+    { want: (0.35 / 0.035).toFixed(1), floor: "0.035（1280×720 验收视口）" },
+    { want: (0.35 / 0.067).toFixed(1), floor: "0.067（1920×1080）" },
+    { want: (0.35 / 0.081).toFixed(1), floor: "0.081（旧注释）" },
+    { want: (0.35 / 0.41).toFixed(2), floor: "0.410（1.8e7 夹具点）" },
+  ];
+  const missing = ratios.filter((r) => !text.includes(r.want));
+  if (!missing.length) ok("阈值/噪声底四个比值复算", ratios.map((r) => r.want).join(" / "));
+  else bad("阈值/噪声底四个比值复算", `缺 ${missing.map((r) => `${r.want}（${r.floor}）`).join("，")}`);
+
+  /**
+   * d) **前提复算**（t30 F1 那条「检查脚本能按 frameEarthMoon 的参数复算这两行」）：
+   * 相带不是拍出来的，是 `frameEarthMoon` 的三个参数推出来的——
+   * 相机放在「地月中点 + 日向 × 1.75 × sep」，所以到某颗天体的距离带是
+   * `[1.75·sep − sep/2, 1.75·sep + sep/2]`，而 `sep ∈ [a(1−e), a(1+e)]`。
+   * 这里用 a、e、1.75 现算一遍，要求文里写的四个数对得上。
+   * **注意这是「前提能不能推出来」，不是「前提对不对」**——a/e 本身是不是最新值，
+   * 它同样验不了（那是人工复核项的第一行）。
+   */
+  const A_MOON = 3.84399e8;
+  const E_MOON = 0.0549;
+  const FACTOR = 1.75;
+  const sepMin = A_MOON * (1 - E_MOON);
+  const sepMax = A_MOON * (1 + E_MOON);
+  const dMin = FACTOR * sepMin - sepMax / 2;
+  const dMax = FACTOR * sepMax + sepMax / 2;
+  const bandOf = (r) => [TAU_S * Math.log(dMin / (1.2 * r)), TAU_S * Math.log(dMax / (1.2 * r))];
+  const [earthLo, earthHi] = bandOf(6.371e6);
+  const [moonLo, moonHi] = bandOf(1.7374e6);
+  const want = {
+    dist: `${dMin.toExponential(3).replace("e+", "e")}–${dMax.toExponential(3).replace("e+", "e")}`,
+    earth: `${earthLo.toFixed(1)}–${earthHi.toFixed(1)}`,
+    moon: `${moonLo.toFixed(1)}–${moonHi.toFixed(1)}`,
+  };
+  const absent = Object.entries(want).filter(([, v]) => !text.includes(v));
+  if (!absent.length) ok("相带能从 frameEarthMoon 参数复算", `${want.dist} m → 地球 ${want.earth} s / 月球 ${want.moon} s`);
+  else bad("相带能从 frameEarthMoon 参数复算", `按 1.75、a=${A_MOON}、e=${E_MOON} 算得 ${JSON.stringify(want)}，文里缺 ${absent.map(([k, v]) => `${k}=${v}`).join("，")}`);
 }
 
 /** 纯函数：检查一段文本，返回 {checks, failures}。 */
@@ -266,8 +335,16 @@ function check(text) {
     }
   }
 
-  // 行号基准（t7 第 12 条）：没有这一行，文里的行号引用就是不可复核的。
+  for (const t of GLOBAL_TOKENS) {
+    if (text.includes(t.token)) ok(`全局：${t.label}`);
+    else bad(`全局：${t.label}`, `全文找不到「${t.token}」`);
+  }
+
+  // 来源声明：没有这两行，人工复核无从下手。
+  const hasSource = /数值来源/.test(text);
   const hasTreeNote = /行号基准/.test(text) && /git\s+[0-9a-f]{7}/.test(text);
+  if (hasSource) ok("数值来源声明", "文首记了哪些是实测");
+  else bad("数值来源声明", "文首缺「数值来源」");
   if (hasTreeNote) ok("行号引用有 tree 基准", "文首记了 git rev");
   else bad("行号引用有 tree 基准", "文首缺「行号基准：git <rev> + 工作树」");
 
@@ -306,7 +383,7 @@ function report({ checks, failures }, file) {
 }
 
 /**
- * 自检：四份反例必须都红。第四条（把用时改回 30.3）专门验算术复算真的在跑——
+ * 自检：四份反例必须都红。第四条（把月球那行改回 30.3）专门验算术复算真的在跑——
  * 它在字符串层面完全合法（30.3 是个正常数字），只有重算才抓得住。
  */
 async function selftest(text) {
@@ -325,7 +402,7 @@ async function selftest(text) {
     const i = t.indexOf("## 3 决策 2");
     const j = t.indexOf("## 4 决策 3");
     if (i < 0 || j <= i) return t;
-    return t.slice(0, i) + t.slice(i, j).replaceAll("72.3 s", "（自检抽掉的数）") + t.slice(j);
+    return t.slice(0, i) + t.slice(i, j).replaceAll("66.36 s", "（自检抽掉的数）") + t.slice(j);
   };
   const mutations = [
     {
@@ -337,7 +414,7 @@ async function selftest(text) {
           : `${text}\n（原文里找不到决策 3 段，无法造这条反例）`,
     },
     {
-      name: "只在决策 2 段里抽掉「72.3 s」",
+      name: "只在决策 2 段里抽掉「66.36 s」",
       why: "段的数字不能靠别处凑",
       text: stripFromDecision2(text),
     },
@@ -347,16 +424,23 @@ async function selftest(text) {
       text: `${text}\n\n这段是临时加的：仿佛一切都对。\n`,
     },
     {
-      name: "把月球那行的用时改回 30.3 s",
-      why: "错的数必须被算术复算抓住",
-      text: text.replace("| 72.3 s | ±10% |", "| 30.3 s | ±10% |"),
+      name: "把月球那行的起点改成 8.616e8（用时 66.36 s 不动）",
+      why: "错的数必须被算术复算抓住，而且不能靠 token 缺失去抓",
+      text: text.replace("| 5.259e8 m | 2.08488e6 m |", "| 8.616e8 m | 2.08488e6 m |"),
     },
   ];
 
   for (const m of mutations) {
     const r = check(m.text);
     if (r.failures.length === 0) problems.push(`反例「${m.name}」没有变红（${m.why}）—— 检查器漏了`);
-    else console.log(`  ✓ 反例「${m.name}」按预期变红（${r.failures.length} 项）：${r.failures[0]}`);
+    else {
+      // 算术类的反例必须由「复算」那一行变红，不能靠别处漏 token 凑出来。
+      if (m.why.includes("算术")) {
+        const hitArith = r.failures.some((f) => f.includes("复算"));
+        if (!hitArith) problems.push(`反例「${m.name}」红了，但不是算术复算抓的（${r.failures[0]}）—— 覆盖不到`);
+      }
+      console.log(`  ✓ 反例「${m.name}」按预期变红（${r.failures.length} 项）：${r.failures[0]}`);
+    }
   }
 
   console.log("");

@@ -15,8 +15,10 @@ import {
   accumulateTargetWatch,
   layerGateWitnessed,
   targetGateWitnessed,
+  targetWatchAfterSelect,
   timeGateWitnessed,
   type GateWatch,
+  type SelectionSource,
 } from "./observe";
 
 const KEY = "xinggui-settings-v1";
@@ -160,44 +162,72 @@ let lastDistanceWrite = 0;
 let lastDaysWrite = 0;
 
 /*
- * 页面上出现过玩家手势没有（t19，三条门共用）。
+ * 选中的来源（t19 立、t33 细分，三条门共用）。
  *
  * 为什么需要它：URL 深链（`?body=moon`）也会调 `select`，把 selectedId 设出来 ——
- * 零交互就能点门。批判位实测过 `?body=moon` 1.71 实秒白拿门·time。「URL 不是行为」，
- * 所以门的选中态必须能区分"点出来的"与"链接带出来的"。
+ * 零交互就能点门（批判位实测 `?body=moon` 1.71 实秒白拿门·time）。而且芯片行常驻印着名字，
+ * 点芯片同样算选中 —— 门·layer 要考"两层都不在还认不认得"，点芯片等于看着答案点。
  *
- * 判据只用一个布尔：**这次 select 调用之前，页面上有没有发生过指针 / 键盘 / 滚轮事件**。
- * 选中发生在挂载期（App 的深链那一下）⇒ 那时还没有手势 ⇒ `fromGesture = false`。
+ * 所以 `select` 在**调用那一刻**读两个模块级事实：
+ *  - `sawGesture`：页面上出现过指针/键盘/滚轮没有 —— 没有就是 URL 带出来的；
+ *  - `lastInputOnCanvas`：最近一次输入落在画布（3D）还是别处（HUD 芯片/键盘/面板）。
+ * 合成 observe.ts 的 `SelectionSource`：`"url"` / `"canvas"` / `"hud"`。
+ *
+ * 为什么是"最近一次输入"而不是让调用方传参：`select` 的调用方分布在 Hud / SolarCanvas / App
+ * 三个作用域，让每个都传来源等于把同一件事抄三遍（抄一次漂一次）。输入事件在 window 捕获阶段
+ * 先于 React 的 onClick 触发，所以读到的就是**这一下**的来源。
  *
  * 什么情况会推翻它：
  *  - **自动化/演示模式替玩家点**：Playwright 的 `locator.click()` 会真的发 pointerdown，
- *    所以夹具的点击算手势（这是对的）；但 `element.click()` 这种 DOM 直调不算 —— 夹具如果
- *    改用 `evaluate(el => el.click())` 选天体，门就会不亮，那时要回来把来源标记显式化。
+ *    所以夹具的点击算画布点选（这是对的）；`element.click()` 这种 DOM 直调不算。
+ *  - **选中不是由输入直接触发的那些路**：`finishSwitch` 排队后的那次 select 发生在相机动画回调里，
+ *    读到的是"上一次输入"（通常就是点芯片/点画布那一下）—— 这一档可以接受，因为排队的那次
+ *    和触发它的是同一动作；真要求严格，得让调用方传来源。
  *  - **最干净的修法**是让 App 的深链调用传来源（`select(id, { source: "url" })`），
- *    那要改 `App.tsx`（外壳位作用域）。这一版不动别的文件，用"手势出现过没有"这个间接判据。
+ *    那要改 `App.tsx`（外壳位作用域），这一版不做。
  */
 let sawGesture = false;
+/** 最近一次输入是否落在画布上（`<canvas>` 里面）。 */
+let lastInputOnCanvas = false;
 
-function markGesture() {
+function notePointerDown(event: PointerEvent) {
+  sawGesture = true;
+  const target = event.target as Element | null;
+  lastInputOnCanvas = Boolean(target?.closest?.("canvas"));
+}
+
+function noteKeyDown() {
+  sawGesture = true;
+  // 键盘选天体（1–9）不是画布点选
+  lastInputOnCanvas = false;
+}
+
+function noteWheel() {
   sawGesture = true;
 }
 
 if (typeof window !== "undefined") {
-  // once：一条事件只需看见一次；三条各自只留一次监听，谁先来都行
-  const once = { once: true, capture: true, passive: true } as const;
-  window.addEventListener("pointerdown", markGesture, once);
-  window.addEventListener("keydown", markGesture, once);
-  window.addEventListener("wheel", markGesture, once);
+  // 捕获阶段 + passive：先于 React 的 onClick / 画布自己的 pointerup 落地，且不拖慢滚动
+  const capture = { capture: true, passive: true } as const;
+  window.addEventListener("pointerdown", notePointerDown, capture);
+  window.addEventListener("keydown", noteKeyDown, capture);
+  window.addEventListener("wheel", noteWheel, { ...capture, once: true });
 }
 
-/** 只看不写：给 select 决定 `selectionFromGesture`，也给断言一个稳定的读法。 */
+/** 只看不写：给断言一个稳定的读法（门判据自己读的是 state 里的 `selectionSource`）。 */
 export function gestureSeen() {
   return sawGesture;
 }
 
+/** 这一下选中该算哪种来源。`select` 里调一次，别在别处重算。 */
+function selectionSourceNow(): SelectionSource {
+  if (!sawGesture) return "url";
+  return lastInputOnCanvas ? "canvas" : "hud";
+}
+
 /** 三条门共用的选中态读法（判据本体在 observe.ts 的 GateWatch 上）。 */
-function gateWatch(s: Pick<SimStore, "selectedId" | "selectionFromGesture">): GateWatch {
-  return { selectedId: s.selectedId, fromGesture: s.selectionFromGesture };
+function gateWatch(s: Pick<SimStore, "selectedId" | "selectionSource">): GateWatch {
+  return { selectedId: s.selectedId, source: s.selectionSource };
 }
 
 type GateSlice = {
@@ -207,8 +237,8 @@ type GateSlice = {
   gateSeen: number;
   /** 最近一次写盘失败：只用来在面板上说一句真话，**不参与判定**。 */
   gatePersistFailed: boolean;
-  /** 当前这次选中的来源：`true` = 玩家手势点的，`false` = 页面加载/URL 带出来的（t19）。 */
-  selectionFromGesture: boolean;
+  /** 当前这次选中的来源：`"url"` / `"canvas"` / `"hud"`（t19 立、t33 细分，三条门共用）。 */
+  selectionSource: SelectionSource;
   /**
    * 门·target 的累积量（**模拟秒**，不是实秒）：只累计"水星被玩家选中"的那几段。
    * 0 = 刚开始看；≥ `TARGET_GATE_ORBIT_SECONDS`（水星一个 period，8.2 模拟秒）就算看完一圈。
@@ -373,7 +403,7 @@ export const useSim = create<SimStore>((set, get) => {
   gateUnlockedAt: null,
   gateSeen: 0,
   gatePersistFailed: false,
-  selectionFromGesture: false,
+  selectionSource: "url",
   mercuryWatchSeconds: 0,
 
   // 切换中禁「暂停 / 调速」：这两个动作会和切换里写进去的 speed / paused 打架，
@@ -391,11 +421,14 @@ export const useSim = create<SimStore>((set, get) => {
     // 高倍率只是让它来得快，低倍率也不是"没等"）。
   },
   /*
-   * 门·符号（t28 → t19 收紧）：**名称与轨道都不在的时候选得中一颗行星**才算。
+   * 门·符号（t28 → t19 收紧 → t33 只认画布）：**名称与轨道都不在的时候，在画布上点得中一颗行星**才算。
    *
    * 旧口径（t28）是"同时关掉两层就亮"——那还是"摸过控件"：两个按钮各点一下，两下通关。
-   * t19 起开关本身一次都不点门，判据搬到 `select` 里，看的是"没有名字和轨道线，你还认得出谁"。
+   * t19 起开关本身一次都不点门，判据搬到 `select` 里；t33 再收紧：只认**画布点选**，
+   * 芯片行常驻印着名字，点芯片等于看着答案点（那是观察位 t29 判读出来的第二条硬伤）。
    * 尾迹始终不算：它不是导航符号，关掉它证明不了任何事。
+   *
+   * 这里只写判据检查什么，不抄界面提示的原文 —— 提示改过两轮，注释抄一次漂一次。
    */
   toggleLabels: () => {
     set((s) => ({ showLabels: !s.showLabels }));
@@ -419,21 +452,25 @@ export const useSim = create<SimStore>((set, get) => {
       return;
     }
     /*
-     * 选中来源（t19）：**这个布尔决定三条门认不认这次选中**。
-     * 深链（App.tsx 的 `?body=`）也走这个函数，但它发生在任何手势之前 ⇒ fromGesture=false。
-     * 另外每次选中都把门·target 的累计清零：换目标就是"没在看了"，从头来。
+     * 选中来源（t19 / t33）：**它决定三条门认不认这次选中**，也决定门·layer 认不认"点得中"。
+     * 深链（App.tsx 的 `?body=`）也走这个函数，但它发生在任何输入之前 ⇒ `"url"`。
+     *
+     * 门·target 的累计**只在换目标时清零**（t33）：玩家"再点一下确认是这颗"不该白等，
+     * 所以同一颗的重复选中保留已看的时长（规则本体在 observe.ts 的 `targetWatchAfterSelect`）。
      */
-    const fromGesture = gestureSeen();
-    if (selectedId && selectedId !== s.selectedId) {
-      set({ selectedId, hops: s.hops + 1, selectionFromGesture: fromGesture, mercuryWatchSeconds: 0 });
-    } else {
-      set({ selectedId, selectionFromGesture: fromGesture, mercuryWatchSeconds: 0 });
-    }
+    const source = selectionSourceNow();
+    const changed = selectedId !== s.selectedId;
+    set({
+      selectedId,
+      hops: selectedId && changed ? s.hops + 1 : s.hops,
+      selectionSource: source,
+      mercuryWatchSeconds: targetWatchAfterSelect(s.mercuryWatchSeconds, s.selectedId, selectedId),
+    });
     const after = get();
     /*
-     * 门·符号（t19）：**名称与轨道都不在的时候还选得中一颗行星**。
-     * 判据本体在 observe.ts 的 `layerGateWitnessed`；这里只负责"在选中那一刻问一次"。
-     * 开关本身一次都不点门（见 toggleLabels / toggleOrbits 的注释）。
+     * 门·符号（t19 / t33）：**名称与轨道都不在的时候，在画布上点得中一颗行星**。
+     * 判据本体在 observe.ts 的 `layerGateWitnessed`（它自己要求 `source === "canvas"`）；
+     * 这里只负责"在选中那一刻问一次"。开关本身一次都不点门（见 toggleLabels / toggleOrbits 的注释）。
      */
     if (layerGateWitnessed(gateWatch(after), after.showLabels, after.showOrbits)) after.hitGate("layer");
     /*

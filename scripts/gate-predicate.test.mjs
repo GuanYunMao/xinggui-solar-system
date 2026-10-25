@@ -30,6 +30,7 @@ import {
   sandboxEclipse,
   sandboxEclipseGeometry,
   targetGateWitnessed,
+  targetWatchAfterSelect,
   timeGateWitnessed,
   umbraRadiusAtDistance,
   umbraSlope,
@@ -170,8 +171,8 @@ console.log(`\n=== ④ 掠食边界：相切算没进影 ===\n`);
 console.log(`\n=== ⑤ 门·time 要「选中月球」才算（t13）===\n`);
 {
   ok(TIME_GATE_TARGET === "moon", `门要看的天体 = ${TIME_GATE_TARGET}`);
-  const watched = (selectedId) => ({ selectedId, fromGesture: true });
-  const fromUrl = (selectedId) => ({ selectedId, fromGesture: false });
+  const watched = (selectedId) => ({ selectedId, source: "hud" });
+  const fromUrl = (selectedId) => ({ selectedId, source: "url" });
 
   // 同一段推进，只改"选中了谁"：这是 t13 修的那个洞的正面/反面
   // 真进入点是 18.5769（0.0005 步长扫出来的）；eclipseEntry 返回**第一个在影里的采样点**，
@@ -211,16 +212,18 @@ console.log(`\n=== ⑥ 门·target：看水星跑完一整圈（t19）===\n`);
   const realSeconds = TARGET_GATE_ORBIT_SECONDS / (8 * (18 / 365.25));
   ok(realSeconds > 20 && realSeconds < 21.5, `8× 下需要看 ${realSeconds.toFixed(2)} 实秒（判据说"约 21 实秒"）`);
 
-  const watch = (selectedId, fromGesture = true) => ({ selectedId, fromGesture });
-  // 正例：水星被手势选中，时间在前进
-  ok(accumulateTargetWatch(0, 4, watch("mercury")) === 4, "选中水星 + 手势 ⇒ 累积 4 模拟秒");
+  const watch = (selectedId, source = "hud") => ({ selectedId, source });
+  // 正例：水星被玩家选中，时间在前进
+  ok(accumulateTargetWatch(0, 4, watch("mercury")) === 4, "选中水星 + 玩家动作 ⇒ 累积 4 模拟秒");
   const near = accumulateTargetWatch(8.1, 0.05, watch("mercury"));
   ok(Math.abs(near - 8.15) < 1e-9 && targetGateWitnessed(near) === false, `8.1 + 一帧 0.05 = ${near} → 还差一点，不亮`);
   ok(targetGateWitnessed(accumulateTargetWatch(near, 0.06, watch("mercury"))) === true, "再攒一帧越过 8.2 → 亮");
+  // 画布点选与芯片一样算"玩家动作"（这门只问有没有看它，不问在哪点的）
+  ok(accumulateTargetWatch(0, 4, watch("mercury", "canvas")) === 4, "画布点选水星 ⇒ 同样累积");
   // 反例：换目标 / URL 带出来 / 没选中
   ok(accumulateTargetWatch(6, 1, watch("venus")) === 0, "选中金星 ⇒ 归零（换目标就是没在看了）");
   ok(accumulateTargetWatch(6, 1, watch(null)) === 0, "没选中 ⇒ 归零");
-  ok(accumulateTargetWatch(6, 1, watch("mercury", false)) === 0, "水星是 URL 带出来的选中 ⇒ 归零（?body=mercury 白拿不了）");
+  ok(accumulateTargetWatch(6, 1, watch("mercury", "url")) === 0, "水星是 URL 带出来的选中 ⇒ 归零（?body=mercury 白拿不了）");
   // 暂停（dt ≤ 0）不作废已经看过的时长
   ok(accumulateTargetWatch(6, 0, watch("mercury")) === 6, "暂停一帧（dt=0）⇒ 保留 6，不清零");
   ok(accumulateTargetWatch(Number.NaN, 1, watch("mercury")) === 1, "上一帧的累计是 NaN ⇒ 当成 0 再加，不污染");
@@ -228,20 +231,39 @@ console.log(`\n=== ⑥ 门·target：看水星跑完一整圈（t19）===\n`);
   ok(targetGateWitnessed(8.19) === false, "8.19 模拟秒（差一点）→ 不亮");
   ok(targetGateWitnessed(8.2) === true, "8.2 模拟秒（刚好一整圈）→ 亮");
   ok(targetGateWitnessed(0) === false && targetGateWitnessed(-3) === false, "0 和负数都不亮");
+
+  /*
+   * t33 ①：**再点同一颗不清零**（观察位 t29：玩家"点一下确认自己选的是哪颗"就白等）。
+   * 归零只发生在选中真的换成别的天体时。
+   */
+  ok(targetWatchAfterSelect(6.2, "mercury", "mercury") === 6.2, "再点一次水星 ⇒ 6.2 保留（不清零）");
+  ok(targetWatchAfterSelect(6.2, "mercury", "venus") === 0, "换到金星 ⇒ 归零");
+  ok(targetWatchAfterSelect(6.2, "mercury", null) === 0, "回总览（选成空）⇒ 归零");
+  ok(targetWatchAfterSelect(6.2, null, "mercury") === 0, "从空里选出水星 ⇒ 从 0 开始");
+  ok(targetWatchAfterSelect(Number.NaN, "mercury", "mercury") === 0, "上一份累计是 NaN ⇒ 当成 0，不污染");
+  ok(targetWatchAfterSelect(-3, "mercury", "mercury") === 0, "负数 ⇒ 当成 0");
+  // 与累积器串起来：点一下确认、接着看，等于没被打断
+  const kept = targetWatchAfterSelect(7.9, "mercury", "mercury");
+  ok(targetGateWitnessed(accumulateTargetWatch(kept, 0.35, watch("mercury"))) === true, "7.9 + 再点一次不清零 + 0.35 ⇒ 越过 8.2 亮");
 }
 
-console.log(`\n=== ⑦ 门·layer：名称与轨道都不在，还选得中一颗行星（t19）===\n`);
+console.log(`\n=== ⑦ 门·layer：名称与轨道都不在，还得在画布上指得出来（t19 / t33）===\n`);
 {
-  const watch = (selectedId, fromGesture = true) => ({ selectedId, fromGesture });
-  ok(layerGateWitnessed(watch("mars"), false, false) === true, "两层都关 + 选中火星（手势）→ 亮");
+  const watch = (selectedId, source = "canvas") => ({ selectedId, source });
+  ok(layerGateWitnessed(watch("mars"), false, false) === true, "两层都关 + 画布点中火星 → 亮");
   ok(layerGateWitnessed(watch("earth"), false, false) === true, "任意行星都行（地球）");
   ok(layerGateWitnessed(watch("mercury"), false, false) === true, "任意行星都行（水星）");
   ok(layerGateWitnessed(watch("mars"), true, false) === false, "名称还开着 → 不亮");
   ok(layerGateWitnessed(watch("mars"), false, true) === false, "轨道还开着 → 不亮");
   ok(layerGateWitnessed(watch("mars"), true, true) === false, "两层都开着 → 不亮");
-  ok(layerGateWitnessed(watch("moon"), false, false) === false, "选中月球（卫星）不算 —— 卫星行本来就是靠母行星找出来的");
-  ok(layerGateWitnessed(watch("sun"), false, false) === false, "太阳不算行星（它不靠轨道线也认得出）");
-  ok(layerGateWitnessed(watch("mars", false), false, false) === false, "URL 带出来的选中不算（图层是持久化的，光开链接能白拿）");
+  ok(layerGateWitnessed(watch("moon"), false, false) === false, "画布点中月球（卫星）不算 —— 卫星行本来就是靠母行星找出来的");
+  ok(layerGateWitnessed(watch("sun"), false, false) === false, "太阳不算行星（它在画面正中被认出来跟轨道线无关）");
+  ok(layerGateWitnessed(watch("mars", "url"), false, false) === false, "URL 带出来的选中不算（图层是持久化的，光开链接能白拿）");
+  ok(
+    layerGateWitnessed(watch("mars", "hud"), false, false) === false,
+    "点芯片选中火星（source=hud）不算 —— 芯片行常驻印着名字，那是看着答案点（t33）",
+  );
+  ok(layerGateWitnessed(watch("jupiter", "hud"), false, false) === false, "芯片点别的行星同样不算");
   ok(layerGateWitnessed(watch(null), false, false) === false, "没选中 → 不亮");
   ok(layerGateWitnessed(watch("nope"), false, false) === false, "不存在的天体 id → 不亮，不炸");
 }
@@ -306,6 +328,30 @@ console.log(`\n=== ⑧ 槽位表：只放可达的 ===\n`);{
   ok(
     flippedBack.ok === false && flippedBack.reason === "checksum",
     `本版码 ${goodCode} 把校验字符 ${last}→${bumped} → ${JSON.stringify(flippedBack)}`,
+  );
+
+  /*
+   * 校验先于版本（t25 / t8-F2）：**坏 CRC + 错版本** 必须报 checksum。
+   * 这是"打错一个字"的典型形状：payload 里错一位 → 版本位跟着变成别的数、CRC 也对不上。
+   * 旧顺序会先看到版本位就说「这个码来自别的版本」，把打错字的人打发去翻旧存档。
+   */
+  const typo = "XG1-" + payloadChars + "-" + alphabet[(v1Check + 1) & 31] + alphabet[(v1Check >>> 5) & 7];
+  const typoBack = decodeGate(typo);
+  ok(
+    typoBack.ok === false && typoBack.reason === "checksum",
+    `坏 CRC + 错版本（老 v1 payload 翻掉一个校验字符：${typo}）→ ${JSON.stringify(typoBack)}`,
+  );
+  // 面板输入框的占位符本身就是这个形状（version 位 = 5、CRC 对不上），必须报 checksum
+  const placeholderBack = decodeGate("XG1-ABCDE-FG");
+  ok(
+    placeholderBack.ok === false && placeholderBack.reason === "checksum",
+    `面板占位符 XG1-ABCDE-FG → ${JSON.stringify(placeholderBack)}（玩家随手点「恢复」不该听到"来自别的版本"）`,
+  );
+  // 同一份 payload、正确的校验字符 → 仍然报 version（老码的 CRC 本来就是有效的）
+  const versionBack = decodeGate(v1Code);
+  ok(
+    versionBack.ok === false && versionBack.reason === "version",
+    `同一 payload、CRC 正确（${v1Code}）→ ${JSON.stringify(versionBack)}（一码归一码）`,
   );
 }
 

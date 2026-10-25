@@ -11,10 +11,10 @@
 //  3. **不改 src/**：玩家视角，看见 bug 记录不修。
 //
 // ── v1.3.0 相对上一版新增/变化的可测面 ──────────────────────────────────────
-//  · 门三条从「摸过控件」改成「可判定的观察」（ModeBadge COPY）：
-//      time   = 让地球走完一年   → daysOf(simSeconds) ≥ 365.25（store.ts:405）
-//      target = 找出跑得最快的那颗 → selectedId === "mercury"（store.ts:377）
-//      layer  = 关掉名称和轨道    → 两者同时 false（store.ts:345-350）
+//  · 门三条从「摸过控件」改成「可判定的观察」（t19，判据在 observe.ts）：
+//      time   = 月球进地球本影那一刻它正被玩家选中 → eclipseEntry + selectedId==="moon" + source!=="url"
+//      target = 盯着水星跑满一整圈（累积 8.2 模拟秒 ≈ 8× 下 20.8 实秒）→ mercuryWatchSeconds ≥ period
+//      layer  = 名称与轨道都不在时，还**在画布上点得中**一颗行星 → layerGateWitnessed 要求 source==="canvas"
 //    面板每行带 data-gate-hint / data-lit，右侧写「✓ 已完成 / 未完成」（ModeBadge.tsx:271-284）；
 //    解锁那一刻弹 .gate-celebrate（2600ms，ModeBadge.tsx:106-114/377）。
 //  · 实境 HUD 从「只有徽标」变成 RealHud：回沙盘 / 距离读数 / 地球取景 / 月球取景（Hud.tsx:381-460）。
@@ -419,6 +419,49 @@ async function gateHints(page) {
   );
 }
 
+/**
+ * 门存档（产品自己写的 localStorage）：断言读它，不必为了看一格灯反复开关面板。
+ * 键名是历史（v1），不是 schema 版本 —— 见 gate.ts 的 GATE_KEY 注释。
+ */
+async function gateLit(page) {
+  return page.evaluate(() => {
+    try {
+      const raw = window.localStorage.getItem("xinggui-gate-v1");
+      const parsed = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed?.lit) ? parsed.lit : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+/**
+ * 画布点选夹具（t33）：挑一颗在屏幕上、离其他天体 ≥30px、且该点确实落在 canvas 上的行星。
+ * 30px 让 22px 的拾取热区不互相重叠；elementFromPoint 保证别点到 HUD。
+ */
+async function canvasPickPlanet(page) {
+  return page.evaluate(() => {
+    const planets = ["mercury", "venus", "earth", "mars", "jupiter", "saturn", "uranus", "neptune"];
+    const bodies = window.__solarProbe?.() ?? [];
+    let best = null;
+    for (const b of bodies) {
+      if (!planets.includes(b.id)) continue;
+      if (!(Number.isFinite(b.x) && Number.isFinite(b.y))) continue;
+      if (b.x < 2 || b.y < 2 || b.x > innerWidth - 2 || b.y > innerHeight - 2) continue;
+      let nearest = Infinity;
+      for (const o of bodies) {
+        if (o.id === b.id) continue;
+        nearest = Math.min(nearest, Math.hypot(o.x - b.x, o.y - b.y));
+      }
+      const el = document.elementFromPoint(b.x, b.y);
+      if (!el || el.tagName !== "CANVAS") continue;
+      if (nearest < 30) continue;
+      if (!best || nearest > best.gap) best = { id: b.id, x: +b.x.toFixed(1), y: +b.y.toFixed(1), gap: +nearest.toFixed(1) };
+    }
+    return best;
+  });
+}
+
 async function pickBody(page, step, id) {
   await ensureChips(page, step); // 顶部星球行会自己收起，先把它叫回来
   const chip = page.locator(`#chip-${id}`);
@@ -640,12 +683,10 @@ try {
     return { hints };
   });
 
-  // 3. 门·time：让地球走完一年
-  //    走真控件：设定时刻 → 年=2 → 应用。玩家完全走得通这条路（不是夹具捷径：
-  //    setSimTime 之后下一帧 advanceSim 才算 daysOf ≥ 365.25，与"等一年"同一条判定）。
-  //    ⚠ 别等 [data-gate-hint]：那三行只在面板打开时存在。第一版我在这儿等 DOM 节点，
-  //    面板关着一律超时，白等 25s 还误报"没点亮"——等状态，再开面板看 UI。
-  await run(page, "03-gate-time", "门·time：让地球走完一年", async () => {
+  // 3. 门·time：**跳年不亮**（t13/t19 口径），选中月球等进入本影才亮
+  //    旧版这一步是「跳到第 2 年 → 断言 time 亮」—— 旧判据把"钟走过去了"当"你看着它走过去"，
+  //    那正是 1.3.4 拆掉的东西。现在跳变不判：只有从外进影、且那一刻月球被玩家选中才判。
+  await run(page, "03-gate-time", "门·time：跳年不亮，选中月球等本影", async () => {
     await page.keyboard.press("Escape"); // 关掉 step02 打开的面板
     await ensureDock(page, "03-gate-time");
     await page.locator(sel.timeTrigger).first().click();
@@ -662,28 +703,75 @@ try {
       expected: "days ≈ 730.5",
       actual: (e) => ({ days: window.__solarTime.days(), want: e }),
     });
-    await openCalibration(page, "03-gate-time");
-    const hints = await gateHints(page);
-    const time = hints.find((h) => h.slot === "time");
-    if (!time?.lit) throw new StepError("03-gate-time", "走到第 2 年后 time 仍未点亮", 'data-lit="true"', JSON.stringify(hints));
-    return { days: await page.evaluate(() => window.__solarTime.days()), hints };
+    const afterJump = await gateLit(page);
+    if (afterJump.includes("time")) {
+      throw new StepError(
+        "03-gate-time",
+        `跳到第 2 年后 time 当场亮了（lit=${JSON.stringify(afterJump)}）—— 跳变不该算目击`,
+        'lit 不含 "time"',
+        JSON.stringify({ lit: afterJump, days: await page.evaluate(() => window.__solarTime.days()) }),
+      );
+    }
+    // 选中地球 → 月球，等"进入本影"（8× 下下一次进影在几实秒内）
+    await pickBody(page, "03-gate-time", "earth");
+    await pickBody(page, "03-gate-time", "moon");
+    const waited = await until(
+      page,
+      "03-gate-time",
+      "选中月球 25s 内 time 仍未点亮",
+      () => (JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || []).includes("time"),
+      undefined,
+      {
+        timeout: 25000,
+        expected: 'xinggui-gate-v1 的 lit 含 "time"',
+        actual: () => ({
+          lit: JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || [],
+          sim: window.__solarTime.now(),
+        }),
+      },
+    );
+    return { lit: await gateLit(page), jumpLit: afterJump, waitedMs: waited, days: await page.evaluate(() => window.__solarTime.days()) };
   });
 
-  // 4. 门·target：找出跑得最快的那颗（水星）
-  await run(page, "04-gate-target", "门·target：选中水星", async () => {
+  // 4. 门·target（t19）：点一下不亮；盯着水星跑满一整圈（8.2 模拟秒 ≈ 8× 下 20.8 实秒）才亮
+  await run(page, "04-gate-target", "门·target：盯水星跑满一整圈", async () => {
+    const before = await gateLit(page);
     await pickBody(page, "04-gate-target", "mercury");
-    await openCalibration(page, "04-gate-target");
-    await until(page, "04-gate-target", "选中水星后 target 这条没点亮", () => Boolean(document.querySelector('[data-gate-hint="target"][data-lit="true"]')), undefined, {
-      expected: '[data-gate-hint="target"] data-lit="true"',
-      actual: () => ({ hints: [...document.querySelectorAll("[data-gate-hint]")].map((e) => [e.getAttribute("data-gate-hint"), e.getAttribute("data-lit")]) }),
-    });
-    return { hints: await gateHints(page) };
+    const justClicked = await gateLit(page);
+    if (justClicked.includes("target")) {
+      throw new StepError(
+        "04-gate-target",
+        `点一次 #chip-mercury 就亮了 target（lit=${JSON.stringify(justClicked)}）—— 这一格又退回「点到就算」`,
+        '点一次后 lit 不含 "target"',
+        JSON.stringify({ before, justClicked }),
+      );
+    }
+    const waited = await until(
+      page,
+      "04-gate-target",
+      "盯着水星 35s 仍未点亮 target",
+      () => (JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || []).includes("target"),
+      undefined,
+      {
+        timeout: 35000,
+        expected: 'lit 含 "target"（跑满一圈 8.2 模拟秒）',
+        actual: () => ({
+          lit: JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || [],
+          sim: window.__solarTime.now(),
+        }),
+      },
+    );
+    return { lit: await gateLit(page), waitedMs: waited, litAfterClick: justClicked };
   });
 
-  // 5. 门·layer：关掉名称和轨道（两者同时 false）
-  await run(page, "05-gate-layer", "门·layer：关掉名称和轨道", async () => {
+  // 5. 门·layer（t19）：先关名称与轨道，**再点一颗行星**（太阳与卫星不算）
+  await run(page, "05-gate-layer", "门·layer：关层后再选一颗行星", async () => {
     await page.keyboard.press("Escape");
     await ensureDock(page, "05-gate-layer");
+    const before = await gateLit(page);
+    if (before.includes("layer")) {
+      throw new StepError("05-gate-layer", `进这一步前 layer 已经亮了（lit=${JSON.stringify(before)}）`, 'lit 不含 "layer"', JSON.stringify(before));
+    }
     for (const label of ["名称", "轨道"]) {
       await page.locator(`button[aria-label="${label}"]`).first().click();
       await until(page, "05-gate-layer", `「${label}」没关掉`, (a) => document.querySelector(`button[aria-label="${a}"]`)?.getAttribute("aria-pressed") === "false", label, {
@@ -691,13 +779,48 @@ try {
         actual: (a) => ({ [a]: document.querySelector(`button[aria-label="${a}"]`)?.getAttribute("aria-pressed") ?? "按钮不在" }),
       });
     }
+    // 只关开关不选天体：layer 不许亮（"摸过控件"不是判据）
+    const justToggled = await gateLit(page);
+    if (justToggled.includes("layer")) {
+      throw new StepError(
+        "05-gate-layer",
+        `只关了名称与轨道（还没选天体）layer 就亮了（lit=${JSON.stringify(justToggled)}）—— 判据退回「摸过开关」`,
+        'lit 不含 "layer"',
+        JSON.stringify(justToggled),
+      );
+    }
+    /*
+     * 正例必须**画布点选**（t33）：layer 门只认 source === "canvas"——芯片行常驻印着名字，
+     * 点芯片等于看着答案点。三步：回总览清掉 selectedId（否则点到已选中的那颗走 refocus()，
+     * 不经 select）→ 用 __solarProbe 挑一颗在屏幕上、离其他天体 ≥30px 的行星 → 鼠标真点它的坐标。
+     */
+    await ensureDock(page, "05-gate-layer");
+    await page.locator(sel.overview).first().click();
+    await page.waitForTimeout(1800);
+    const pick = await canvasPickPlanet(page);
+    if (!pick) {
+      throw new StepError("05-gate-layer", "画布上找不到「离其他天体 ≥30px 且该点落在 canvas 上」的行星", "≥1 个候选", JSON.stringify(await page.evaluate(() => window.__solarProbe?.() ?? [])));
+    }
+    await page.mouse.click(pick.x, pick.y);
+    const waited = await until(
+      page,
+      "05-gate-layer",
+      `关层后在画布上点 ${pick.id}（${pick.x},${pick.y}）8s 内 layer 仍未点亮`,
+      () => (JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || []).includes("layer"),
+      undefined,
+      {
+        timeout: 8000,
+        expected: 'lit 含 "layer"',
+        actual: () => ({ lit: JSON.parse(window.localStorage.getItem("xinggui-gate-v1") || "{}").lit || [] }),
+      },
+    );
     // 三条齐了 → 解锁瞬间会弹 .gate-celebrate（2600ms），马上开面板并截图
     const t0 = Date.now();
     await openCalibration(page, "05-gate-layer");
     const celeb = await page.evaluate(() => (document.querySelector(".gate-celebrate")?.textContent || "").trim() || null);
     const hints = await gateHints(page);
     if (hints.filter((h) => h.lit).length !== 3) throw new StepError("05-gate-layer", "三条都做完了却不是 3/3", "三条 data-lit 全 true", JSON.stringify(hints));
-    return { hints, celebrateText: celeb, celebrateSeenMs: Date.now() - t0 };
+    return { hints, celebrateText: celeb, celebrateSeenMs: Date.now() - t0, waitedMs: waited, litAfterToggles: justToggled };
   });
 
   // 5b. 解锁之后：玩家怎么知道"实境"能进去了？

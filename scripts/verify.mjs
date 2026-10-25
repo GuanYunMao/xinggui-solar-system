@@ -2263,6 +2263,18 @@ try {
   const XG_GATE_KEY = "xinggui-gate-v1";
   const XG_VISITED_KEY = "xinggui-visited-v1";
   const XG_HINT_FORBIDDEN = /推进|关闭|选择|锁定|打开|切换/;
+  /*
+   * 三条提示 + 规则行的**逐字快照**（t35）。外壳位改文案时改这一处，然后同步断言 ——
+   * 批判位在 t8 就点过「文案没有 pass/fail」：只数行数和 data-lit，改回旧句子不会红。
+   * `GATE_RULES_TOKENS` 是规则行里必须出现的两个等待时间（8× 与 1×）。
+   */
+  const GATE_HINT_COPY = {
+    time: "月球进影子时，它正被选中",
+    target: "选中水星，看它明暗走完一轮",
+    layer: "名称与轨道都不在，画面上点得中",
+  };
+  const GATE_RULES_COPY = "三条不分先后；第二条盯住水星别换，8× 约 20.8 秒、1× 约 166 秒。";
+  const GATE_RULES_TOKENS = ["20.8", "166"];
   const XG_REAL_CONTROLS = ["沙盘", "实境", "校准", "回沙盘", "地球取景", "月球取景"];
   const XG_UNLOCK_PASSES = [
     "gate-time-coldstart",
@@ -2323,6 +2335,7 @@ try {
         valueNow: bar ? Number(bar.getAttribute("aria-valuenow")) : null,
         valueMax: bar ? Number(bar.getAttribute("aria-valuemax")) : null,
         countText: panel?.querySelector(".calibration-count")?.textContent?.replace(/\s+/g, " ").trim() ?? null,
+        rules: panel?.querySelector("[data-gate-rules]")?.textContent?.replace(/\s+/g, " ").trim() ?? null,
         hints,
         modeSwitch: document.querySelectorAll(".mode-switch").length,
         modeLocked: document.querySelectorAll(".mode-locked").length,
@@ -2372,6 +2385,50 @@ try {
     });
     return { ok, speed: now };
   }
+
+  /**
+   * 画布点选夹具（t33）：layer 门只认 `source === "canvas"`，所以正例必须在画布上真点一下。
+   * 挑一颗**在屏幕上、离其他天体 ≥30px、且该点确实落在 canvas 上**的行星 ——
+   * 30px 是为了让 22px 的拾取热区不互相重叠，elementFromPoint 是为了别点到 HUD。
+   */
+  const CANVAS_PICK_PLANETS = ["mercury", "venus", "earth", "mars", "jupiter", "saturn", "uranus", "neptune"];
+  const CANVAS_PICK_GAP = 30;
+  const readCanvasPick = (page) =>
+    page.evaluate(
+      ({ planets, gap }) => {
+        const bodies = window.__solarProbe?.() ?? [];
+        const visible = bodies.filter(
+          (b) => Number.isFinite(b.x) && Number.isFinite(b.y) && b.x > 2 && b.y > 2 && b.x < innerWidth - 2 && b.y < innerHeight - 2,
+        );
+        const candidates = [];
+        for (const b of visible) {
+          if (!planets.includes(b.id)) continue;
+          let nearest = Infinity;
+          let nearestId = null;
+          for (const o of bodies) {
+            if (o.id === b.id) continue;
+            const d = Math.hypot(o.x - b.x, o.y - b.y);
+            if (d < nearest) {
+              nearest = d;
+              nearestId = o.id;
+            }
+          }
+          const el = document.elementFromPoint(b.x, b.y);
+          candidates.push({
+            id: b.id,
+            x: +b.x.toFixed(1),
+            y: +b.y.toFixed(1),
+            nearest: +nearest.toFixed(1),
+            nearestId,
+            onCanvas: Boolean(el && el.tagName === "CANVAS"),
+            hit: el?.tagName ?? null,
+          });
+        }
+        const ok = candidates.filter((c) => c.onCanvas && c.nearest >= gap).sort((a, b) => b.nearest - a.nearest);
+        return { probes: bodies.length, onScreen: visible.length, candidates, pick: ok[0] ?? null };
+      },
+      { planets: CANVAS_PICK_PLANETS, gap: CANVAS_PICK_GAP },
+    );
 
   async function runUnlockFlow(browser, base) {
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
@@ -2424,20 +2481,31 @@ try {
         out.litAfterResume = await readGateStorage(page);
       });
 
-      // ② 选中月球后连续推进：进入本影那一刻月球被选中，门才亮
-      await stage("witness", async () => {
-        await page.locator('button[aria-label="暂停模拟"]').first().click();
-        await page.waitForTimeout(150);
+      // ② 门·layer 的顺序：**先选行星、后关层**必须不亮（t19 口径：认得出 ≠ 摸过控件）
+      await stage("layer-negative", async () => {
         await ensureHudVisible(page);
-        await page.locator("#chip-earth").click({ timeout: 8000 });
-        await page.waitForTimeout(600);
+        out.layersOn = await page.evaluate(() => ({
+          labels: document.querySelector('button[aria-label="名称"]')?.getAttribute("aria-pressed"),
+          orbits: document.querySelector('button[aria-label="轨道"]')?.getAttribute("aria-pressed"),
+        }));
+        await page.locator("#chip-mars").first().click({ timeout: 8000 });
+        await page.waitForTimeout(400);
+        const gate = await readGateStorage(page);
+        out.layerNegative = { selected: "mars", lit: gate.lit, simNow: await page.evaluate(() => window.__solarTime.now()) };
+      });
+
+      // ③ 门·time：选中月球（真手势）→ 8× 推进到进入本影
+      await stage("time", async () => {
+        await ensureHudVisible(page);
+        await page.locator("#chip-earth").first().click({ timeout: 8000 });
+        await page.waitForTimeout(700);
         const moonChipCount = await page.locator("#chip-moon").count();
-        if (moonChipCount > 0) await page.locator("#chip-moon").first().click({ timeout: 8000 });
+        if (moonChipCount === 0) throw new Error("选中地球后没有 #chip-moon —— 选不到月球，time 门判据失去对象");
+        await page.locator("#chip-moon").first().click({ timeout: 8000 });
         await page.waitForTimeout(400);
         out.selectedTitle = await page.evaluate(() => document.querySelector("article h2")?.innerText?.trim() ?? null);
         await ensureHudVisible(page);
         out.speedHigh = await setSpeedTo(page, 7); // 8×
-        await page.locator('button[aria-label="继续模拟"]').first().click();
         const startedApprox = Date.now();
         let gate = await readGateStorage(page);
         while (Date.now() - startedApprox < 20000 && !gate.lit.includes("time")) {
@@ -2452,31 +2520,86 @@ try {
         };
       });
 
-      // ③ 第三格 target（水星）+ layer（名称与轨道都不在）→ 解锁
-      await stage("target-layer", async () => {
+      // ④ 门·target（t19）：点一下就亮 = 作业；要**盯着水星跑满一整圈**（8.2 模拟秒 ≈ 8× 下 20.8 实秒）
+      await stage("target", async () => {
         await ensureHudVisible(page);
-        await page.locator("#chip-mercury").click({ timeout: 8000 });
+        // sim0 必须在**点击之前**读：累积从 select 那一刻起算，点完再读会把 400ms 的等待算丢
+        out.target = { speed: await page.evaluate(() => Number(document.querySelector('input[aria-label="模拟速度"]')?.getAttribute("aria-valuenow"))), sim0: await page.evaluate(() => window.__solarTime.now()), lit0: null, midAt: null, midLit: null, simAtMidRead: null };
+        out.target.midAt = out.target.sim0 + 5.0;
+        await page.locator("#chip-mercury").first().click({ timeout: 8000 });
         await page.waitForTimeout(400);
+        out.target.lit0 = (await readGateStorage(page)).lit;
+        const t0 = Date.now();
+        let gate = await readGateStorage(page);
+        // 轮询而不是 sleep：机制位实测 8× 下约 20.8 实秒才亮，写死 sleep 在慢机器上会翻车
+        while (Date.now() - t0 < 35000 && !gate.lit.includes("target")) {
+          await page.waitForTimeout(150);
+          const simNow = await page.evaluate(() => window.__solarTime.now());
+          if (out.target.midLit === null && simNow >= out.target.midAt) {
+            out.target.midLit = (await readGateStorage(page)).lit;
+            out.target.simAtMidRead = simNow;
+          }
+          gate = await readGateStorage(page);
+        }
+        out.target.waitedMs = Date.now() - t0;
+        out.target.lit = gate.lit;
+        out.target.simAtLit = await page.evaluate(() => window.__solarTime.now());
+      });
+
+      // ⑤ 门·layer（t19 正向）：先关名称与轨道，**再点一颗行星**
+      await stage("layer-positive", async () => {
         await ensureHudVisible(page);
-        /*
-         * layer 门的判定输入就是这两次点击：1280 宽底栏直接摊着「名称 / 轨道」，
-         * **没有「图层」那个按钮**——它只在 compact 分支里（Hud.tsx:1528），点它必 8s 超时，
-         * 然后 gate-unlock / realm-controls 一起级联红。
-         * 这里写死宽屏的真实交互，不再用 count()>0 分支：分支会把「按钮没了」变成静默跳过，
-         * 而按钮没了正是这条判据最该知道的事。数量不对就抛错，红在 stage 上、带计数。
-         */
         const layerButtons = {};
+        const layerBefore = {};
         for (const label of ["名称", "轨道"]) {
           const btn = page.locator(`button[aria-label="${label}"]`);
           layerButtons[label] = await btn.count();
           if (layerButtons[label] !== 1) {
             throw new Error(`1280 宽底栏应有 1 个「${label}」按钮，实际 ${layerButtons[label]} 个 —— 夹具前提坏了`);
           }
+          layerBefore[label] = await btn.first().getAttribute("aria-pressed");
+          if (layerBefore[label] !== "true") {
+            throw new Error(`「${label}」进这一步时已是 aria-pressed=${layerBefore[label]}，期望 true —— 前面的步骤动过图层`);
+          }
           await btn.first().click({ timeout: 8000 });
           await page.waitForTimeout(250);
         }
         out.layerButtons = layerButtons;
+        out.layerBefore = layerBefore;
+        await page.waitForTimeout(300);
+        // 负例 B（t33 来源口径）：两层都关着，点**芯片**（hud 来源）不许点亮。
+        // 芯片行常驻印着名字，点芯片等于看着答案点；layer 门只认画布点选。
+        await page.locator("#chip-mars").first().click({ timeout: 8000 });
         await page.waitForTimeout(400);
+        out.layerHudNegative = { selected: "mars", via: "chip[hud]", lit: (await readGateStorage(page)).lit };
+        // 正例：先在画布上真点一下。第一步必须回总览清掉 selectedId ——
+        // 否则点到"已选中的那颗"会走 SolarCanvas 的 refocus()，不经 select，这一下不点亮。
+        await ensureHudVisible(page);
+        await page.locator('button[aria-label="返回总览"]').first().click({ timeout: 8000 });
+        await page.waitForTimeout(1800);
+        out.afterOverview = await page.evaluate(() => new URL(location.href).searchParams.get("body"));
+        const canvasPick = await readCanvasPick(page);
+        out.canvasPick = canvasPick;
+        if (!canvasPick.pick) {
+          throw new Error(
+            `画布上找不到「离其他天体 ≥${CANVAS_PICK_GAP}px 且该点落在 canvas 上」的行星 —— 候选 ${canvasPick.candidates.length} 颗：` +
+              canvasPick.candidates.map((c) => `${c.id}@${c.x},${c.y}(gap ${c.nearest}${c.onCanvas ? "" : `, 被 ${c.hit} 盖住`})`).join("；"),
+          );
+        }
+        await page.mouse.click(canvasPick.pick.x, canvasPick.pick.y);
+        await page.waitForTimeout(600);
+        const gate = await readGateStorage(page);
+        out.layerAfter = await page.evaluate(() => ({
+          labels: document.querySelector('button[aria-label="名称"]')?.getAttribute("aria-pressed"),
+          orbits: document.querySelector('button[aria-label="轨道"]')?.getAttribute("aria-pressed"),
+        }));
+        out.layerPositive = {
+          selected: canvasPick.pick.id,
+          at: [canvasPick.pick.x, canvasPick.pick.y],
+          gap: canvasPick.pick.nearest,
+          title: await page.evaluate(() => document.querySelector("article h2")?.innerText?.trim() ?? null),
+          lit: gate.lit,
+        };
         out.unlock = await readCalibration(page);
       });
 
@@ -2563,7 +2686,7 @@ try {
     const name = "gate-witness";
     const w = flow.witness;
     if (!w) {
-      const bad = flow.stages?.find((s) => s.name === "witness" && !s.ok);
+      const bad = flow.stages?.find((s) => s.name === "time" && !s.ok);
       failures.push(`${name}: 这一段没跑完（${bad?.error ?? "缺记录"}）`);
       return;
     }
@@ -2578,6 +2701,97 @@ try {
         `${name}: 选中月球后连续推进 ${w.waitedMs}ms 仍未点亮门·time（lit=${JSON.stringify(w.lit)}，模拟时间 ${w.simAtWitness?.toFixed(3)}）` +
           ` —— 要么月食没来，要么进入本影那一帧月球没被选中。`,
       );
+    }
+  };
+
+  // 门·target（t19）：点一下不亮，盯着跑满一圈（8.2 模拟秒）才亮
+  const judgeGateTarget = (flow) => {
+    const name = "gate-target";
+    const t = flow.target;
+    if (!t) {
+      const bad = flow.stages?.find((s) => s.name === "target" && !s.ok);
+      failures.push(`${name}: 这一段没跑完（${bad?.error ?? "缺记录"}）`);
+      return;
+    }
+    if ((t.lit0 ?? []).includes("target")) {
+      failures.push(`${name}: 点了一次 #chip-mercury 就点亮了 target（lit=${JSON.stringify(t.lit0)}）—— 这一格又退回「点到就算」了`);
+    }
+    // 中点校验：只有真的在读到时还没到 7.8 模拟秒才算数，否则是机器跳步，不能判
+    if (t.midLit && typeof t.simAtMidRead === "number" && t.simAtMidRead - t.sim0 < 7.8) {
+      if (t.midLit.includes("target")) {
+        failures.push(
+          `${name}: 才看了 ${(t.simAtMidRead - t.sim0).toFixed(2)} 模拟秒（< 8.2）就点亮了 target` +
+            `（sim ${t.sim0.toFixed(3)}→${t.simAtMidRead.toFixed(3)}）—— 累积时长判据没生效`,
+        );
+      }
+    }
+    if (!(t.lit ?? []).includes("target")) {
+      failures.push(
+        `${name}: 选中水星后推进 ${t.waitedMs}ms（模拟秒 ${(t.simAtLit - t.sim0).toFixed(3)}）仍未点亮 target` +
+          `（lit=${JSON.stringify(t.lit ?? [])}，速度 ${t.speed}×）—— 8.2 模拟秒的一圈没走完？`,
+      );
+      return;
+    }
+    const watched = t.simAtLit - t.sim0;
+    if (!(watched >= 8.2 - 1e-6)) {
+      failures.push(
+        `${name}: 点亮 target 时只攒了 ${watched.toFixed(3)} 模拟秒（< 8.2）—— 判据的「一整圈」没生效` +
+          `（sim ${t.sim0.toFixed(3)}→${t.simAtLit.toFixed(3)}，速度 ${t.speed}×）`,
+      );
+    }
+  };
+
+  // 门·layer（t19）：顺序反了不亮；关层后点行星才亮
+  const judgeGateLayerOrder = (flow) => {
+    const name = "gate-layer-order";
+    const neg = flow.layerNegative;
+    const pos = flow.layerPositive;
+    if (!neg || !pos) {
+      const bad = flow.stages?.find((s) => (s.name === "layer-negative" || s.name === "layer-positive") && !s.ok);
+      failures.push(`${name}: 这一段没跑完（${bad?.error ?? "缺记录"}）`);
+      return;
+    }
+    if (flow.layersOn?.labels !== "true" || flow.layersOn?.orbits !== "true") {
+      failures.push(`${name}: 进这一步时图层不是「两层都开着」（名称=${flow.layersOn?.labels}，轨道=${flow.layersOn?.orbits}）—— 顺序前提不成立`);
+    }
+    if ((neg.lit ?? []).includes("layer")) {
+      failures.push(
+        `${name}: 顺序反了也点亮了 layer —— 名称/轨道还开着的时候选了 ${neg.selected} 就亮（lit=${JSON.stringify(neg.lit)}）。` +
+          `这条判据要求「关层之后再选得中」，不是「摸过开关」。`,
+      );
+    }
+    if (flow.layerBefore?.名称 !== "true" || flow.layerBefore?.轨道 !== "true") {
+      failures.push(`${name}: 关层前按钮状态不对（名称=${flow.layerBefore?.名称}，轨道=${flow.layerBefore?.轨道}，应各为 true）`);
+    }
+    if (flow.layerAfter?.labels !== "false" || flow.layerAfter?.orbits !== "false") {
+      failures.push(`${name}: 两次点击之后图层没关（名称=${flow.layerAfter?.labels}，轨道=${flow.layerAfter?.orbits}，应各为 false）`);
+    }
+    if (!(pos.lit ?? []).includes("layer")) {
+      failures.push(
+        `${name}: 关了名称与轨道、再在画布上点 ${pos.selected}（坐标 ${JSON.stringify(pos.at)}，离最近天体 ${pos.gap}px）之后 layer 仍未点亮` +
+          `（lit=${JSON.stringify(pos.lit)}，卡片标题 ${JSON.stringify(pos.title)}）` +
+          ` —— 顺序对了却不亮：layerGateWitnessed 要求 source===\"canvas\"（画布点选）且 parent===\"sun\"，这两条哪条没满足？`,
+      );
+    }
+    // 负例 B（t33 来源口径）：两层都关着，点**芯片**是 hud 来源，不许点亮
+    const hudNeg = flow.layerHudNegative;
+    if (!hudNeg) {
+      failures.push(`${name}: 缺「关层后点芯片」的负例记录（layerHudNegative）—— 来源判据没在测`);
+    } else if ((hudNeg.lit ?? []).includes("layer")) {
+      failures.push(
+        `${name}: 两层都关着、点芯片 #chip-${hudNeg.selected}（hud 来源）就点亮了 layer（lit=${JSON.stringify(hudNeg.lit)}）` +
+          ` —— 芯片行印着名字，这一格只认 source===\"canvas\"（画布点选）。`,
+      );
+    }
+    const pick = flow.canvasPick;
+    if (pick) {
+      if (!pick.pick) {
+        failures.push(`${name}: 画布上没有合格的点选目标（候选 ${pick.candidates?.length ?? 0} 颗，需要 ≥${CANVAS_PICK_GAP}px 间距且不被 HUD 盖住）`);
+      } else if (!(pick.pick.nearest >= CANVAS_PICK_GAP)) {
+        failures.push(`${name}: 画布点选目标 ${pick.pick.id} 离最近天体只有 ${pick.pick.nearest}px（< ${CANVAS_PICK_GAP}）—— 热区会互相重叠`);
+      }
+    } else {
+      failures.push(`${name}: 缺画布点选的候选记录（canvasPick）—— 正例的前提没有留证`);
     }
   };
 
@@ -2647,6 +2861,23 @@ try {
       else if (XG_HINT_FORBIDDEN.test(h.text)) {
         failures.push(`${name}: ${h.slot} 行提示「${h.text}」命中操作动词 /推进|关闭|选择|锁定|打开|切换/ —— 又把答案印出来了`);
       }
+      // 逐字快照（t35）：文案改回旧句子必须红，别只数行数
+      const want = GATE_HINT_COPY[h.slot];
+      if (want && h.text !== want) {
+        failures.push(`${name}: ${h.slot} 行提示与快照不一致 —— 实际「${h.text}」，期望「${want}」（改文案就同步改 GATE_HINT_COPY）`);
+      }
+    }
+    // 规则行（t35）：整行快照 + 两个等待时间必须在
+    if (!cal.rules) {
+      failures.push(`${name}: 面板里没有 [data-gate-rules] 规则行 —— 速度前提（8× / 1×）没告诉玩家`);
+    } else {
+      if (cal.rules !== GATE_RULES_COPY) {
+        failures.push(`${name}: 规则行与快照不一致 —— 实际「${cal.rules}」，期望「${GATE_RULES_COPY}」（改文案就同步改 GATE_RULES_COPY）`);
+      }
+      const missing = GATE_RULES_TOKENS.filter((t) => !cal.rules.includes(t));
+      if (missing.length) {
+        failures.push(`${name}: 规则行里缺 ${missing.join(" / ")} —— 8× 与 1× 的等待时间必须写出来（实际「${cal.rules}」）`);
+      }
     }
     if (cal.valueMax !== 3) failures.push(`${name}: 进度条 aria-valuemax ${cal.valueMax}，期望 3（GATE_REQUIRED 被改了？）`);
     // 面板上那颗「03 / 03」的可见读数：与 aria-valuemax 是同一个数的两面，一面都不能丢
@@ -2704,8 +2935,8 @@ try {
     }
   }
 
-  // ——— ② 解锁流程主体：跳时不亮 → 选中月球推进才亮 → 三格 → 进实境 ———
-  if (["gate-jump", "gate-witness", "gate-unlock", "realm-controls"].some(want)) {
+  // ——— ② 解锁流程主体（t19 动作序列）：跳时不亮 → 关层顺序 → 选中月球等本影 → 盯水星一圈 → 三格 → 进实境 ———
+  if (["gate-jump", "gate-witness", "gate-target", "gate-layer-order", "gate-unlock", "realm-controls"].some(want)) {
     const flow = await runUnlockFlow(browser, base);
     results.push({
       pass: "gate-jump",
@@ -2720,15 +2951,63 @@ try {
       litAfterResume: flow.litAfterResume?.lit ?? [],
     });
     results.push({ pass: "gate-witness", 分类: "结构量（选中 + 连续推进）", selectedTitle: flow.selectedTitle, speedHigh: flow.speedHigh, ...(flow.witness ?? {}) });
+    results.push({ pass: "gate-target", 分类: "结构量（一次点击 vs 累积 8.2 模拟秒）", ...(flow.target ?? {}) });
+    results.push({
+      pass: "gate-layer-order",
+      分类: "结构量（顺序 + 来源：关层后画布点选才亮）",
+      layersOn: flow.layersOn,
+      negative: flow.layerNegative ?? null,
+      layerButtons: flow.layerButtons,
+      layerBefore: flow.layerBefore,
+      layerAfter: flow.layerAfter,
+      hudNegative: flow.layerHudNegative ?? null,
+      afterOverview: flow.afterOverview ?? null,
+      canvasPick: flow.canvasPick ?? null,
+      positive: flow.layerPositive ?? null,
+    });
     results.push({ pass: "gate-unlock", 分类: "结构量（三格 + DOM 切换）", layerButtons: flow.layerButtons, ...(flow.unlock ?? { available: false, reason: "缺记录" }) });
     results.push({ pass: "realm-controls", 分类: "结构量（控件清单）", ...(flow.real ?? {}) });
     judgeGateJump(flow);
     judgeGateWitness(flow);
+    judgeGateTarget(flow);
+    judgeGateLayerOrder(flow);
     judgeGateUnlock(flow);
     judgeRealmControls(flow);
     if (flow.errors?.length) failures.push(`unlock-flow: 控制台/页面报错 ${flow.errors.length} 条`);
     const badStages = (flow.stages ?? []).filter((s) => !s.ok);
     if (badStages.length) failures.push(`unlock-flow: 有 ${badStages.length} 个阶段抛错（${badStages.map((s) => `${s.name}: ${s.error}`).join("；")}）`);
+  }
+
+  // ——— ②b ?body=moon 零交互：深链带出来的选中不是手势，门·time 不许亮（t19） ———
+  if (want("gate-url-moon")) {
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+    const page = await ctx.newPage();
+    const rec = { ready: false };
+    try {
+      await page.goto(`${base}?body=moon`, { waitUntil: "load", timeout: 30000 });
+      await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+      rec.ready = true;
+      await page.waitForTimeout(1200);
+      rec.selection = await page.evaluate(() => document.querySelector("article h2")?.innerText?.trim() ?? null);
+      rec.simStart = await page.evaluate(() => window.__solarTime.now());
+      await page.waitForTimeout(10000);
+      rec.simEnd = await page.evaluate(() => window.__solarTime.now());
+      rec.lit = (await readGateStorage(page)).lit;
+      results.push({ pass: "gate-url-moon", 分类: "结构量（深链 × 手势来源）", ...rec });
+      if (rec.selection !== "月球") {
+        failures.push(`gate-url-moon: ?body=moon 进站后卡片标题是「${rec.selection}」，期望「月球」—— 深链没选中月球，这条负向判据没在判`);
+      }
+      if (rec.lit.includes("time")) {
+        failures.push(
+          `gate-url-moon: ?body=moon 零交互 ${(rec.simEnd - rec.simStart).toFixed(3)} 模拟秒后门·time 亮了（lit=${JSON.stringify(rec.lit)}）` +
+            ` —— 深链带出来的选中 source===\"url\"，不该算目击。`,
+        );
+      }
+    } catch (err) {
+      failures.push(`gate-url-moon: ${err.message}`);
+    } finally {
+      await ctx.close();
+    }
   }
 
   // ——— ③ 三条提示：行数、槽位、负向正则（不硬编码文案） ———
