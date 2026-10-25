@@ -1302,6 +1302,7 @@ const hudWheelProbe = (page, pt) =>
     };
   }, pt);
 
+
 async function runHudWheel(browser, base) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
   const page = await ctx.newPage();
@@ -2196,9 +2197,19 @@ function judgeHudAutoHide(res) {
     const settledInfo = await waitSettled();
     let jitter = null;
     if (!settledInfo.settled) {
-      // 不判绿也不判红：把"没测成"这件事写进结果，别让它长得像"通过"
-      console.error(`（注意）follow-jitter: 相机在 ${settledInfo.waitedMs}ms 内没稳定（${settledInfo.reads} 次读数）→ settled:false，本轮不判`);
-      results.push({ pass: "follow-jitter", settled: false, ...settledInfo, px: null, note: "相机未稳定，本轮不判（不是通过）" });
+      /*
+       * **`settled:false` = 红**（t56 F3 修正，批判位打回）。
+       *
+       * 原来这里只记一条 `px:null` 的结果、不判红——但这条 pass 测的就是「跟随期间目标屏幕位置稳不稳」，
+       * **相机一直不稳正是它要抓的 bug**。记成"跳过"等于放走它：`t44` 记的那次 86.6px
+       * （阈值的 173 倍）就是"采样窗口在聚焦动画没收敛时开始"，按旧写法它会被记成 settled:false 然后绿。
+       * 而且同一批里 ③ 是"探针缺失必须红"，两种缺失一种判红一种判绿，自相矛盾。
+       */
+      failures.push(
+        `follow-jitter: 相机 ${(settledInfo.waitedMs / 1000).toFixed(1)}s 内未稳定（${settledInfo.reads} 次读数）` +
+          ` —— 这条判据失去采样前提，**不是通过**。相机一直在动正是它要抓的状态。`,
+      );
+      results.push({ pass: "follow-jitter", settled: false, ...settledInfo, px: null, note: "相机未稳定 → 判红（不是跳过）" });
     } else {
       jitter = await numPage.evaluate(async () => {
         const xs = [];
