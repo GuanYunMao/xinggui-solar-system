@@ -1042,7 +1042,7 @@ function judgeJupiterSpot(res) {
 //   参照 `cover≤0`
 const ECLIPSE_PAIR = ["moon", "earth"];
 const ECLIPSE_TOTAL_MAX_RATIO = 0.5; // 实测正侧 0.204–0.316（n=5），留 58% 余量
-const ECLIPSE_ANTISOLAR_MIN_RATIO = 0.85; // **只作为记录**（反侧尚未建立，见下方注释）：实测反侧 1.004–1.028（n=3）
+const ECLIPSE_ANTISOLAR_MIN_RATIO = 0.85; // 实测反侧 1.004–1.028（n=3）；无守卫时落到 0.23 → 取 0.85 留 18% 余量
 const ECLIPSE_FRAMES_PER_GROUP = 4;
 const ECLIPSE_SWEEP_STEP = 0.02;
 const ECLIPSE_SWEEP_END = 13;
@@ -1149,7 +1149,9 @@ async function runEclipseHemisphere(browser, base) {
     }
     const buckets = {
       total: samples.filter((s) => s.dot > 0 && s.cover >= 1),
-      antisolar: samples.filter((s) => s.dot < 0),
+      // 反侧必须取**接近 −1** 的帧：`dot=−0.1` 时 `sep` 很大、根本进不了阴影，删守卫也不会变暗，
+      // 判据就永远绿（这正是第一版反向验证失败的原因）。取 `dot ≤ −0.99` 与 A/B 的 t=2.38 同口径。
+      antisolar: samples.filter((s) => s.dot <= -0.99),
       none: samples.filter((s) => s.cover <= 0),
     };
     out.groupSizes = Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length]));
@@ -1259,15 +1261,27 @@ function judgeEclipseHemisphere(res) {
     );
   }
   /*
-   * ⚠ **本条只覆盖正侧（遮挡真的发生）。反侧（`dot<0` 时受光面不得被压暗）尚未建立。**
+   * 本条两侧都判：正侧（`dot>0 且 cover≥1` → 必须显著变暗）+ 反侧（`dot<0` → 不得被压暗）。
    *
-   * 为什么没建：侧视机位下反侧采到的帧对"删掉半球守卫"**逐位不敏感**（改前/改后比值都是 1.0），
-   * 说明那些帧的 `cover` 到不了 1、`direct` 本来就没被压暗——**判据红不了，就不能算守住**。
-   * 反侧单独成条（`t57`），判据不变，**红不了不许关**。
-   * 这里仍把反侧组的测量值记进结果（它是正侧比值的上下文），但**不参与判定**，
-   * 也不写"未验证/pending"这类字段——那种字段的实际效果是"没人会去验证"。
+   * 反侧的口径来自一次**决定性 A/B**（同一天体、同一时刻 t=2.38 dot=−1、两个机位、改前/改后各一次）：
+   *   日向 az=0,el=8：有守卫 diskMean **125.47** / 无守卫 **12.42**（中心 140.76 → 11.88）
+   *   侧视 az=90,el=0：有守卫 diskMean **55.03** / 无守卫 **12.47**（中心 53.56 → 12.53）
+   * ⇒ **两个机位都敏感**，侧视那 55 只是相角暗（半明半暗），不是"没在判"。
+   * 之前 t53 的反向验证"逐位不变"是**补丁没进那次服务的产物**，不是判据不敏感。
+   *
+   * 为什么当初以为没建：侧视机位下反侧帧对"删掉半球守卫"曾测得逐位不变——
+   * 那次是**补丁没进服务的产物**，不是判据不敏感。决定性 A/B 已经推翻了它（见上）。
+   * 现在反侧**参与判定**，阈值 0.85（实测有守卫 1.004–1.028、无守卫 0.23）。
    */
-  void a; // 反侧只作为记录，不参与判定
+  if (a.n < 2) {
+    failures.push(`${name}: 反侧（dot<0）只采到 ${a.n} 帧 —— 判据失去对象，不许静默通过`);
+  } else if (res.ratios.antisolarMin !== null && res.ratios.antisolarMin < ECLIPSE_ANTISOLAR_MIN_RATIO) {
+    failures.push(
+      `${name}: 反侧（地球在月球**背后**，物理上挡不住太阳）也被压暗了 —— 最暗一帧比值 ${res.ratios.antisolarMin} < ${ECLIPSE_ANTISOLAR_MIN_RATIO}` +
+        `（中位 ${res.ratios.antisolar}）。这就是 t50 那个 bug：\`sep=|sinθ|\` 是偶函数，缺 \`dot(sunDir,occDir) > 0\` 的半球判断。`,
+    );
+  }
+
   if (res.errors?.length) failures.push(`${name}: 控制台/页面报错 ${res.errors.length} 条`);
   return res;
 }
