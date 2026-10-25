@@ -2092,7 +2092,6 @@ function judgeHudAutoHide(res) {
       failures.push(`eclipse-hemisphere: ${err.message}`);
     }
   }
-  // ——— 数值断言（批判位指出的验收夹具缺失，这里补上）———
   // XG_ONLY 设了就不再往下跑：反向测试只关心某条 page pass 会不会红，数值段是最费时的部分。
   // 用带标签的块 + break，而不是整体包一层 if —— 后者要把下面几百行整体缩进一层，
   // 那种 diff 没人能审。所以块里缩进保持原样，这是有意的。
@@ -3070,6 +3069,20 @@ function judgeHudAutoHide(res) {
   server.close();
 }
 
+/*
+ * **0 条 pass 不是"全部通过"，是"什么都没验"。**
+ *
+ * 教训：`XG_ONLY=follow-jitter` 打印过「✓ 全部通过」——而那条 pass 在 `numeric` 块里，
+ * 过滤后**一条都没跑**。这和"断言看不见坏状态"是同一类错，但位置更靠上游：
+ * 判据再好，跑的人把 0 条当成通过也会放过去。
+ * 所以：带了过滤却命中 0 条 → exit 2，并明说"过滤后没有 pass 被跑"。
+ */
+if (results.length === 0) {
+  console.log(JSON.stringify({ results, failures }, null, 2));
+  console.error(`\n✗ ${ONLY.length ? `XG_ONLY=${ONLY.join(",")} 过滤后` : "本轮"}**没有 pass 被跑**（0 条）—— 0 条不是"全部通过"，是"什么都没验"。`);
+  console.error("  检查过滤名是否拼对、以及目标 pass 是否在别的块里（例如 follow-jitter 在 numeric 块内）。");
+  process.exit(2);
+}
 console.log(JSON.stringify({ results, failures }, null, 2));
 console.log(failures.length ? `\n✗ ${failures.length} 项未通过` : "\n✓ 全部通过");
 console.log(`耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s（${results.length} 条 pass 记录）`);
