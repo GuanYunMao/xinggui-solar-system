@@ -3123,6 +3123,42 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
     (window as unknown as { __solarOrbitPlanes?: typeof orbitPlanes }).__solarOrbitPlanes = orbitPlanes;
 
     /*
+     * t58 顺带（给 verifier 的 F7 判据）：自转探针 —— `id → 该天体**应用后**的自转`。
+     *
+     * 返回两样：
+     *  - `spin`：这一帧实际写进 spin 节点（`reg.spins`）的 `rotation.y` —— **应用后的值，不是公式输入**。
+     *    潮汐锁定的耦合到底改没改，只能从应用后的值看出来（判据是"spin − 轨道角 在多个时刻是常数"）。
+     *  - `world`：该天体本地 **+X** 轴在世界系里的方向（≈ 近地面朝向）。它已经跨过了倾角层与
+     *    母天体赤道层 —— 配上 `__solarOrbitPlanes()` 的**世界**位置角，两边才在同一个坐标系里，
+     *    调用方不必自己还原父级变换（t51 的临时探针就是在这里绊过一次：月球的倾角层与世界轴不同）。
+     *
+     * 为什么需要它：`__solarTime.spin(id)` 只有单天体、且只给局部 `rotation.y`；F7 要一次拿到
+     * 全部 15 个、还要能和世界位置角对上。**别当冗余删掉** —— 它存在的理由就是那条
+     * "spin − orbit = 常数"的判据（`__solarTime.spin` 保留给单点排查用）。
+     * 纯只读：调用时现算，不在帧里加任何计算。
+     */
+    const spinApi = () => {
+      const out: Record<string, { spin: number | null; world: [number, number, number] | null }> = {};
+      const q = new THREE.Quaternion();
+      const v = new THREE.Vector3();
+      for (const body of bodies) {
+        const node = reg.spins.get(body.id);
+        if (!node) {
+          out[body.id] = { spin: null, world: null };
+          continue;
+        }
+        node.getWorldQuaternion(q);
+        v.set(1, 0, 0).applyQuaternion(q);
+        out[body.id] = {
+          spin: +node.rotation.y.toFixed(6),
+          world: [+v.x.toFixed(6), +v.y.toFixed(6), +v.z.toFixed(6)],
+        };
+      }
+      return out;
+    };
+    (window as unknown as { __solarSpin?: typeof spinApi }).__solarSpin = spinApi;
+
+    /*
      * 贴图预算探针：启动时每张程序化贴图多大、总像素多少、还有几个任务在排队。
      * 它要证明的是两件事 ——「启动期只付总览档的钱」和「放大后真的升了档」，
      * 不是"每个像素都对"（那要截图）。摄影贴图（地球/月球）不参与预算，不在报告里。
@@ -3412,6 +3448,7 @@ function Probe({ controlsRef }: { controlsRef: RefObject<OrbitControlsImpl | nul
       delete (window as unknown as { __solarClip?: typeof clip }).__solarClip;
       delete (window as unknown as { __solarOrbitFrames?: typeof orbitFrames }).__solarOrbitFrames;
       delete (window as unknown as { __solarOrbitPlanes?: typeof orbitPlanes }).__solarOrbitPlanes;
+      delete (window as unknown as { __solarSpin?: typeof spinApi }).__solarSpin;
       delete (window as unknown as { __solarTextures?: typeof textures }).__solarTextures;
       delete (window as unknown as { __solarTime?: typeof timeApi }).__solarTime;
       delete (window as unknown as { __solarLook?: typeof lookApi }).__solarLook;
