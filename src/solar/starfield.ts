@@ -50,7 +50,16 @@ export const STAR_VERT = /* glsl */ `
   varying vec3 vColor;
   varying float vPhase;
   void main() {
-    vColor = aColor;
+    /*
+     * t59：银河暗尘带也要吸**星**。尘是吸收，挡的是"后面的所有光" —— 只压带子那一项压不出暗缝：
+     * 实测只改带子的尘深度（0.55→0.15）时，带心只比两侧暗 4.6%，肉眼不可见 ——
+     * 因为 70% 的星都收在带里，而星是加法混合、完全不理会尘。所以这里按同一条银纬给星点乘透过率。
+     * 银道面法线写死成 GALACTIC_NORMAL 的同一组数（两层用同一个方向；天球漂移时一起转）。
+     */
+    vec3 gd = normalize(position);
+    float glat = dot(gd, normalize(vec3(0.5, 0.78, -0.38)));
+    float gdust = smoothstep(0.0, 0.09, abs(glat));
+    vColor = aColor * (0.16 + 0.84 * gdust);
     vPhase = aPhase;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     // 无穷远的星：角尺寸固定，gl_PointSize 不除深度（改造前除 -mv.z，一缩放星星就变大）
@@ -119,12 +128,15 @@ export const BAND_VERT = /* glsl */ `
     // 银纬（对带法线的投影）决定带的截面：高斯，σ≈0.10（≈ ±6° 的核心，边缘渐隐）
     float lat = dot(dir, uNormal);
     float band = exp(-lat * lat / (2.0 * 0.10 * 0.10));
-    // 暗尘带：正中间切一条窄的，免得带子像一根荧光管
-    float dust = smoothstep(0.0, 0.06, abs(lat));
+    // 暗尘带：正中间切一条，免得带子像一根荧光管。
+    // t59 实测：只加深这一项（0.55→0.15）带心也只比两侧暗 **4.6%**，肉眼看不出来 ——
+    // 因为带里 70% 的星是加法混合、不理会尘；真正的暗缝得让尘连星一起吸（见 STAR_VERT）。
+    // 这一维（尘）在两层用的是同一组 abs(lat) 阈值（0.09 ≈ 5.2°），所以缝在两层的边缘对得上。
+    float dust = smoothstep(0.0, 0.09, abs(lat));
     float clouds = fbm(dir * 3.1);
     float clumps = fbm(dir * 7.9 + 13.7);
     // 带的亮度 = 截面 × 云团 × 尘带，再轻微调制
-    float glow = band * (0.28 + 0.72 * smoothstep(0.22, 0.78, clouds)) * (0.55 + 0.45 * dust);
+    float glow = band * (0.28 + 0.72 * smoothstep(0.22, 0.78, clouds)) * (0.22 + 0.78 * dust);
     glow *= 0.72 + 0.28 * clumps;
     vGlow = glow;
     // 色温：冷蓝为核心（银河星族更蓝），暖黄在云团处

@@ -1,4 +1,4 @@
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+﻿import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
@@ -573,7 +573,7 @@ function Stars() {
   );
   const geo = useMemo(() => createStarGeometry(), []);
   // 天球只用来承载银河带：64×32 段足够让带子的亮度梯度平滑（噪声在顶点里算）
-  const dome = useMemo(() => new THREE.SphereGeometry(SKY_RADIUS, 64, 32), []);
+  const dome = useMemo(() => new THREE.SphereGeometry(SKY_RADIUS, 192, 96), []);
   const sky = useRef<THREE.Group>(null);
   useEffect(
     () => () => {
