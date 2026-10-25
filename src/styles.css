@@ -1130,7 +1130,13 @@ button[aria-label^="自动收起"] {
 
 /* ── 场景标签 ────────────────────────────────────────────────── */
 
-.star-label {
+/*
+ * 标签层是 SolarCanvas 运行时拼出来的一个 div（`data-label-layer="1"`）：
+ * 几何、z-index、pointer-events 都写在它的 inline cssText 里，这个属性是那一层
+ * **唯一的样式钩子**。所以下面两条规则挂在它名下 —— 删掉属性，标签当场没样式，
+ * 是能立刻看见的失败，而不是一个留着没人读的标记（HANDOFF.md:92 的欠账）。
+ */
+[data-label-layer] .star-label {
   display: block;
   padding: 0.15rem 0.3rem;
   border-left: 1px solid rgb(145 169 176 / 0.34);
@@ -1146,7 +1152,7 @@ button[aria-label^="自动收起"] {
   user-select: none;
 }
 
-.star-label.is-selected {
+[data-label-layer] .star-label.is-selected {
   border-left-color: var(--cyan);
   color: var(--cyan);
   background: linear-gradient(90deg, rgb(20 52 58 / 0.68), transparent);

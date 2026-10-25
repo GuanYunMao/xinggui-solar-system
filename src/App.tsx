@@ -104,9 +104,34 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [inReal]);
 
-  // 可分享的深链：?body=earth 打开就聚焦地球，选中什么就把什么写回地址栏。
+  /*
+   * 可分享的深链：?body=earth 打开就聚焦地球，选中什么就把什么写回地址栏。
+   *
+   * 顺序有讲究（t4）：**订阅先挂，select 后发**。原来反过来 —— 先 select 再 subscribe，
+   * 于是 `?body=earth` 深链进来的那一次选择谁都没看见：「记访问 + 回写地址栏」只有订阅里
+   * 那一段在做，`xinggui-visited-v1` 里永远不会有 earth（实测过，干净 profile 打开深链，
+   * localStorage 是空的）。把订阅提到 select 前面就够了，不另补一份一次性记账 ——
+   * 两份记账迟早在某条路径上分叉。
+   */
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
+
+    const unsubscribe = useSim.subscribe((state, prev) => {
+      // 切换中禁写 URL：别让人复制到中间态的链接（落定后拦下的选择会再触发一次）
+      if (state.switching) return;
+      if (state.selectedId === prev.selectedId) return;
+      if (state.selectedId) markVisited(state.selectedId);
+      try {
+        const url = new URL(window.location.href);
+        if (state.selectedId) url.searchParams.set("body", state.selectedId);
+        else url.searchParams.delete("body");
+        window.history.replaceState(null, "", url);
+      } catch {
+        /* file:// 下部分浏览器不允许改地址栏，忽略即可 */
+      }
+    });
+
+    // 订阅挂好之后再发这次 select：深链的那一下和用户真点一下走同一条路。
     const id = params.get("body");
     if (id && BODY_BY_ID[id]) useSim.getState().select(id);
 
@@ -122,20 +147,7 @@ export function App() {
       }
     }
 
-    return useSim.subscribe((state, prev) => {
-      // 切换中禁写 URL：别让人复制到中间态的链接（落定后拦下的选择会再触发一次）
-      if (state.switching) return;
-      if (state.selectedId === prev.selectedId) return;
-      if (state.selectedId) markVisited(state.selectedId);
-      try {
-        const url = new URL(window.location.href);
-        if (state.selectedId) url.searchParams.set("body", state.selectedId);
-        else url.searchParams.delete("body");
-        window.history.replaceState(null, "", url);
-      } catch {
-        /* file:// 下部分浏览器不允许改地址栏，忽略即可 */
-      }
-    });
+    return unsubscribe;
   }, []);
 
   return (

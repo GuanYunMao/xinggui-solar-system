@@ -10,9 +10,9 @@
  *
  * 短码布局（24 bit 载荷 + 8 bit 校验，Crockford Base32，无 I / L / O / U）：
  *
- *   bit   0–11  槽位点亮位（12 个，与面板上一圈 12 格一一对应）
- *   bit      12  已解锁位（和「亮满 3 个」是冗余信息，但它让「只亮了 2 个」也能带走）
- *   bit  13–16  schema 版本号（当前 1）
+ *   bit   0–2   槽位点亮位（3 个，顺序 = GATE_SLOTS 的顺序）
+ *   bit   3–12  保留，必须为 0（1.3.4 之前这里装着 12 槽位的其余 9 个）
+ *   bit  13–16  schema 版本号（当前 2）
  *   bit  17–23  保留，必须为 0
  *
  *   XG1-ABCDE-FG
@@ -23,28 +23,43 @@
  *    └────────── 前缀 + 版本字面量（解析时也按字符处理，所以跟着一起规范化）
  */
 
-export const GATE_SLOTS = [
-  "time",
-  "target",
-  "layer",
-  "scale",
-  "orbit",
-  "clock",
-  "signal",
-  "eclipse",
-  "drift",
-  "echo",
-  "void",
-  "trail",
-] as const;
+/**
+ * 槽位表 = **store 里真有 hitGate 调用的那几个**（1.3.4 从 12 收到 3）。
+ *
+ * 旧表 12 个槽位里，"scale / orbit / clock / signal / eclipse / drift / echo / void / trail"
+ * 这 9 个没有任何写入点 —— 它们在界面上是 12 个点里永远不亮的 9 个，玩家把能做的都做了
+ * 也只到 3/3，剩下的只能靠猜或者开控制台。槽位表是**可达性**的声明，不是愿望清单。
+ *
+ * 加槽位的规矩：先在 store 里写出一个能失败的判定（命中者不是"点了就给"），
+ * 再加进来。scripts/gate-predicate.test.mjs 会数 store.ts 里的 `hitGate("…")` 调用，
+ * 表里多一个没有调用点的槽位，断言直接红。
+ */
+export const GATE_SLOTS = ["time", "target", "layer"] as const;
 
 export type GateSlot = (typeof GATE_SLOTS)[number];
 
 /** 亮满几个点算解锁。改这个数等于改游戏规则，要同步 CHANGELOG。 */
 export const GATE_REQUIRED = 3;
 
-export const GATE_VERSION = 1;
+/**
+ * 短码的 schema 版本（1.3.4 起 = 2）。
+ *
+ * 为什么升版而不是"尽量把老码解出来"：槽位表从 12 收到 3，老码的 bit 3–11 里每一位
+ * 都**曾经**是一个有名字的槽位，现在没有对应物。硬解它就只剩两条路——
+ *  ① 悄悄把那几位丢掉：一个写着「3 格已归档」的老码进来，面板显示 1/3，没人知道为什么；
+ *  ② 把 bit 12 的"已解锁"位重新读回来：t20 已经判过死刑（冗余位能造出自我矛盾的态）。
+ * 两条都会让"一个事实一个来源"破掉。所以老码一律 `version` 失败，界面会明说
+ * 「这个码来自别的版本。」——这是能听懂的真话，不是"码无效"。
+ *
+ * 老玩家的进度不受影响：本机存档（GATE_KEY）里的 `unlockedAt` 仍然作数，
+ * 见 `readGate` / store 的 `hydrateGate` —— 铁律 2、铁律 1 都没动。
+ */
+export const GATE_VERSION = 2;
 
+/**
+ * localStorage 的键名里那个 `v1` 是**历史**，不是 schema 版本 —— 别跟着 GATE_VERSION 改。
+ * 改键名 = 读不到老存档 = 把已解锁的人打回锁态，而铁律 1/2 都不允许"记忆丢了"升级成"这次进不去"。
+ */
 export const GATE_KEY = "xinggui-gate-v1";
 
 const PREFIX = "XG1";
@@ -115,6 +130,10 @@ export function normalizeGate(raw: string): string {
  * 点复制又把这个矛盾导出一遍（自传播）。
  * 解锁与否现在只由**槽位数**决定（`slots.length >= GATE_REQUIRED`），一个事实一个来源。
  * `unlocked` 参数保留是为了不改调用方签名，但它已经不影响输出。
+ *
+ * 1.3.4 又补一条：**bit 3–12 与 17–23 一个都不写**（只写 0–2 的槽位位和 13–16 的版本）。
+ * 编码出的码解回来必须是最小读数，再导出还是同一个码 —— 否则"同一份进度两个码"，
+ * 玩家抄哪个都像对的。
  */
 export function encodeGate(lit: readonly string[], _unlocked: boolean, version = GATE_VERSION): string {
   let payload = 0;
@@ -160,16 +179,28 @@ export function decodeGate(raw: string): DecodeGateResult {
   const expected = crc8([payload & 0xff, (payload >>> 8) & 0xff, (payload >>> 16) & 0xff]);
   if (low + (high << 5) !== expected) return { ok: false, reason: "checksum" };
 
-  const slots = GATE_SLOTS.filter((_, index) => (payload & (1 << index)) !== 0);
   /*
-   * bit 12 一概不读（t20）。老版本发出的码里可能带着它，这里**忽略**而不是报错：
-   * 解码的结论必须和 UI 的判定同源 —— 都是「亮了几格 >= GATE_REQUIRED」。
-   * 于是 `XG1-00C00-S7` 这种「0 槽位 + 已解锁」的旧码，进来就是 0/3，
-   * 不会再让面板一边说 0/3、一边说「校准已完成」。
+   * 保留位必须为 0（1.3.4）：槽位收到 3 个之后，bit 3–12（老槽位的残位 + t20 废止的解锁位）
+   * 和 bit 17–23 都没有含义了。这里**拒收**而不是忽略。
+   *
+   * 为什么这次不学 t20 的"忽略"：t20 忽略 bit 12 是有前提的 —— 那时只有那一位会带脏，
+   * 忽略它才能让「亮满 3 格」成为唯一事实来源。现在整个高位区间都不再有含义，
+   * 忽略等于认下任意垃圾位：同一份进度会解出跟原码不同的新码（导出就变了个样）。
+   *
+   * 顺序放在校验之后：位翻转应该报 checksum，不该报 range —— 报错要指向真正的毛病。
    */
+  const reserved = ((payload >>> 3) & 0x3ff) | (payload >>> 17);
+  if (reserved !== 0) return { ok: false, reason: "range" };
+
+  const slots = GATE_SLOTS.filter((_, index) => (payload & (1 << index)) !== 0);
   return { ok: true, slots: [...slots], unlocked: slots.length >= GATE_REQUIRED };
 }
 
+/**
+ * 本机存档（`xinggui-gate-v1`）。**和短码是两个东西**：这里不校验、不防伪、不做版本拒绝，
+ * 只做「下次记得」。所以老存档里那些已经不存在的槽位名（`eclipse` 等）会被
+ * `canonicalSlots` 丢掉，而 `unlockedAt` 原样保留 —— 已解锁的人不会因为槽位表缩了就被打回锁态。
+ */
 export type GateRecord = {
   v: 1;
   lit: string[];

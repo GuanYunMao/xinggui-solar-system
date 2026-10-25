@@ -62,6 +62,7 @@ const SCAN_FILES = [
   "src/solar/data.ts",
   "src/solar/gate.ts",
   "src/solar/kepler.ts",
+  "src/solar/observe.ts",
   "src/solar/pick.ts",
   "src/solar/progress.ts",
   "src/solar/quality.ts",

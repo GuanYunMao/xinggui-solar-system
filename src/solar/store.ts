@@ -11,6 +11,13 @@ import {
   type GateSlot,
 } from "./gate";
 import { EARTH_PERIOD } from "./data";
+import {
+  accumulateTargetWatch,
+  layerGateWitnessed,
+  targetGateWitnessed,
+  timeGateWitnessed,
+  type GateWatch,
+} from "./observe";
 
 const KEY = "xinggui-settings-v1";
 
@@ -152,6 +159,47 @@ let lastDistanceWrite = 0;
  */
 let lastDaysWrite = 0;
 
+/*
+ * 页面上出现过玩家手势没有（t19，三条门共用）。
+ *
+ * 为什么需要它：URL 深链（`?body=moon`）也会调 `select`，把 selectedId 设出来 ——
+ * 零交互就能点门。批判位实测过 `?body=moon` 1.71 实秒白拿门·time。「URL 不是行为」，
+ * 所以门的选中态必须能区分"点出来的"与"链接带出来的"。
+ *
+ * 判据只用一个布尔：**这次 select 调用之前，页面上有没有发生过指针 / 键盘 / 滚轮事件**。
+ * 选中发生在挂载期（App 的深链那一下）⇒ 那时还没有手势 ⇒ `fromGesture = false`。
+ *
+ * 什么情况会推翻它：
+ *  - **自动化/演示模式替玩家点**：Playwright 的 `locator.click()` 会真的发 pointerdown，
+ *    所以夹具的点击算手势（这是对的）；但 `element.click()` 这种 DOM 直调不算 —— 夹具如果
+ *    改用 `evaluate(el => el.click())` 选天体，门就会不亮，那时要回来把来源标记显式化。
+ *  - **最干净的修法**是让 App 的深链调用传来源（`select(id, { source: "url" })`），
+ *    那要改 `App.tsx`（外壳位作用域）。这一版不动别的文件，用"手势出现过没有"这个间接判据。
+ */
+let sawGesture = false;
+
+function markGesture() {
+  sawGesture = true;
+}
+
+if (typeof window !== "undefined") {
+  // once：一条事件只需看见一次；三条各自只留一次监听，谁先来都行
+  const once = { once: true, capture: true, passive: true } as const;
+  window.addEventListener("pointerdown", markGesture, once);
+  window.addEventListener("keydown", markGesture, once);
+  window.addEventListener("wheel", markGesture, once);
+}
+
+/** 只看不写：给 select 决定 `selectionFromGesture`，也给断言一个稳定的读法。 */
+export function gestureSeen() {
+  return sawGesture;
+}
+
+/** 三条门共用的选中态读法（判据本体在 observe.ts 的 GateWatch 上）。 */
+function gateWatch(s: Pick<SimStore, "selectedId" | "selectionFromGesture">): GateWatch {
+  return { selectedId: s.selectedId, fromGesture: s.selectionFromGesture };
+}
+
 type GateSlice = {
   gateLit: GateSlot[];
   gateUnlocked: boolean;
@@ -159,6 +207,13 @@ type GateSlice = {
   gateSeen: number;
   /** 最近一次写盘失败：只用来在面板上说一句真话，**不参与判定**。 */
   gatePersistFailed: boolean;
+  /** 当前这次选中的来源：`true` = 玩家手势点的，`false` = 页面加载/URL 带出来的（t19）。 */
+  selectionFromGesture: boolean;
+  /**
+   * 门·target 的累积量（**模拟秒**，不是实秒）：只累计"水星被玩家选中"的那几段。
+   * 0 = 刚开始看；≥ `TARGET_GATE_ORBIT_SECONDS`（水星一个 period，8.2 模拟秒）就算看完一圈。
+   */
+  mercuryWatchSeconds: number;
 };
 
 type SimStore = GateSlice & {
@@ -318,36 +373,35 @@ export const useSim = create<SimStore>((set, get) => {
   gateUnlockedAt: null,
   gateSeen: 0,
   gatePersistFailed: false,
+  selectionFromGesture: false,
+  mercuryWatchSeconds: 0,
 
   // 切换中禁「暂停 / 调速」：这两个动作会和切换里写进去的 speed / paused 打架，
   // 与其让玩家看到自己刚拖的滑条被覆盖，不如直接不响应。
   togglePaused: () => {
     if (get().switching) return;
     set((s) => ({ paused: !s.paused }));
-    // 注意：暂停/继续**不再点门**（t28）。门·time 现在判的是「时间真的走完一年」，
-    // 不是"碰过时间控件"。
+    // 注意：暂停/继续**不点门**（t28 起）。门·time 判的是沙盘里真发生的一次月食（1.3.4），
+    // 暂停只是让钟不走 —— 它既不是月食，也不是"等了一年"。
   },
   setSpeed: (speed) => {
     if (get().switching) return;
     set({ speed: clampSpeed(speed) });
-    // 同理：调速只是手段，门看的是 `advanceSim` 里累计出来的模拟日。
+    // 同理：调速只是手段，门看的是 `advanceSim` 连续推进时发生的那次月食（与倍率无关，
+    // 高倍率只是让它来得快，低倍率也不是"没等"）。
   },
   /*
-   * 门·符号（t28）：**名称与轨道同时关掉过**才算。
+   * 门·符号（t28 → t19 收紧）：**名称与轨道都不在的时候选得中一颗行星**才算。
    *
-   * 旧口径是"关掉任意一层拐仗就算"——那是"摸过控件"，不是"看见了符号本身"。
-   * 尾迹不算：它不是导航符号，关掉它证明不了任何事。
-   * 一起关（同时为 false）才算：这才是"只看天体，不看那层壳"。
+   * 旧口径（t28）是"同时关掉两层就亮"——那还是"摸过控件"：两个按钮各点一下，两下通关。
+   * t19 起开关本身一次都不点门，判据搬到 `select` 里，看的是"没有名字和轨道线，你还认得出谁"。
+   * 尾迹始终不算：它不是导航符号，关掉它证明不了任何事。
    */
   toggleLabels: () => {
     set((s) => ({ showLabels: !s.showLabels }));
-    const s = get();
-    if (!s.showLabels && !s.showOrbits) s.hitGate("layer");
   },
   toggleOrbits: () => {
     set((s) => ({ showOrbits: !s.showOrbits }));
-    const s = get();
-    if (!s.showLabels && !s.showOrbits) s.hitGate("layer");
   },
   toggleTrails: () => {
     // 尾迹不点门：它既不是时间也不是符号（t28）
@@ -364,17 +418,31 @@ export const useSim = create<SimStore>((set, get) => {
       if (selectedId) set({ queuedSelectId: selectedId });
       return;
     }
-    if (selectedId && selectedId !== s.selectedId) {
-      set({ selectedId, hops: s.hops + 1 });
-    } else {
-      set({ selectedId });
-    }
     /*
-     * 门·规律（t28）：**最后选中水星**才算。
-     * 水星是周期最短的那颗（data.ts 里 0.24 年），"找出跑得最快的那颗"就是它。
-     * 旧口径数的是"换过几次目标 + 回没回过总览"，那测的是操作次数，不是观察。
+     * 选中来源（t19）：**这个布尔决定三条门认不认这次选中**。
+     * 深链（App.tsx 的 `?body=`）也走这个函数，但它发生在任何手势之前 ⇒ fromGesture=false。
+     * 另外每次选中都把门·target 的累计清零：换目标就是"没在看了"，从头来。
      */
-    if (selectedId === "mercury") get().hitGate("target");
+    const fromGesture = gestureSeen();
+    if (selectedId && selectedId !== s.selectedId) {
+      set({ selectedId, hops: s.hops + 1, selectionFromGesture: fromGesture, mercuryWatchSeconds: 0 });
+    } else {
+      set({ selectedId, selectionFromGesture: fromGesture, mercuryWatchSeconds: 0 });
+    }
+    const after = get();
+    /*
+     * 门·符号（t19）：**名称与轨道都不在的时候还选得中一颗行星**。
+     * 判据本体在 observe.ts 的 `layerGateWitnessed`；这里只负责"在选中那一刻问一次"。
+     * 开关本身一次都不点门（见 toggleLabels / toggleOrbits 的注释）。
+     */
+    if (layerGateWitnessed(gateWatch(after), after.showLabels, after.showOrbits)) after.hitGate("layer");
+    /*
+     * 门·规律（1.3.4 / t19）：**不再"选中水星就亮"**。
+     * 旧口径（t28）是 `selectedId === "mercury"` 就 hitGate —— 批判位实测：点一下芯片、
+     * 甚至按一下键盘 2 就通关，而卡片第一屏印着「公转 88 地球日」。那测的是"点到了"，
+     * 不是"看见了它跑得最快"。现在要**盯着它跑完一整圈**，累计在 advanceSim 里做。
+     * 注意：选中月球也不点门（t13）—— 它是门·time 的前置条件，不是判据。
+     */
   },
   /*
    * 时间推进：唯一的生产端。**实境的冻结不在这里**（store 不知道系统单位），
@@ -386,23 +454,51 @@ export const useSim = create<SimStore>((set, get) => {
     if (s.paused) return;
     // 时间基准：`dt`（实秒）× speed × SECONDS_PER_SIM_SECOND（t44 定的 1.0× = 1 天/秒）
     const next = s.simSeconds + dt * s.speed * SECONDS_PER_SIM_SECOND;
+    /*
+     * 门·target 的累积（t19）：**和时钟同一拍写进 store**，不另开一次 set。
+     * 只在"水星被玩家选中"时为真；换目标 / URL 带出来的选中一律归零（判据在 observe.ts）。
+     * 已点亮就不再累加，省掉每帧的无谓状态变化。
+     */
+    const watched = s.gateLit.includes("target")
+      ? 0
+      : accumulateTargetWatch(s.mercuryWatchSeconds, next - s.simSeconds, gateWatch(s));
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     let wrote = false;
     if (now - lastDaysWrite >= 250) {
       lastDaysWrite = now;
       const d = daysOf(next);
       if (Math.abs(d - s.days) > 0.2) {
-        set({ simSeconds: next, days: d });
+        set({ simSeconds: next, days: d, mercuryWatchSeconds: watched });
         wrote = true;
       }
     }
-    if (!wrote) set({ simSeconds: next });
+    if (!wrote) set({ simSeconds: next, mercuryWatchSeconds: watched });
     /*
-     * 门·时间（t28）：**模拟时间真的走满一年**才算，不再看"摸没摸过时间控件"。
-     * `daysOf` 是唯一的换算处（t44），门也走它，不另写一份 365。
-     * `hitGate` 自己会去重，这里不必提前判（但留了 `includes` 省一次 set）。
+     * 门·规律（t19）：**看水星跑满一整圈**才亮（累积轨道角 ≥ 2π）。
+     * 卡片的「公转 88 地球日」让"谁最快"一眼可得，所以这一格不能只判"选中了水星"——
+     * 要真的盯着它走完模型里的一个 period（8.2 模拟秒，8× 下约 20.8 实秒）。
+     * 沙盘是正圆、角速度恒定 ⇒ 累积时间即累积角，换椭圆必须先改 observe.ts 的
+     * `TARGET_GATE_ORBIT_SECONDS`（那里写了什么情况会推翻它）。
      */
-    if (!s.gateLit.includes("time") && daysOf(next) >= DAYS_PER_YEAR) get().hitGate("time");
+    if (!s.gateLit.includes("target") && targetGateWitnessed(watched)) get().hitGate("target");
+    /*
+     * 门·时间（1.3.4，t13 补一条）：判据换成**月食 + 月球被玩家选中**，不再看钟面读数。
+     *
+     * 旧判据 `daysOf(next) >= DAYS_PER_YEAR` 只读钟：界面「设定时刻 → +1 年」一步就能把
+     * 读数从第 0 天推到第 365.25 天，门当场亮 —— 它测的是"钟走过去了"，不是"你看着它走过去"。
+     * 现在唯一的判据在 observe.ts：这段推进里有一次"月球进本影"，**且进入那一刻月球是选中的**。
+     * 和钟读数无关，所以跳时间制造不出点亮：只有 `advanceSim` 这条连续推进的路径会调用它，
+     * `setSimTime` 一次都不调（跳变不是目击）。
+     *
+     * 为什么判"进入"而不是"在里面"：跳变之后的第一帧可能正好落在影里，
+     * "在里面"会把那次跳当成目击；`eclipseEntry` 要求采样从外到内。
+     * 帧步长 8× 下 0.0066 模拟秒，食长 0.294 模拟秒 —— 一段月食被 40 多帧穿过。
+     *
+     * 为什么要"选中月球"（t13）：只判几何的话，8× 开局约 1.9 实秒就发生第一次月食，
+     * 零输入的玩家白拿一盏灯 —— 四把尺子第 1 条（能不能失败）不通过。选中是一次玩家动作，
+     * 也是"跟着月球看它变暗"的前提。t19 起还要求这条选中是**手势**引起的（深链不算）。
+     */
+    if (!s.gateLit.includes("time") && timeGateWitnessed(s.simSeconds, next, gateWatch(s))) get().hitGate("time");
   },
 
   setSimTime: (when) => {
