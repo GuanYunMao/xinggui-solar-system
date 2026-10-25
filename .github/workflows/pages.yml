@@ -1,0 +1,53 @@
+name: 部署网站
+
+# 网站是主形态：每次 push 到 main 都把 release/site 发到 GitHub Pages。
+# 单文件 HTML 仍由 build.yml 发在 Release，但它降级成离线备选。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: 确认站点产物
+        run: |
+          test -s release/site/index.html
+          ls -lh release/site/
+
+      # 闸：站点必须自洽，不许发一个打不开的站
+      - run: npm run check:shape
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: release/site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
