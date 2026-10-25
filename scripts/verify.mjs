@@ -1292,6 +1292,293 @@ const HUD_WHEEL_FOCUS_TOL = 0.01;
 const HUD_WHEEL_NOTCHES = 4;
 const HUD_WHEEL_NOTCH_GAP_MS = 100;
 
+// ——— 详情卡滚轮守卫（`card-scroll`）：指针在卡片正文上滚，场景不许动 ————
+//
+// 为什么要有它：`hud-wheel` 只守了"指针在 HUD 上滚**必须**缩放"这一侧；
+// 反过来那一侧——**指针在可滚正文上滚时滚轮要留给正文**——此前 `grep scrollTop` = 0 命中。
+//
+// 判法（队长定死，别简化）：**逐格采样**，按"这一格之前是否已到底"分两类判：
+//   · 未到底（`scrollTop < maxScroll`）：`ΔdistTarget` 必须是 **0**（±0.01）；
+//   · 已到底（`scrollTop ≥ maxScroll − 1`）：允许交回场景，但幅度要像**画布内单格**（0.65–1.35）；
+//   · 两类都必须至少采到一格，否则 `available:false` 并写原因（`n=0` 不许当通过）。
+const CARD_SCROLL_SELECTOR = "article .overflow-y-auto";
+const CARD_SCROLL_MAX_NOTCHES = 10;
+const CARD_SCROLL_GAP_MS = 130;
+const CARD_LEAK_TOL = 0.01;
+const CARD_HANDBACK_MIN = 0.65;
+const CARD_HANDBACK_MAX = 1.35;
+
+const cardState = (page) =>
+  page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    return {
+      scrollTop: el ? +el.scrollTop.toFixed(1) : null,
+      scrollHeight: el ? el.scrollHeight : null,
+      clientHeight: el ? el.clientHeight : null,
+      distTarget: window.__solarCamera?.().distTarget ?? null,
+    };
+  }, CARD_SCROLL_SELECTOR);
+
+async function runCardScroll(browser, base) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+  page.on("console", (m) => m.type() === "error" && errs.push(m.text()));
+  const out = { errors: errs };
+  try {
+    await page.goto(`${base}?diag=1`, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    if (!(await page.evaluate(() => typeof window.__solarCamera === "function"))) {
+      return { ...out, available: false, reason: "__solarCamera 探针缺失" };
+    }
+    await page.mouse.move(300, 40);
+    await page.waitForSelector("#chip-earth", { state: "visible", timeout: 5000 });
+    await page.locator("#chip-earth").click({ timeout: 8000, force: true });
+    await page.waitForSelector(CARD_SCROLL_SELECTOR, { state: "visible", timeout: 8000 });
+    await page.waitForTimeout(1200);
+    const box = await page.locator(CARD_SCROLL_SELECTOR).first().boundingBox();
+    if (!box) return { ...out, available: false, reason: "量不到卡片正文的位置" };
+    const pt = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
+    out.hit = await page.evaluate((p) => {
+      const el = document.elementFromPoint(p.x, p.y);
+      return el ? { tag: el.tagName, cls: String(el.className).slice(0, 48) } : null;
+    }, pt);
+
+    // 参照：画布内单格幅度（先量，避免被卡片的滚动改变相机状态后混入）
+    await page.mouse.move(640, 300);
+    await page.waitForTimeout(150);
+    const c0 = await page.evaluate(() => window.__solarCamera().distTarget);
+    await page.mouse.wheel(0, 120);
+    await page.waitForTimeout(400);
+    const c1 = await page.evaluate(() => window.__solarCamera().distTarget);
+    out.canvasSingleStep = { from: c0, to: c1, ratio: c0 ? +(c1 / c0).toFixed(4) : null };
+
+    // 指针压到卡片正文上，逐格采样
+    await page.mouse.move(pt.x, pt.y);
+    await page.waitForTimeout(200);
+    const start = await cardState(page);
+    out.start = start;
+    if (start.scrollHeight === null) return { ...out, available: false, reason: "读不到卡片正文的滚动高度" };
+    const maxScroll = start.scrollHeight - start.clientHeight;
+    out.maxScroll = maxScroll;
+    if (maxScroll <= 1) return { ...out, available: false, reason: `卡片正文不可滚（maxScroll=${maxScroll}）` };
+
+    const notches = [];
+    let prev = start;
+    for (let i = 0; i < CARD_SCROLL_MAX_NOTCHES; i++) {
+      const beforeBottom = prev.scrollTop < maxScroll - 1;
+      await page.mouse.wheel(0, 120);
+      await page.waitForTimeout(CARD_SCROLL_GAP_MS);
+      const next = await cardState(page);
+      notches.push({
+        i,
+        beforeBottom,
+        scrollTop: prev.scrollTop,
+        dScroll: +(next.scrollTop - prev.scrollTop).toFixed(1),
+        dDist: +(next.distTarget - prev.distTarget).toFixed(5),
+        ratio: prev.distTarget ? +(next.distTarget / prev.distTarget).toFixed(4) : null,
+      });
+      prev = next;
+      if (!beforeBottom) break; // 采到一格"到底后"的样本就够
+    }
+    out.notches = notches;
+    const beforeBottomSamples = notches.filter((n) => n.beforeBottom);
+    const atBottomSamples = notches.filter((n) => !n.beforeBottom);
+    out.counts = { beforeBottom: beforeBottomSamples.length, atBottom: atBottomSamples.length };
+    if (!beforeBottomSamples.length || !atBottomSamples.length) {
+      return {
+        ...out,
+        available: false,
+        reason: `没采全两类样本（未到底 ${beforeBottomSamples.length} / 到底后 ${atBottomSamples.length}）—— n=0 不许当通过`,
+      };
+    }
+    return { ...out, available: true };
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeCardScroll(res) {
+  const name = "card-scroll";
+  if (!res.available) {
+    failures.push(`${name}: 夹具不成立（${res.reason}）—— 没采成就没判，不许报绿`);
+    return res;
+  }
+  // ① 未到底的格：场景必须一点不动
+  for (const n of res.notches.filter((x) => x.beforeBottom)) {
+    if (Math.abs(n.dDist) > CARD_LEAK_TOL) {
+      failures.push(
+        `${name}: 第 ${n.i} 格（指针在卡片正文上，scrollTop ${n.scrollTop} < max ${res.maxScroll}）时场景也动了 —— ` +
+          `ΔdistTarget ${n.dDist}（容差 ±${CARD_LEAK_TOL}）。卡片滚轮守卫失效，滚轮漏给了场景。`,
+      );
+    }
+  }
+  // ② 到底后的格：允许交回，但幅度要像画布单格
+  const cs = res.canvasSingleStep?.ratio ?? null;
+  if (!cs) failures.push(`${name}: 画布内单格参照没量到 —— 交回场景的幅度无从比较`);
+  else {
+    for (const n of res.notches.filter((x) => !x.beforeBottom)) {
+      if (n.ratio !== null && (n.ratio < cs * CARD_HANDBACK_MIN || n.ratio > cs * CARD_HANDBACK_MAX)) {
+        failures.push(
+          `${name}: 到底后那一格交回场景的幅度不像单格 —— 卡片侧 ${n.ratio}× vs 画布侧 ${cs}×` +
+            `（允许 ${CARD_HANDBACK_MIN}–${CARD_HANDBACK_MAX} × 画布侧）。带了卡片累积速度/余量？`,
+        );
+      }
+    }
+  }
+  if (res.errors?.length) failures.push(`${name}: 控制台/页面报错 ${res.errors.length} 条`);
+  return res;
+}
+
+// ——— 潮汐锁定（`tidal-lock`）：锁定卫星的近地面朝向必须始终对着母天体 ————
+//
+// 为什么要有它：`t51` 修的是"月球与地球的相对转动不对"（用户报），修完**没有任何 pass 守它**——
+// `grep locked|tidal|潮汐` 在 verify.mjs 里只命中 HUD 的锁态。
+//
+// 口径（engineer2 的 `__solarSpin()`，别自己改算法）：
+//  · `spin` 是这一帧**实际写进** spin 节点的 rotation.y（应用后的值）；
+//  · `world` 是该天体**本地 +X 轴在世界系里的方向**（≈ 近地面朝向）。
+// **别拿 `spin` 直接减位置角**：月球在倾角层、赤道面卫星在母天体赤道层，会多出 2–3° 的系统差。
+// 这里用的是更稳的等价判据：**「近地面朝向」与「指向母天体」的夹角在多个时刻是常数**。
+// 锁定 ⇒ 夹角恒定（0° 或 180°，符号无所谓）；未锁定 ⇒ 夹角随时间变。
+//
+// ⚠ 覆盖名单是**夹具契约**：沙盘里六颗卫星都是 `locked: true`。将来加/删锁定卫星时同步改这里。
+const TIDAL_MOONS = [
+  ["moon", "earth"],
+  ["io", "jupiter"],
+  ["europa", "jupiter"],
+  ["ganymede", "jupiter"],
+  ["callisto", "jupiter"],
+  ["titan", "saturn"],
+];
+const TIDAL_T1 = 1;
+const TIDAL_T2 = 1.35; // 相隔约 0.35 模拟秒（≈7 显示日），足够让"没锁定"的差暴露出来
+const TIDAL_MAX_DELTA_DEG = 1;
+
+const tidalSnapshot = (page, t) =>
+  page.evaluate((t) => {
+    window.__solarTime.set(t);
+    return new Promise((resolve) => {
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => {
+          const spin = window.__solarSpin ? window.__solarSpin() : null;
+          const rows = window.__solarOrbitPlanes?.() ?? [];
+          const pos = { sol: [0, 0, 0], sun: [0, 0, 0] };
+          for (const r of rows) if (r.parent === "sun") pos[r.id] = r.rel.slice();
+          for (const r of rows) if (r.parent !== "sun") {
+            const p = pos[r.parent] ?? [0, 0, 0];
+            pos[r.id] = [p[0] + r.rel[0], p[1] + r.rel[1], p[2] + r.rel[2]];
+          }
+          resolve({ spin, pos });
+        }),
+      );
+    });
+  }, t);
+
+const angleBetweenDeg = (a, b) => {
+  const na = Math.hypot(...a);
+  const nb = Math.hypot(...b);
+  if (!(na > 1e-12 && nb > 1e-12)) return null;
+  const d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb);
+  return (Math.acos(Math.max(-1, Math.min(1, d))) * 180) / Math.PI;
+};
+
+async function runTidalLock(browser, base) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+  const page = await ctx.newPage();
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(e.message));
+  page.on("console", (m) => m.type() === "error" && errs.push(m.text()));
+  const out = { errors: errs, pair: "tidal", thresholds: { maxDeltaDeg: TIDAL_MAX_DELTA_DEG, t1: TIDAL_T1, t2: TIDAL_T2 } };
+  try {
+    await page.goto(`${base}?diag=1`, { waitUntil: "load", timeout: 30000 });
+    await page.waitForFunction(() => window.__solarReady === true, null, { timeout: 60000 });
+    await page.waitForTimeout(1200);
+    await page.keyboard.press(" "); // 暂停：时间由脚本钉
+    await page.waitForTimeout(200);
+    const probes = await page.evaluate(() => ({
+      spin: typeof window.__solarSpin === "function",
+      planes: typeof window.__solarOrbitPlanes === "function",
+      time: typeof window.__solarTime?.set === "function",
+    }));
+    out.probes = probes;
+    if (!probes.spin) return { ...out, available: false, reason: "__solarSpin 探针缺失（引擎侧 bffe915 才有）" };
+    if (!probes.planes || !probes.time) return { ...out, available: false, reason: "缺 __solarOrbitPlanes / __solarTime.set" };
+
+    const a = await tidalSnapshot(page, TIDAL_T1);
+    const b = await tidalSnapshot(page, TIDAL_T2);
+    const rows = [];
+    for (const [id, parent] of TIDAL_MOONS) {
+      const sa = a.spin?.[id];
+      const sb = b.spin?.[id];
+      const pa = a.pos[id];
+      const pb = b.pos[id];
+      const ga = a.pos[parent];
+      const gb = b.pos[parent];
+      if (!sa?.world || !sb?.world || !pa || !pb || !ga || !gb) {
+        rows.push({ id, parent, available: false, reason: "缺 spin.world 或世界位置" });
+        continue;
+      }
+      const dirToParentA = [ga[0] - pa[0], ga[1] - pa[1], ga[2] - pa[2]];
+      const dirToParentB = [gb[0] - pb[0], gb[1] - pb[1], gb[2] - pb[2]];
+      /*
+       * 投影到 XZ（黄道面）再比夹角：月球的 spin 节点在**自己的倾角层**里（6.7°），
+       * 直接与三维「指向地球」比会带一个随轨道缓慢漂移的倾角偏移——实测月球 6.68°→4.739°
+       * （差 1.94°），而五颗赤道面卫星全是 0.000°。那 1.94° 是坐标系层差，不是"没锁定"。
+       * 投到黄道面后两边的倾角分量一起被去掉，锁定性才可比。
+       */
+      const xz = (v) => [v[0], 0, v[2]];
+      const angA = angleBetweenDeg(xz(sa.world), xz(dirToParentA));
+      const angB = angleBetweenDeg(xz(sb.world), xz(dirToParentB));
+      const delta = angA !== null && angB !== null ? +Math.abs(angA - angB).toFixed(4) : null;
+      rows.push({
+        id,
+        parent,
+        available: true,
+        angleT1: angA !== null ? +angA.toFixed(3) : null,
+        angleT2: angB !== null ? +angB.toFixed(3) : null,
+        deltaDeg: delta,
+        spinT1: sa.spin,
+        spinT2: sb.spin,
+      });
+    }
+    out.moons = rows;
+    return { ...out, available: true };
+  } finally {
+    await ctx.close();
+  }
+}
+
+function judgeTidalLock(res) {
+  const name = "tidal-lock";
+  if (!res.available) {
+    failures.push(`${name}: 夹具不成立（${res.reason}）—— 没采到就不许报绿`);
+    return res;
+  }
+  const rows = res.moons ?? [];
+  if (!rows.length) {
+    failures.push(`${name}: 一颗锁定卫星都没采到 —— 判据失去对象`);
+    return res;
+  }
+  for (const m of rows) {
+    if (!m.available) {
+      failures.push(`${name}: ${m.id}/${m.parent} 读不到朝向（${m.reason}）—— 缺失不许静默`);
+    } else if (m.deltaDeg === null) {
+      failures.push(`${name}: ${m.id}/${m.parent} 夹角算不出（朝向或位置为零向量）`);
+    } else if (m.deltaDeg > TIDAL_MAX_DELTA_DEG) {
+      failures.push(
+        `${name}: ${m.id} 没有潮汐锁定 —— 「近地面朝向」与「指向 ${m.parent}」的夹角在 t=${TIDAL_T1} 是 ${m.angleT1}°，` +
+          `t=${TIDAL_T2} 是 ${m.angleT2}°，差 ${m.deltaDeg}° > ${TIDAL_MAX_DELTA_DEG}°。` +
+          `锁定卫星的近地面必须始终对着母天体（t51 的修复点）。`,
+      );
+    }
+  }
+  if (res.errors?.length) failures.push(`${name}: 控制台/页面报错 ${res.errors.length} 条`);
+  return res;
+}
+
 const hudWheelProbe = (page, pt) =>
   page.evaluate(({ x, y }) => {
     const el = document.elementFromPoint(x, y);
@@ -2090,6 +2377,24 @@ function judgeHudAutoHide(res) {
       results.push({ pass: "eclipse-hemisphere", 分类: "结构量（整盘平均亮度 + 几何分组）", ...judgeEclipseHemisphere(ec) });
     } catch (err) {
       failures.push(`eclipse-hemisphere: ${err.message}`);
+    }
+  }
+  // ——— 潮汐锁定（锁定卫星的近地面朝向必须对着母天体）———
+  if (want("tidal-lock")) {
+    try {
+      const tl = await runTidalLock(browser, base);
+      results.push({ pass: "tidal-lock", 分类: "结构量（世界朝向夹角，两个时刻之差）", ...judgeTidalLock(tl) });
+    } catch (err) {
+      failures.push(`tidal-lock: ${err.message}`);
+    }
+  }
+  // ——— 详情卡滚轮守卫（卡片正文滚，场景不许动）———
+  if (want("card-scroll")) {
+    try {
+      const csr = await runCardScroll(browser, base);
+      results.push({ pass: "card-scroll", 分类: "结构量（逐格 scrollTop / distTarget）", ...judgeCardScroll(csr) });
+    } catch (err) {
+      failures.push(`card-scroll: ${err.message}`);
     }
   }
   // XG_ONLY 设了就不再往下跑：反向测试只关心某条 page pass 会不会红，数值段是最费时的部分。
