@@ -4,6 +4,7 @@ import { SolarCanvas } from "./solar/SolarCanvas";
 import { BODY_BY_ID } from "./solar/data";
 import { markVisited } from "./solar/progress";
 import { APP_FULL_NAME } from "./solar/brand";
+import { OrbitGlyph } from "./solar/BrandMark";
 import { useSim } from "./solar/store";
 import { SystemProvider } from "./solar/system-context";
 import { REAL_PROTO, REAL_SYSTEM } from "./solar/systems";
@@ -155,9 +156,13 @@ export function App() {
           所以它不进水印、不进 HUD 角落，只在这里居中排开。
           不设 z-index：首帧画出后画布（z-0）会自然盖住它，等于自动退场。
         */}
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3">
-          <p className="font-display text-4xl leading-none tracking-[0.06em] text-fg">{APP_FULL_NAME}</p>
-          <p className="text-xs tracking-[0.3em] text-subtle">正在展开星图</p>
+        <div className="boot-screen pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-6 text-center">
+          <div className="boot-mark">
+            <OrbitGlyph className="size-10" />
+          </div>
+          <p className="boot-title font-display leading-tight text-fg">{APP_FULL_NAME}</p>
+          <p className="boot-code">SOLAR CARTOGRAPHY / XG—01</p>
+          <p className="boot-status">正在展开星图</p>
         </div>
         <div className="absolute inset-0 z-0 overflow-hidden" role="img" aria-label="太阳系三维场景">
           {ready ? <SolarCanvas /> : null}

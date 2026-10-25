@@ -1,4 +1,4 @@
-﻿import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import * as THREE from "three";
@@ -1326,7 +1326,96 @@ function BodyNode({
  * 之后每帧直接写 transform。切系统时没有任何节点被卸载，也就没有可抢的东西。
  * 顺带省掉 15 个 portal 和它们的 context —— 这是净减，不是净增。
  */
-type LabelNode = { el: HTMLSpanElement; text: string; selected: boolean };
+type LabelNode = { el: HTMLSpanElement; text: string; selected: boolean; width: number; height: number };
+type ScreenRect = { left: number; right: number; top: number; bottom: number };
+type LabelCandidate = {
+  node: LabelNode;
+  rect: ScreenRect;
+  selected: boolean;
+  prominence: number;
+  depth: number;
+  order: number;
+};
+type LabelFrameBody = { body: Body; center: THREE.Vector3; depth: number };
+
+/** 总览之外再拉远 35%，名称整批退出；近景则按各天体的取景尺度保留。 */
+const SANDBOX_LABEL_RANGE = 1.35;
+const SANDBOX_LABEL_DEPTH = 1.8;
+
+/**
+ * 相机到标签目标点的线段是否穿过其他天体。全部用标量计算，避免每帧为
+ * 「天体数 × 标签数」创建射线与临时向量；不显示名称的卫星也参与遮挡。
+ */
+function labelPointOccluded(
+  cameraPosition: THREE.Vector3,
+  target: THREE.Vector3,
+  frameBodies: readonly LabelFrameBody[],
+  targetId: string,
+) {
+  const sx = target.x - cameraPosition.x;
+  const sy = target.y - cameraPosition.y;
+  const sz = target.z - cameraPosition.z;
+  const segmentLengthSq = sx * sx + sy * sy + sz * sz;
+  if (segmentLengthSq < 1e-12) return false;
+
+  for (const { body, center } of frameBodies) {
+    if (body.id === targetId) continue;
+    const ox = center.x - cameraPosition.x;
+    const oy = center.y - cameraPosition.y;
+    const oz = center.z - cameraPosition.z;
+    const radiusSq = body.radius * body.radius;
+    // 相机已经在这个天体内部时，不把它当成前方的一块遮挡板。
+    if (ox * ox + oy * oy + oz * oz <= radiusSq) continue;
+    const along = (ox * sx + oy * sy + oz * sz) / segmentLengthSq;
+    if (along <= 0 || along >= 1) continue;
+    const closestX = ox - along * sx;
+    const closestY = oy - along * sy;
+    const closestZ = oz - along * sz;
+    if (closestX * closestX + closestY * closestY + closestZ * closestZ <= radiusSq) return true;
+  }
+  return false;
+}
+
+const rectsOverlap = (a: ScreenRect, b: ScreenRect, gap = 0) =>
+  a.left < b.right + gap && a.right > b.left - gap && a.top < b.bottom + gap && a.bottom > b.top - gap;
+
+function screenRect(el: Element): ScreenRect | null {
+  const r = el.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return null;
+  return { left: r.left, right: r.right, top: r.top, bottom: r.bottom };
+}
+
+/** 名称不能落在舱面下面：顶部、底台、详情与浮层都作为真实屏幕遮挡体。 */
+function hudLabelRects() {
+  const rects: ScreenRect[] = [];
+  const elements = document.querySelectorAll(
+    '[data-hud-chrome], [data-label-occluder="true"], [data-overlay-open="true"]',
+  );
+  for (const element of elements) {
+    const rect = screenRect(element);
+    if (rect) rects.push(rect);
+  }
+  return rects;
+}
+
+/**
+ * 竖屏取景不再是固定的 0.55 半高。读取上下舱面与详情卡的真实边界，
+ * 把天体放在可用观测区中央；收成标题条后自然回到屏幕中部。
+ */
+function portraitObservationLift(height: number) {
+  const sheet = document.querySelector("article[data-sheet-stop]");
+  if (!sheet) return 0.55;
+  const sheetRect = screenRect(sheet);
+  if (!sheetRect) return 0.55;
+  const top = document.querySelector('[data-hud-chrome="top"]');
+  const dock = document.querySelector('[data-hud-chrome="dock"]');
+  const upper = top ? (screenRect(top)?.bottom ?? 0) : 0;
+  let lower = sheetRect.top;
+  if (dock) lower = Math.min(lower, screenRect(dock)?.top ?? height);
+  if (lower - upper < 72) return 0.55;
+  const desiredY = upper + (lower - upper) * 0.5;
+  return THREE.MathUtils.clamp(1 - (2 * desiredY) / height, 0, 0.55);
+}
 
 function Labels() {
   const gl = useThree((state) => state.gl);
@@ -1339,7 +1428,11 @@ function Labels() {
 
   const host = useRef<HTMLDivElement | null>(null);
   const pool = useRef(new Map<string, LabelNode>());
+  const framePool = useRef(new Map<string, LabelFrameBody>());
   const world = useMemo(() => new THREE.Vector3(), []);
+  const uiRects = useRef<ScreenRect[]>([]);
+  const uiTick = useRef(0);
+  const uiSize = useRef("");
 
   useEffect(() => {
     const parent = gl.domElement.parentElement;
@@ -1366,68 +1459,134 @@ function Labels() {
     const w = el.clientWidth;
     const h = el.clientHeight;
     if (w < 2 || h < 2) return;
-    // 标签投影的焦距与拾取器同源（pick.ts 的 focalPx）——以前这里自己写了一份
+    // 标签投影的焦距与拾取器同源（pick.ts 的 focalPx）。
     const focal = focalPx(h, persp.fov);
     const nodes = pool.current;
-    // baseOn = HUD 的开关 且 这个系统声明了 look.labels；选中的那颗不受它管（见下面 `on` 的
-    // 定义），卫星则一律不给标签 —— 沙盘里会叠成一团
     const baseOn = showLabels && look.labels;
+    const sizeKey = `${w}×${h}`;
+    if (uiSize.current !== sizeKey || uiTick.current++ % 4 === 0) {
+      uiSize.current = sizeKey;
+      uiRects.current = hudLabelRects();
+    }
 
-    /*
-     * 先回收这一帧不在系统里的旧节点。
-     * 切系统时 bodies 从 15 个变成 3 个，循环只遍历新 bodies，旧标签节点
-     * 就永远留在容器里 —— 实境画面上会飘着"木星/海王星/土星"这些沙盘的名字。
-     */
     const alive = new Set(bodies.map((b) => b.id));
     for (const [key, node] of nodes) {
       if (alive.has(key)) continue;
       node.el.remove();
       nodes.delete(key);
     }
+    for (const key of framePool.current.keys()) {
+      if (!alive.has(key)) framePool.current.delete(key);
+    }
+    // 每帧先全部退场；只有通过距离、实体、屏幕与 HUD 检查的名称才重新点亮。
+    for (const node of nodes.values()) node.el.style.display = "none";
 
+    // 所有已挂载天体都进入遮挡集合，包括本身不显示名称的卫星。
+    const frameBodies: LabelFrameBody[] = [];
     for (const body of bodies) {
       const group = reg.groups.get(body.id);
-      const on = Boolean(group) && (selectedId === body.id || (baseOn && !isMoon(body)));
+      if (!group) continue;
+      let frame = framePool.current.get(body.id);
+      if (!frame) {
+        frame = { body, center: new THREE.Vector3(), depth: 0 };
+        framePool.current.set(body.id, frame);
+      }
+      frame.body = body;
+      group.getWorldPosition(frame.center);
+      frame.depth = frame.center.distanceTo(camera.position);
+      frameBodies.push(frame);
+    }
+
+    const homeDistance = Math.hypot(...homePose(w, h).position);
+    const selectedFrame = frameBodies.find(({ body }) => body.id === selectedId);
+    // 聚焦远处天体后应以该天体为距离基准，不能误用它的日心坐标。
+    const observationDistance = selectedFrame?.depth ?? camera.position.length();
+    if (look.camera === "sandbox" && observationDistance > homeDistance * SANDBOX_LABEL_RANGE) return;
+
+    const candidates: LabelCandidate[] = [];
+    let order = 0;
+    for (const { body, center, depth } of frameBodies) {
+      const on = selectedId === body.id || (baseOn && !isMoon(body));
+      const maxDepth =
+        look.camera === "sandbox"
+          ? homeDistance * SANDBOX_LABEL_DEPTH
+          : Math.max(body.focus * 48, body.radius * 200);
+      if (!on || depth > maxDepth) continue;
+      // 球心被挡时不保留半个名称；球顶锚点被挡时也同样让位。
+      if (labelPointOccluded(camera.position, center, frameBodies, body.id)) continue;
+
+      // 标签挂在球顶：偏移量随天体半径走。
+      world.copy(center);
+      world.y += body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
+      if (labelPointOccluded(camera.position, world, frameBodies, body.id)) continue;
+      world.project(camera);
+      if (world.z > 1) continue;
+      const x = (world.x * 0.5 + 0.5) * w;
+      const y = (-world.y * 0.5 + 0.5) * h;
+
       const key = body.id;
       let node = nodes.get(key);
-      if (!on) {
-        if (node) node.el.style.display = "none";
-        continue;
-      }
       if (!node) {
         const span = document.createElement("span");
         span.className = "star-label";
-        // .star-label 本身没有定位：以前是 drei 的 Html 外层容器负责绝对定位，
-        // 现在直接给元素定位，transform 才是它的位移而不是偏移。
         span.style.cssText = "position:absolute;left:0;top:0;will-change:transform";
         el.appendChild(span);
-        node = { el: span, text: "", selected: false };
+        node = { el: span, text: "", selected: false, width: 0, height: 0 };
         nodes.set(key, node);
       }
       const selected = selectedId === body.id;
       if (node.text !== body.name) {
         node.el.textContent = body.name;
         node.text = body.name;
+        node.width = 0;
       }
       if (node.selected !== selected) {
         node.el.className = selected ? "star-label is-selected" : "star-label";
         node.selected = selected;
+        node.width = 0;
       }
-      group!.getWorldPosition(world);
-      // 标签挂在球顶：偏移量随天体半径走，和以前 <Html position={[0, y, 0]}> 一致
-      world.y += body.texture === "sun" ? body.radius * 2.15 : body.radius * 1.85;
-      world.project(camera);
-      const behind = world.z > 1;
-      const x = (world.x * 0.5 + 0.5) * w;
-      const y = (-world.y * 0.5 + 0.5) * h;
-      if (behind || x < -200 || x > w + 200 || y < -80 || y > h + 80) {
+      node.el.style.display = "block";
+      node.el.style.visibility = "hidden";
+      if (node.width < 1 || node.height < 1) {
+        node.width = node.el.offsetWidth;
+        node.height = node.el.offsetHeight;
+      }
+      node.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`;
+      const rect = {
+        left: x - node.width * 0.5,
+        right: x + node.width * 0.5,
+        top: y - node.height * 0.5,
+        bottom: y + node.height * 0.5,
+      };
+      if (rect.right < 0 || rect.left > w || rect.bottom < 0 || rect.top > h) {
         node.el.style.display = "none";
         continue;
       }
-      node.el.style.display = "";
-      node.el.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -50%)`;
-      // focal 只用来给将来的最小字号做参考，先留着免得未使用告警
-      void focal;
+      candidates.push({
+        node,
+        rect,
+        selected,
+        prominence: (focal * body.radius) / Math.max(depth, 1e-6),
+        depth,
+        order: order++,
+      });
+    }
+
+    // 选中目标优先，其次是在画面上更大的天体；低优先级名称让位，不再互相压字。
+    candidates.sort(
+      (a, b) =>
+        Number(b.selected) - Number(a.selected) ||
+        b.prominence - a.prominence ||
+        a.depth - b.depth ||
+        a.order - b.order,
+    );
+    const accepted: ScreenRect[] = [];
+    for (const candidate of candidates) {
+      const coveredByHud = uiRects.current.some((rect) => rectsOverlap(candidate.rect, rect, 3));
+      const coveredByLabel = accepted.some((rect) => rectsOverlap(candidate.rect, rect, 6));
+      if (coveredByHud || coveredByLabel) continue;
+      candidate.node.el.style.visibility = "visible";
+      accepted.push(candidate.rect);
     }
   });
 
@@ -2513,8 +2672,8 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     else ps.dest.set(0, 0, 0);
     if (h > w) {
       const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
-      // 半高 = focalPx 的反解，和拾取器/标签用同一条 fov 约定（pick.ts 的 halfSpanAt）
-      ps.dest.y -= halfSpanAt(cur.toDist, fov) * 0.55;
+      // 半高 = focalPx 的反解；抬高量由当前舱面实际留下的观测区决定。
+      ps.dest.y -= halfSpanAt(cur.toDist, fov) * portraitObservationLift(h);
     }
     out.target.copy(cur.fromTarget).lerp(ps.dest, u);
     const dist = Math.exp(
@@ -2916,10 +3075,24 @@ function SandboxCamera({ controlsRef }: { controlsRef: RefObject<OrbitControlsIm
     if (!obj) return;
     obj.getWorldPosition(scratch.dest);
     scratch.delta.copy(scratch.dest).sub(prevPlanet.current);
-    if (scratch.delta.lengthSq() < 1e-10) return;
-    camera.position.add(scratch.delta);
-    controls.target.add(scratch.delta);
-    prevPlanet.current.copy(scratch.dest);
+    if (scratch.delta.lengthSq() >= 1e-10) {
+      camera.position.add(scratch.delta);
+      controls.target.add(scratch.delta);
+      prevPlanet.current.copy(scratch.dest);
+    }
+
+    // 面板收放或上下舱面收纳时，重新分配竖屏观测区；暂停中也要能回到中央。
+    const viewW = sizeRef.current.width;
+    const viewH = sizeRef.current.height;
+    if (viewH > viewW) {
+      const fov = (camera as THREE.PerspectiveCamera).fov ?? 56;
+      const dist = Math.max(camera.position.distanceTo(controls.target), 1e-3);
+      const desiredY = scratch.dest.y - halfSpanAt(dist, fov) * portraitObservationLift(viewH);
+      const blend = 1 - Math.exp(-delta * 12);
+      const correction = (desiredY - controls.target.y) * blend;
+      controls.target.y += correction;
+      camera.position.y += correction;
+    }
 
     /*
      * 跟随卫星时要躲开母天体。

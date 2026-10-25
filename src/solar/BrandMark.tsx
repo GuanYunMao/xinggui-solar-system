@@ -9,14 +9,19 @@ export function OrbitGlyph({ className }: { className?: string }) {
   return (
     <svg
       className={className}
-      viewBox="0 0 32 32"
+      viewBox="0 0 40 40"
       fill="none"
       aria-hidden="true"
       focusable="false"
     >
-      <circle cx="16" cy="17" r="8.5" stroke="currentColor" strokeOpacity="0.55" strokeWidth="1.7" />
-      <circle cx="16" cy="17" r="1.35" fill="currentColor" />
-      <circle cx="22.6" cy="11.2" r="2.15" fill="currentColor" />
+      {/* 非对称轨道 + 象限刻线：像一枚测绘仪标，而不是通用的“星球”图标。 */}
+      <ellipse cx="20" cy="20" rx="14" ry="7.5" transform="rotate(-32 20 20)" stroke="currentColor" strokeOpacity="0.72" strokeWidth="1.2" />
+      <ellipse cx="20" cy="20" rx="9.5" ry="14" transform="rotate(38 20 20)" stroke="currentColor" strokeOpacity="0.28" strokeWidth="1" />
+      <path d="M20 3V8M20 32V37M3 20H8M32 20H37" stroke="currentColor" strokeOpacity="0.62" strokeWidth="1.2" />
+      <path d="M17 20H23M20 17V23" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="20" cy="20" r="2.2" fill="currentColor" />
+      <circle cx="30.7" cy="11.6" r="2.3" fill="currentColor" />
+      <circle cx="30.7" cy="11.6" r="4.2" stroke="currentColor" strokeOpacity="0.35" strokeWidth="1" />
     </svg>
   );
 }

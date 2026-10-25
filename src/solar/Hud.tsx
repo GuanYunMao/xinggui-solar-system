@@ -81,6 +81,8 @@ type ChromeApi = {
   dockRef: RefObject<HTMLDivElement | null>;
   expandTop: () => void;
   expandDock: () => void;
+  collapseTop: () => void;
+  collapseDock: () => void;
 };
 
 const ChromeContext = createContext<ChromeApi | null>(null);
@@ -225,6 +227,8 @@ function useChromeState({ compact, autoHide }: { compact: boolean; autoHide: boo
     dockRef,
     expandTop: () => setTop(false),
     expandDock: () => setDock(false),
+    collapseTop: () => setTop(true),
+    collapseDock: () => setDock(true),
   };
 }
 
@@ -442,14 +446,12 @@ function RealInstruments() {
   );
   return (
     <div
-      className="real-controls pointer-events-auto mt-1 flex items-center justify-between gap-2 px-4 md:mt-2 md:px-6"
+      className="real-controls real-instruments pointer-events-auto mt-1 flex items-center justify-between gap-2 px-4 md:mt-2 md:px-6"
       data-real-focus={focus}
     >
       <p className="flex min-w-0 items-baseline gap-2 text-xs text-muted">
-        {/* 窄屏省掉「距离」二字（320 下这一行要和两个取景按钮并排，见 t5 的宽度预算） */}
-        <span className="hidden shrink-0 sm:inline">距离</span>
-        {/* null 时显示「—」：0 会被读成「贴脸了」，那是谎言 */}
-        <span data-real-distance={formatDistanceMeters(distance)} className="shrink-0 text-sm tabular-nums text-fg">
+        <span className="hidden shrink-0 font-mono text-[10px] tracking-widest text-subtle sm:inline">RANGE</span>
+        <span data-real-distance={formatDistanceMeters(distance)} className="real-distance shrink-0 text-sm tabular-nums text-fg">
           {formatDistanceMeters(distance)}
         </span>
         <span className="min-w-0 truncate text-subtle">距{targetName}</span>
@@ -475,19 +477,21 @@ function RealInstruments() {
  */
 function HudHeader({ trailing }: { trailing?: ReactNode }) {
   return (
-    <header className="flex items-center justify-between gap-2 px-4 pt-3 md:gap-3 md:px-6 md:pt-6">
-      <div className="sky-title flex min-w-0 items-center gap-2.5">
-        <h1 className="flex items-center gap-1.5 md:gap-2">
-          <OrbitGlyph className="size-7 shrink-0 text-fg md:size-8" />
-          <span className="text-sm leading-none tracking-[0.2em] text-muted md:text-base">{APP_ERA_NAME}</span>
+    <header className="hud-header flex items-center justify-between gap-2 px-4 pt-3 md:gap-3 md:px-6 md:pt-6">
+      <div className="brand-lockup sky-title flex min-w-0 items-center gap-2.5">
+        <div className="brand-emblem">
+          <OrbitGlyph className="size-7 shrink-0 md:size-8" />
+        </div>
+        <h1 className="min-w-0">
+          <span className="brand-era">
+            {APP_ERA_NAME}
+            <span className="brand-code">XG—01</span>
+          </span>
+          <span className="brand-subtitle block">SOLAR CARTOGRAPHY</span>
         </h1>
-        <span className="eyebrow hidden text-[11px] text-subtle sm:inline">{versionLabel(__APP_VERSION__)}</span>
+        <span className="eyebrow hidden text-[10px] text-subtle sm:inline">{versionLabel(__APP_VERSION__)}</span>
       </div>
-      {/*
-        右侧单行：模式徽标 + （沙盘的）模拟历。徽标占的是「区划」的位置，
-        绝不下放到底栏——底栏 grid-cols-5 已满，而且底栏是玩具区（暂停/图层）。
-      */}
-      <div className="pointer-events-auto flex shrink-0 items-center gap-1.5 md:gap-2">
+      <div className="hud-header-actions pointer-events-auto flex shrink-0 items-center gap-1.5 md:gap-3">
         <ModeBadge />
         {trailing}
       </div>
@@ -500,13 +504,10 @@ function Epoch() {
   const paused = useSim((state) => state.paused);
   const days = useSim((state) => state.days);
   return (
-    <>
-      <span className="h-4 w-px shrink-0 bg-line" aria-hidden />
-      <div className="sky-title flex items-baseline gap-1.5 whitespace-nowrap">
-        <span className="hidden text-xs text-muted sm:inline">{paused ? "已暂停" : "模拟历"}</span>
-        <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
-      </div>
-    </>
+    <div className="epoch-readout sky-title shrink-0 whitespace-nowrap" data-paused={paused ? "true" : "false"}>
+      <span className="epoch-label">{paused ? "HOLD / 已暂停" : "T+ / 模拟历"}</span>
+      <p className="text-lg tabular-nums text-fg">{formatEpoch(days)}</p>
+    </div>
   );
 }
 
@@ -519,25 +520,16 @@ function Chips({ compact }: { compact: boolean }) {
   const selected = selectedId ? byId[selectedId] : undefined;
   const rowRef = useRef<HTMLDivElement>(null);
   const [edge, setEdge] = useState({ left: false, right: false });
-  /**
-   * 展开态。窄屏默认收起（一行横滑），宽屏恒为展开（换行成网格）。
-   * **同一个组件两种展开状态**，不是两份实现：t26 那条"差异从运行时条件变成结构上不存在"
-   * 在这里的具体落法是「宽度只决定初始展开状态」，决定完之后两端的 DOM 是同一套。
-   */
   const [open, setOpen] = useState(false);
   const expanded = compact ? open : true;
   const chrome = useChrome();
 
-  /*
-   * 渐隐提示：判据是**真的溢出了没有**，不是"宽度小于某个数"。
-   * 390 宽收起态下 9 颗只露 5.4 颗，右侧必须告诉人还有东西；展开态换行了就不用提示。
-   */
   const measure = useCallback(() => {
     const el = rowRef.current;
     if (!el) return;
     const left = el.scrollLeft > 2;
     const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
-    setEdge((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+    setEdge((previous) => (previous.left === left && previous.right === right ? previous : { left, right }));
   }, []);
 
   useEffect(() => {
@@ -545,7 +537,7 @@ function Chips({ compact }: { compact: boolean }) {
     if (!el) return;
     measure();
     el.addEventListener("scroll", measure, { passive: true });
-    const ro = new ResizeObserver(measure); // 转屏、窗口拉伸、字体变化、展开/收起都会走到这里
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => {
       el.removeEventListener("scroll", measure);
@@ -553,11 +545,6 @@ function Chips({ compact }: { compact: boolean }) {
     };
   }, [measure, expanded]);
 
-  /*
-   * 从把手展开时把当前选中那颗滚回视野（t12）。
-   * `useKeepChipVisible` 只在 selectedId 变化时跑；收起期间选中态没变，
-   * 展开那一刻行是从头开始挂载的，不补这一下就会停在最左边。
-   */
   useEffect(() => {
     if (!expanded) return;
     const id = useSim.getState().selectedId;
@@ -565,24 +552,20 @@ function Chips({ compact }: { compact: boolean }) {
     document.getElementById(`chip-${id}`)?.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
   }, [expanded]);
 
-  /*
-   * 收起态：整行换成**一枚可发现的把手**（不是凭空消失）。
-   * 把手是按钮（≥44px 高），点它展开；鼠标移回顶部区由 useChromeState 的矩形判定负责。
-   */
   if (chrome?.top) {
     return (
-      <div className="relative mt-2 md:mt-3">
+      <div className="body-nav relative">
         <div className="px-4 pb-1 md:px-6">
           <button
             type="button"
-            className="hud-btn chrome-in pointer-events-auto inline-flex h-11 items-center gap-2 rounded-full border border-line bg-elevated px-3 text-sm text-fg md:h-8 md:text-xs"
+            className="hud-btn chrome-in pointer-events-auto inline-flex h-11 items-center gap-2 border px-3 text-sm text-fg md:h-9 md:text-xs"
             aria-label="展开天体列表"
             aria-expanded={false}
             onClick={chrome.expandTop}
           >
-            <span className="tracking-[0.15em] text-muted">天体</span>
+            <span className="tracking-[0.15em] text-muted">NAV / 天体</span>
             <span className="max-w-[8rem] truncate">{selected ? selected.name : "未选择"}</span>
-            <span className="text-subtle">全部 {chips.length}</span>
+            <span className="font-mono text-[10px] text-subtle">{String(chips.length).padStart(2, "0")}</span>
             <ChevronDown className="size-3.5" aria-hidden />
           </button>
         </div>
@@ -591,40 +574,58 @@ function Chips({ compact }: { compact: boolean }) {
   }
 
   return (
-    <div className="relative mt-2 md:mt-3">
-      {/*
-        窄屏的收起条：一句「天体 · 当前」加重一个展开键。
-        宽屏没有这条 —— 宽屏的 9 颗本来就一屏放得下，多一行标题只是噪声。
-      */}
-      {compact && (
-        <div className="pointer-events-auto flex items-center justify-between gap-2 px-4 pb-1">
+    <div className="body-nav relative">
+      <div className="nav-caption pointer-events-none flex items-center justify-between gap-2 px-4 pb-1 md:px-6">
+        {compact ? (
           <p className="flex min-w-0 items-baseline gap-2 text-xs text-subtle">
-            <span className="tracking-[0.15em] text-muted">天体</span>
-            <span className="truncate text-fg">{selected ? selected.name : "未选择"}</span>
+            <span className="tracking-[0.15em] text-muted">NAV / 天体</span>
+            <span className="truncate font-sans text-fg">{selected ? selected.name : "未锁定"}</span>
           </p>
+        ) : (
+          <span>NAV / 天体索引</span>
+        )}
+        <div className="pointer-events-auto flex shrink-0 items-center gap-1.5">
+          {!compact && <span>01—{String(chips.length).padStart(2, "0")}</span>}
+          {compact && (
+            <button
+              type="button"
+              className="hud-btn inline-flex h-8 shrink-0 items-center gap-1 border px-2.5 text-xs text-muted"
+              aria-label="天体列表"
+              aria-expanded={open}
+              onClick={() => setOpen((previous) => !previous)}
+            >
+              {expanded ? "收起" : `全部 ${chips.length}`}
+              <ChevronDown className={`size-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden />
+            </button>
+          )}
           <button
             type="button"
-            className="hud-btn inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-line px-2.5 text-xs text-muted"
-            aria-label="天体列表"
-            aria-expanded={open}
-            onClick={() => setOpen((prev) => !prev)}
+            className="hud-btn inline-flex h-8 shrink-0 items-center justify-center gap-1 border px-2 text-xs text-muted"
+            aria-label="收起天体列表"
+            aria-expanded={true}
+            title="收起天体索引"
+            onClick={() => {
+              setOpen(false);
+              chrome?.collapseTop();
+            }}
           >
-            {expanded ? "收起" : `全部 ${chips.length}`}
-            <ChevronDown className={`size-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden />
+            <ChevronUp className="size-3.5" aria-hidden />
+            <span className="hidden md:inline">收起</span>
           </button>
         </div>
-      )}
+      </div>
 
       <div
         ref={rowRef}
         id="chip-row"
+        data-label-occluder={compact && open ? "true" : undefined}
         className={
           expanded
             ? "chip-row pointer-events-auto flex flex-wrap gap-1.5 px-4 pb-1 md:gap-2 md:px-6"
             : "chip-row pointer-events-auto flex gap-2 overflow-x-auto px-4 pb-1 md:px-6"
         }
       >
-        {chips.map((body) => {
+        {chips.map((body, index) => {
           const moonOfThis = selected?.parent === body.id && selected.parent !== "sun";
           const active = selectedId === body.id || moonOfThis;
           return (
@@ -632,34 +633,28 @@ function Chips({ compact }: { compact: boolean }) {
               key={body.id}
               id={`chip-${body.id}`}
               type="button"
-              className={`hud-btn inline-flex h-11 shrink-0 items-center gap-2 rounded-full border px-3 text-sm ${
-                active ? "border-accent bg-accent text-accent-fg" : "border-line bg-elevated text-fg"
-              }`}
+              className="hud-btn inline-flex h-11 shrink-0 items-center gap-2 border px-3 text-sm"
               aria-pressed={active}
-              onClick={() => select(body.id)}
+              onClick={() => {
+                select(body.id);
+                if (compact) setOpen(false);
+              }}
             >
-              <span className="size-2 rounded-full" style={{ backgroundColor: body.swatch }} />
-              {body.name}
+              <span className="size-1.5 rounded-full" style={{ backgroundColor: body.swatch }} aria-hidden />
+              <span className="chip-index" aria-hidden>{String(index + 1).padStart(2, "0")}</span>
+              <span>{body.name}</span>
             </button>
           );
         })}
       </div>
-      {/* 右侧：还有天体没展开。箭头 + 渐隐同时给，因为"隐约看到半颗"和"知道还有东西"是两件事 */}
-      {edge.right && (
-        <div
-          data-fade="right"
-          className="pointer-events-none absolute inset-y-0 right-0 z-[1] flex w-12 items-center justify-end bg-gradient-to-l from-black/80 via-black/40 to-transparent pr-1"
-        >
+      {edge.right && !expanded && (
+        <div data-fade="right" className="pointer-events-none absolute inset-y-0 right-0 z-[1] flex w-12 items-center justify-end pr-1">
           <ChevronRight className="size-4 text-muted" aria-hidden />
           <span className="sr-only">右侧尚有天体，横向滑动展开</span>
         </div>
       )}
-      {/* 左侧：已经滑开了，反向同款，但不要箭头（箭头会让人以为这是"前进"） */}
-      {edge.left && (
-        <div
-          data-fade="left"
-          className="pointer-events-none absolute inset-y-0 left-0 z-[1] w-8 bg-gradient-to-r from-black/80 via-black/40 to-transparent"
-        />
+      {edge.left && !expanded && (
+        <div data-fade="left" className="pointer-events-none absolute inset-y-0 left-0 z-[1] w-8" />
       )}
     </div>
   );
@@ -745,14 +740,18 @@ const CARD_CLUES: Record<string, string> = {
 function CardShell({
   id,
   maxHeight,
+  sheetStop,
+  dragging = false,
   handle,
   onBodyClick,
   children,
 }: {
   id: string;
   maxHeight?: string;
+  sheetStop?: SheetStop;
+  dragging?: boolean;
   handle?: ReactNode;
-  /** 窄屏：点卡片本体也能开合（t13）。桌面不传，避免和「返回总览」抢点击。 */
+  /** 窄屏：点卡片本体也能开合。桌面不传，避免和「返回总览」抢点击。 */
   onBodyClick?: (event: ReactMouseEvent<HTMLDivElement>) => void;
   children: ReactNode;
 }) {
@@ -760,7 +759,10 @@ function CardShell({
     <article
       key={id}
       style={maxHeight ? { maxHeight } : undefined}
-      className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 flex max-h-[44dvh] flex-col overflow-hidden rounded-xl border border-line bg-elevated md:inset-x-auto md:top-4 md:right-6 md:bottom-4 md:max-h-none md:w-80"
+      data-sheet-stop={sheetStop}
+      data-label-occluder="true"
+      data-dragging={dragging ? "true" : undefined}
+      className="panel-in pointer-events-auto absolute inset-x-3 bottom-3 flex max-h-[44dvh] flex-col overflow-hidden border md:inset-x-auto md:top-4 md:right-6 md:bottom-auto md:w-80"
     >
       {handle}
       <div className="min-h-0 flex-1 overflow-y-auto p-4" onClick={onBodyClick}>
@@ -773,11 +775,11 @@ function CardShell({
 function CardHead({ body, close, note }: { body: Body; close: ReactNode; note?: string }) {
   return (
     <div className="flex items-start justify-between gap-3">
-      <div>
-        <p className="text-xs text-muted">
-          {body.kind}
-          {/* 实境用：明确这张卡说的是「选中的天体」，不是「你正在看的那颗」 */}
-          {note && <span className="ml-2 text-[10px] tracking-wider text-subtle">· {note}</span>}
+      <div className="min-w-0">
+        <p className="card-catalog">
+          <span>{body.kind}</span>
+          <span className="text-subtle">/ {body.id.toUpperCase()}</span>
+          {note && <span className="text-subtle">· {note}</span>}
         </p>
         <h2 className="font-display mt-1 text-xl leading-tight text-fg md:text-2xl">{body.name}</h2>
       </div>
@@ -789,10 +791,10 @@ function CardHead({ body, close, note }: { body: Body; close: ReactNode; note?: 
 function CardBody({ body, stackFacts = false }: { body: Body; stackFacts?: boolean }) {
   return (
     <>
-      <p className="mt-2 text-sm leading-relaxed text-fg">{body.blurb}</p>
-      <dl className={`mt-3 grid gap-2 md:gap-3 ${stackFacts ? "grid-cols-1" : "grid-cols-2"}`}>
+      <p className="mt-3 text-[13px] leading-6 text-muted">{body.blurb}</p>
+      <dl className={`mt-3 grid ${stackFacts ? "grid-cols-1" : "grid-cols-2"}`}>
         {body.facts.map((fact) => (
-          <div key={fact.label} className="rounded-md bg-bg px-3 py-2">
+          <div key={fact.label} className="px-3 py-2">
             <dt className="text-xs text-muted">{fact.label}</dt>
             <dd className="mt-1 text-sm text-fg tabular-nums">{fact.value}</dd>
           </div>
@@ -822,9 +824,8 @@ function CloseButton({ className = "" }: { className?: string }) {
 type SheetStop = "bar" | "half" | "full";
 const SHEET_STOPS: SheetStop[] = ["bar", "half", "full"];
 /**
- * 「收起」原来给的是 28dvh（≈236px），收起之后仍然是屏幕下方一大块 —— 那不算收。
- * 现在它是一根**标题条**：把手 44px + 名称行，约 112px，只剩"这是哪颗星"和关闭键。
- * 用 rem 而不是 dvh：标题条的高度由内容决定，跟视口无关。
+ * 收起态只保留 28px 手柄与一行名称，实际内容约 70px；正文、事实与按钮全部退出布局。
+ * 7rem 只是 max-height 与拖档位，不会把标题条强行撑高。镜头读取的是真实面板边界。
  */
 const SHEET_MAX: Record<SheetStop, string> = { bar: "7rem", half: "44dvh", full: "76dvh" };
 /** 手柄的读屏文本。视觉上只有一个握把条 —— 握把条不需要翻译，读屏需要一句话。 */
@@ -875,7 +876,7 @@ function CardHandle({
       type="button"
       aria-label={`详情卡高度：${SHEET_LABEL[stop]}`}
       aria-expanded={stop !== "bar"}
-      className="hud-btn flex h-11 w-full shrink-0 touch-none items-center justify-center rounded-t-xl bg-elevated"
+      className="sheet-handle hud-btn flex h-11 w-full shrink-0 touch-none items-center justify-center"
       onPointerDown={(event) => {
         const article = event.currentTarget.closest("article");
         onDragStart(event.clientX, event.clientY, article?.getBoundingClientRect().height ?? 0);
@@ -886,7 +887,8 @@ function CardHandle({
       onPointerCancel={onDragEnd}
       onClick={onTap}
     >
-      <span className="h-1 w-10 rounded-full bg-line" aria-hidden />
+      <span className="sheet-grip" aria-hidden />
+      <span className="sheet-stop-label" aria-hidden>{stop === "bar" ? "展开详情" : `${SHEET_LABEL[stop]} / 拖动换档`}</span>
     </button>
   );
 }
@@ -965,6 +967,7 @@ function SandboxCard({ compact }: { compact: boolean }) {
       <button
         type="button"
         className="panel-in pointer-events-auto absolute top-4 right-6 flex w-80 items-center gap-2.5 rounded-xl border border-line bg-elevated px-3 py-2 text-left"
+        data-label-occluder="true"
         aria-label={`展开${selected.name}详情`}
         aria-expanded={false}
         onClick={() => setDesktopCollapsed(false)}
@@ -983,6 +986,8 @@ function SandboxCard({ compact }: { compact: boolean }) {
     <CardShell
       id={selected.id}
       maxHeight={compact ? (dragPx === null ? SHEET_MAX[stop] : `${dragPx}px`) : undefined}
+      sheetStop={compact ? stop : undefined}
+      dragging={compact && dragPx !== null}
       onBodyClick={compact ? onBodyTap : undefined}
       handle={
         compact ? (
@@ -1019,12 +1024,19 @@ function SandboxCard({ compact }: { compact: boolean }) {
             onDragEnd={() => {
               const d = drag.current;
               drag.current = null;
-              if (!d) return;
-              if (!d.active) return; // 没越过死区：什么都不做（click 已被吃掉）
+              if (!d) {
+                setDragPx(null);
+                return;
+              }
+              if (!d.active) {
+                setDragPx(null);
+                return; // 死区内的轻蹭回到原档，不触发第二次点击换档
+              }
               const height = dragPx ?? d.h0;
+              const delta = height - d.h0;
               const index = SHEET_STOPS.indexOf(stop);
-              // 只走一档：往上拖就高一档，往下拖就低一档，撞到端点就停
-              const direction = height > capPx(stop) ? 1 : -1;
+              // 方向直接取本次手势，不再拿内容高度和档位上限猜；短内容也不会误判。
+              const direction = delta >= 0 ? 1 : -1;
               const next = SHEET_STOPS[Math.min(SHEET_STOPS.length - 1, Math.max(0, index + direction))]!;
               setStop(next);
               setDragPx(null);
@@ -1077,7 +1089,7 @@ function SandboxCard({ compact }: { compact: boolean }) {
       </p>
       <button
         type="button"
-        className="hud-btn mt-3 h-11 w-full rounded-md border border-line text-sm text-fg md:mt-4"
+        className="return-overview hud-btn mt-3 h-10 w-full border text-sm md:mt-4"
         onClick={requestReset}
       >
         返回总览
@@ -1093,8 +1105,6 @@ function RealCard() {
   if (!selected) return null;
   return (
     <CardShell id={selected.id}>
-      {/* 实境没有「总览」这个去处（相机被钉在地球上），所以 ✕ 在桌面端也必须常显 */}
-      {/* t22 修：这张卡跟的是「选中的天体」，距离行跟的是「取景目标」——两个源，标签各说各的 */}
       <CardHead body={selected} close={<CloseButton />} note="选中的天体" />
       <CardBody body={selected} />
     </CardShell>
@@ -1105,8 +1115,9 @@ function EmptyHint() {
   const selectedId = useSim((state) => state.selectedId);
   if (selectedId) return null;
   return (
-    <p className="sky-title pointer-events-none absolute bottom-4 left-6 hidden max-w-sm text-sm text-muted md:block">
-      拖拽旋转，滚轮缩放。点选行星后，镜头会平滑聚焦并跟着它走。
+    <p className="empty-guide sky-title pointer-events-none absolute bottom-4 left-6 hidden max-w-sm text-sm md:block">
+      <span className="mb-1 block font-mono text-[9px] tracking-[0.18em] text-subtle">NAVIGATION / 自由观测</span>
+      拖拽旋转 · 滚轮缩放 · 点选天体后跟随
     </p>
   );
 }
@@ -1455,40 +1466,28 @@ function Dock({ compact }: { compact: boolean }) {
    */
   if (chrome?.dock) {
     return (
-      <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 md:px-6">
-        <div className="flex items-center justify-center gap-2 py-1">
+      <footer className="hud-dock is-collapsed pointer-events-auto relative px-3">
+        <div className="flex items-center justify-center gap-2">
           <button
             type="button"
-            className="hud-btn chrome-in-dock inline-flex h-11 items-center gap-2 rounded-full border border-line px-3 text-xs text-muted md:h-8"
+            className="hud-btn chrome-in-dock inline-flex h-10 items-center gap-2 border px-3 text-xs text-muted"
             aria-label="展开操作台"
             aria-expanded={false}
             onClick={chrome.expandDock}
           >
             <ChevronUp className="size-4" aria-hidden />
             <span>操作台</span>
-            <span className="tabular-nums text-subtle">
-              1 秒 = {rate.value} {rate.unit}
-            </span>
+            <span className="dock-rate tabular-nums text-subtle">1 秒 = {rate.value} {rate.unit}</span>
           </button>
-          {versionTag && (
-            <span data-version-tag className="shrink-0 text-[10px] tabular-nums tracking-wider text-subtle">
-              {versionTag}
-            </span>
-          )}
+          {versionTag && <span data-version-tag className="shrink-0 font-mono text-[9px] text-subtle">{versionTag}</span>}
         </div>
       </footer>
     );
   }
 
   return (
-    <footer className="hud-dock pointer-events-auto relative border-t border-line bg-elevated px-3 pt-3 md:px-6">
-      {/*
-        速度 + 时刻：两个控件同属"时间"这一量纲，放在同一行。
-        滑条值 = 档位下标，回读时从实际速度反推 —— store 把 0.05 夹成 0.2 时，旋钮会退回
-        0.2 那一档，而不是停在一个不存在的档上假装能到。
-        读数在 label 外面：label 里放按钮会让"点读数"顺带触发滑条。
-      */}
-      <div className="flex items-center gap-3">
+    <footer className="hud-dock pointer-events-auto relative px-3 pt-3 md:px-6">
+      <div className="speed-row flex items-center gap-3">
         <label className="flex min-w-0 flex-1 items-center gap-3">
           <span className="w-10 shrink-0 text-sm text-muted">速度</span>
           <input
@@ -1506,31 +1505,40 @@ function Dock({ compact }: { compact: boolean }) {
             onChange={(event) => setSpeed(SPEED_STOPS[Number(event.target.value)] ?? speed)}
           />
         </label>
-        <span className="flex w-20 shrink-0 flex-col items-end justify-center leading-tight">
-          <span className="text-xs tabular-nums text-fg">
-            1 秒 = {rate.value} {rate.unit}
-          </span>
+        <span className="dock-rate flex w-20 shrink-0 flex-col items-end justify-center leading-tight">
+          <span className="text-xs tabular-nums text-fg">1 秒 = {rate.value} {rate.unit}</span>
           <span className="text-[10px] tabular-nums text-subtle">{formatMultiplier(speed)}</span>
         </span>
         <TimeSetter disabled={switching !== null} />
+        <button
+          type="button"
+          className="hud-btn inline-flex h-10 w-9 shrink-0 items-center justify-center border text-muted"
+          aria-label="收起操作台"
+          aria-expanded={true}
+          title="收起操作台"
+          onClick={() => {
+            setLayerOpen(false);
+            chrome?.collapseDock();
+          }}
+        >
+          <ChevronDown className="size-4" aria-hidden />
+        </button>
       </div>
 
       {compact ? (
         <>
-          <div className="mt-1 grid grid-cols-3 gap-1.5">
+          <div className="dock-controls mt-1 grid grid-cols-3 gap-1.5">
             <PauseKey paused={paused} onToggle={togglePaused} />
             <button
               ref={layerBtnRef}
               type="button"
-              className={`hud-btn inline-flex h-11 items-center justify-center gap-2 rounded-md border text-sm ${
-                layerOpen ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
-              }`}
+              className="hud-btn inline-flex h-11 items-center justify-center gap-2 border text-sm text-fg"
               aria-label="图层"
               aria-expanded={layerOpen}
               aria-haspopup="dialog"
-              onClick={() => setLayerOpen((prev) => !prev)}
+              onClick={() => setLayerOpen((previous) => !previous)}
             >
-              <Layers className="size-4" />
+              <Layers className="size-4" aria-hidden />
               <span>图层</span>
             </button>
             <OverviewKey onReset={requestReset} />
@@ -1542,78 +1550,58 @@ function Dock({ compact }: { compact: boolean }) {
               data-overlay-open="true"
               role="dialog"
               aria-label="图层开关"
-              className="panel-in absolute inset-x-3 bottom-full z-20 mb-2 grid gap-1.5 rounded-xl border border-line bg-elevated p-2 shadow-lg"
+              className="panel-in absolute inset-x-3 bottom-full z-20 mb-2 grid gap-1.5 p-2"
             >
+              <p className="px-2 pb-1 font-mono text-[9px] tracking-[0.16em] text-subtle">VIS / 显示与界面</p>
               {layers.map((layer) => (
                 <button
                   key={layer.id}
                   type="button"
                   id={`layer-${layer.id}`}
-                  className={`hud-btn inline-flex h-11 items-center gap-2 rounded-md border px-3 text-sm ${
-                    layer.pressed ? "border-accent bg-accent text-accent-fg" : "border-line text-fg"
-                  }`}
+                  className="hud-btn inline-flex h-11 items-center gap-2 border px-3 text-sm text-fg"
                   aria-label={layer.label}
                   aria-pressed={layer.pressed}
                   onClick={layer.onToggle}
                 >
                   {layer.icon}
                   <span>{layer.label}</span>
+                  <span className="ml-auto font-mono text-[9px] text-subtle">{layer.pressed ? "ON" : "OFF"}</span>
                 </button>
               ))}
+              <button
+                type="button"
+                className="hud-btn mt-1 inline-flex h-10 items-center gap-2 border-t border-line px-3 text-xs text-muted"
+                aria-pressed={autoHide}
+                aria-label={`自动收起${autoHide ? "已开" : "已关"}`}
+                onClick={toggleAutoHide}
+              >
+                空闲时收起界面
+                <span className={`ml-auto font-mono text-[10px] ${autoHide ? "text-fg" : "text-subtle"}`}>{autoHide ? "ON" : "OFF"}</span>
+              </button>
             </div>
           )}
 
-          {/* t12：自动收起的开关。窄屏塞在第 4 行——它必须能被关掉，否则"找不到按钮"就成了新 bug */}
-          <div className="mt-1.5 flex items-center gap-2">
-            <button
-              type="button"
-              className="hud-btn inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border border-line text-xs text-muted"
-              aria-pressed={autoHide}
-              aria-label={`自动收起${autoHide ? "已开" : "已关"}`}
-              onClick={toggleAutoHide}
-            >
-              自动收起
-              <span className={autoHide ? "text-fg" : "text-subtle"}>{autoHide ? "开" : "关"}</span>
-            </button>
-            {/* 快照号：窄屏不塞抬头（会把模拟历挤掉），放这儿，两个状态都看得见 */}
-            {versionTag && (
-              <span data-version-tag className="shrink-0 text-[10px] tabular-nums tracking-wider text-subtle">
-                {versionTag}
-              </span>
-            )}
+          <div className="dock-meta mt-1 flex h-4 items-center justify-between gap-2 px-1">
+            <span>AUTO HUD / {autoHide ? "ON" : "OFF"}</span>
+            {versionTag && <span data-version-tag>{versionTag}</span>}
           </div>
         </>
       ) : (
-        <div className="mt-1 grid grid-cols-5 gap-1.5">
+        <div className="dock-controls mt-1 grid grid-cols-5 gap-1.5">
           <PauseKey paused={paused} onToggle={togglePaused} />
           {layers.map((layer) => (
-            <LayerKey
-              key={layer.id}
-              label={layer.label}
-              pressed={layer.pressed}
-              onToggle={layer.onToggle}
-              icon={layer.icon}
-            />
+            <LayerKey key={layer.id} label={layer.label} pressed={layer.pressed} onToggle={layer.onToggle} icon={layer.icon} />
           ))}
           <OverviewKey onReset={requestReset} />
         </div>
       )}
 
-      {/*
-        t12：宽屏的提示行 + 自动收起开关。
-        用 `!compact &&` 而不是 `hidden md:flex`：后者会在窄屏 DOM 里留一个 h=0 的
-        同 aria-label 按钮，`querySelector('button[aria-label^="自动收起"]')` 会先拿到它，
-        以后写断言必踩。结构上不存在，才是真的不存在。
-      */}
       {!compact && (
-        <div className="mt-2 flex items-center justify-between gap-3">
-          <p className="text-xs text-subtle">
-            空格暂停 · Esc 返回总览 · L 名称 · O 轨道 · T 尾迹 · 1–9 选行星
-          </p>
-          {/* t12：自动收起的开关。宽屏放在提示行右侧，不占额外高度 */}
+        <div className="dock-meta mt-2 flex items-center justify-between gap-3">
+          <p>空格 暂停 · ESC 总览 · L 名称 · O 轨道 · T 尾迹 · 1—9 选天体</p>
           <button
             type="button"
-            className="hud-btn inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-line px-2 text-xs text-muted"
+            className="hud-btn inline-flex h-6 shrink-0 items-center gap-1 border px-2 text-[10px] text-muted"
             aria-pressed={autoHide}
             aria-label={`自动收起${autoHide ? "已开" : "已关"}`}
             onClick={toggleAutoHide}

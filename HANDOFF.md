@@ -67,3 +67,29 @@
 ## 一条已经确认的前置项
 
 **实境没有星空层。** `REAL_SYSTEM.look` 继承 `decor: false`，天空均值 9.014 就是清屏色。1.3.x 看不出来（相机钉在地月附近），**1.4.0 自由飞出去就是全黑**。不是翻开关能解决的——要先处理「米制量级 vs `SKY_RADIUS = 820`」（`starfield.ts:24-35`）。
+
+---
+
+## 刚并入的 UI 重做（属 1.3.3-snap.1，未发版）
+
+外部（Kimi）完成的一次界面重做：品牌标识、抬头、天体索引、操控台、模式标识、详情卡，暗色科幻视觉，桌面与手机两套适配；另加名称系统（自动避让、受天体三维遮挡、拉远 1.35 倍整批退出）。
+
+改动范围：`index.html`、`src/App.tsx`、`src/styles.css`、`Hud.tsx`、`ModeBadge.tsx`、`BrandMark.tsx`、`SolarCanvas.tsx`。共 +1985 / −759 行。
+
+**并入前核过的门禁（全部由我独立跑，不是它的自述）**
+- `tsc --noEmit` exit 0
+- `check-shape` 9 项全 PASS，`--selftest` 未跑
+- `npm run check`（含单文件检查）exit 0
+- `verify` **26 条 / 0 failures / 211.6s**，产物 `index-DlE11WtS.js`
+- 12 个 `data-*` 钩子、`chip-row`、`gate-code-input`、14 个 `aria-label` 全部保留
+- 新增选择器在 `Hud.tsx` 里确有设置：`data-label-occluder`（三处）、`data-sheet-stop`
+- 单文件 1,510,716 B（较 1.3.2 的 1,486,524 B 增 24 KB），gzip 仍远低于 1.5 MB 上限
+
+**三件要接任者处理的**
+
+1. **名称系统零断言。** 避让、三维遮挡、远距离退出三条行为没有任何 pass 守。26 条全绿只说明"没测到它"，不说明它工作。也没有 `__solarLabel` 一类探针可读。
+2. **四个魔数无来历。** `SolarCanvas.tsx:1342-1343` 的 `SANDBOX_LABEL_RANGE = 1.35`、`SANDBOX_LABEL_DEPTH = 1.8`，以及标签挂点偏移 `radius * 1.85`（太阳 `* 2.15`）。没有实测区间，没有反例记录。
+3. **`data-label-layer` 无消费者。** 设了属性，没有 CSS、没有断言、没有探针读它。
+
+**一处范围说明**：`SolarCanvas.tsx` 被改了 245 行，而它在我给外部的交付清单之外（标签遮挡确实需要场景深度与相机，工程上说得通），但这是相机、拾取、标签三件事同处的最敏感文件，那 245 行没做过专项审查。
+
