@@ -1620,8 +1620,17 @@ function Dock({ compact }: { compact: boolean }) {
 function useHudBootstrap() {
   useEffect(() => {
     useSim.getState().hydrate(loadSettings());
-    // 进度独立一个键、独立一次读取：存储挂了只丢记忆，不丢「这次能不能进」。
-    useSim.getState().hydrateGate();
+    /*
+     * 1.3.5：**不再读回门的存档。**
+     *
+     * 原来这里有一句 `hydrateGate()`：刷新或重开时把 localStorage 的
+     * `xinggui-gate-v1` 还原成已解锁。问题是「读回来的解锁」和「这一次刚解开」
+     * 在状态上分不出来 —— ModeBadge 的庆祝逻辑看到 `unlocked` 从 false 翻到 true，
+     * 于是每次打开都弹「距日愈远」，面板直接 3/3。
+     *
+     * 账户体系之前不保存用户数据。跨设备携带走进度码，那是用户主动导出/导入的。
+     * 存档的写入侧还留着（没代码读它），彻底清掉要连着改断言，留给下一个补丁。
+     */
     return bindSettingsPersistence();
   }, []);
 }
